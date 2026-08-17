@@ -1,0 +1,25 @@
+{
+  "name": "castalia",
+  "version": "1.0.0",
+  "license": "MIT",
+  "description": "Standalone MCP memory server for agent harnesses — SQLite + sqlite-vec local vector memory, zero API cost",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^11.10.0",
+    "picomatch": "^4.0.5",
+    "sqlite-vec": "^0.1.9",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "@types/picomatch": "^4.0.3",
+    "typescript": "^5.8.0"
+  }
+}

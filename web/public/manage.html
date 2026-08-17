@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>库管理 · Castalia</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --text: #e6edf3; --dim: #8b949e; --accent: #7c6ff7; --accent2: #58a6ff;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "Microsoft YaHei", sans-serif; padding: 24px; }
+  header { display: flex; align-items: baseline; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+  h1 { font-size: 22px; color: var(--accent); }
+  h1 small { color: var(--dim); font-weight: normal; font-size: 13px; margin-left: 10px; }
+  nav { display: flex; gap: 12px; }
+  nav a { color: var(--accent2); text-decoration: none; font-size: 13px; }
+  nav a:hover { text-decoration: underline; }
+  section { margin-bottom: 24px; }
+  h2 { font-size: 15px; color: var(--accent2); margin-bottom: 10px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .15s; }
+  .card:hover { border-color: var(--accent); }
+  .card h3 { font-size: 14px; margin-bottom: 8px; }
+  .card .lib { color: var(--accent); font-weight: 600; }
+  .card .inst { color: var(--dim); font-size: 12px; margin-left: 6px; }
+  .card .nums { font-size: 13px; }
+  .card .nums b { color: var(--ok); }
+  .card .go { color: var(--accent2); font-size: 11px; margin-top: 8px; }
+  .card .err { color: var(--err); font-size: 11px; margin-top: 6px; }
+  .note { color: var(--dim); font-size: 12px; margin-top: 10px; line-height: 1.6; }
+  .empty { color: var(--dim); font-size: 13px; padding: 12px 0; }
+
+  .detail-top { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .detail-top .libtitle { color: var(--accent); font-weight: 600; font-size: 15px; margin-right: auto; }
+  .detail-top .libtitle .inst { color: var(--dim); font-size: 12px; margin-left: 6px; font-weight: normal; }
+  input[type=text] { background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 8px 12px; font-size: 13px; min-width: 200px; }
+  input[type=text]:focus { outline: 1px solid var(--accent); }
+  select { background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+  select:focus { outline: 1px solid var(--accent); }
+  button { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  button:hover { filter: brightness(1.15); }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--dim); }
+  button.danger { background: var(--err); }
+  button.mini { padding: 4px 8px; font-size: 12px; border-radius: 6px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  .selbar { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 13px; color: var(--dim); }
+  .selbar b { color: var(--ok); }
+
+  .mem-row { display: flex; gap: 10px; align-items: flex-start; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .mem-row.moving { opacity: .45; pointer-events: none; }
+  .mem-row input[type=checkbox] { margin-top: 3px; transform: scale(1.15); accent-color: var(--accent); }
+  .mem-body { flex: 1; min-width: 0; }
+  .mem-text { font-size: 13px; line-height: 1.5; word-break: break-word; }
+  .mem-meta { font-size: 11px; color: var(--dim); margin-top: 4px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .badge-type { background: rgba(88,166,255,.12); color: var(--accent2); }
+  .mem-actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+  .mem-actions select { padding: 4px 6px; font-size: 12px; }
+  #status { font-size: 12px; }
+  .ok { color: var(--ok); } .err { color: var(--err); } .warn { color: var(--warn); }
+
+  /* ── 反思面板 ── */
+  .reflect-controls { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; font-size: 13px; color: var(--dim); }
+  .reflect-controls label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+  .reflect-controls input[type=radio], .reflect-controls input[type=checkbox] { accent-color: var(--accent); transform: scale(1.1); }
+  .reflect-controls input[type=text] { min-width: 140px; padding: 6px 10px; }
+  #reflectOutput { width: 100%; min-height: 260px; background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 12px; font-family: Consolas, "Courier New", "Microsoft YaHei", monospace; font-size: 12.5px; line-height: 1.6; resize: vertical; white-space: pre-wrap; overflow-wrap: break-word; }
+  .reflect-note { color: var(--dim); font-size: 12px; margin-bottom: 10px; line-height: 1.6; }
+  .reflect-hist-head { display: flex; align-items: center; gap: 10px; margin: 16px 0 8px; }
+  .reflect-hist-title { font-size: 13px; color: var(--accent2); font-weight: 600; }
+  .hist-item { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; transition: border-color .15s; }
+  .hist-item:hover { border-color: var(--accent); }
+  .hist-head { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; font-size: 12px; }
+  .hist-head .t { color: var(--text); }
+  .hist-head .m { color: var(--dim); }
+  .hist-detail { display: none; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: break-word; color: var(--text); }
+  .hist-detail.open { display: block; }
+  .badge-dry { background: rgba(210,153,34,.15); color: var(--warn); }
+  .badge-real { background: rgba(248,81,73,.15); color: var(--err); }
+</style>
+</head>
+<body>
+<header>
+  <h1>库管理<small>手动调整记忆归属 · 跨库移动 · 批量迁移 · 改分类 · 软删</small></h1>
+  <nav>
+    <a href="/">← 3D 图</a>
+    <a href="/aggregate.html">🗂 记忆总成</a>
+  </nav>
+</header>
+
+<section id="reflectSection">
+  <h2>🧠 反思（跨库整合）</h2>
+  <div class="reflect-controls">
+    <label><input type="radio" name="reflectMode" value="all" checked> 总反思（全库）</label>
+    <label><input type="radio" name="reflectMode" value="project"> 项目级反思</label>
+    <span id="reflectProjectWrap" style="display:none">库名 <input type="text" id="reflectProject" placeholder="hermes" value="hermes"></span>
+    <label><input type="checkbox" id="reflectDryRun" checked> dryRun 预演</label>
+    <button id="btnReflect" onclick="runReflectPanel()">🧠 运行反思</button>
+    <span id="reflectStatus"></span>
+  </div>
+  <div class="reflect-note">dryRun 勾选 = 只分析不写入 reflect 库（推荐，防误提交）。取消勾选将真实写入 reflect 库，按钮会变红提示。LLM 调用可能需 1-3 分钟，请耐心等待。</div>
+  <textarea id="reflectOutput" readonly placeholder="运行反思后，扫描统计 / 每条洞察全文 / 错误列表 显示在这里…"></textarea>
+  <div class="reflect-hist-head">
+    <span class="reflect-hist-title">📜 反思历史（点击展开可回看，防误提交）</span>
+    <button class="ghost mini" onclick="loadReflectHistory()">🔄 刷新历史</button>
+  </div>
+  <div id="reflectHistory"></div>
+</section>
+
+<section id="overviewSection">
+  <h2>📚 库总览</h2>
+  <div class="grid" id="libs"></div>
+  <div class="note">点击卡片进入该库列表。移动目标恒为<b>当前实例库</b>（目标库不存在时自动在当前实例创建）；库名 <b>shared</b> 为共享层约定。</div>
+</section>
+
+<section id="detailSection" style="display:none">
+  <div class="detail-top">
+    <button class="ghost" onclick="closeLibrary()">⬅ 返回总览</button>
+    <span class="libtitle" id="detailTitle"></span>
+    <input type="text" id="q" placeholder="过滤文本 / 类型 / 分类…" oninput="renderMemories()">
+    <select id="targetLib" title="目标库"></select>
+    <button onclick="moveSelected()" id="btnMoveSel">移动选中</button>
+    <button onclick="moveAllMatched()" id="btnMoveAll">移动全部匹配</button>
+    <span id="status"></span>
+  </div>
+  <div class="selbar">
+    <label><input type="checkbox" id="checkAll" onchange="toggleAll(this)"> 全选</label>
+    <span>已选 <b id="selCount">0</b> 条</span>
+    <span id="listHint"></span>
+  </div>
+  <div id="memList"></div>
+</section>
+
+<script>
+const MEM_TYPES = ['user', 'feedback', 'project', 'reference', 'general'];
+const MEM_TYPE_LABELS = { user: '用户画像', feedback: '反馈纠偏', project: '项目上下文', reference: '外部引用', general: '通用' };
+
+const state = {
+  libs: [],
+  current: null,          // { instance, project }
+  memories: [],           // 当前库全部活跃记忆(已加载)
+  selected: new Set(),    // 选中的 id 集合
+  moving: new Set(),      // 移动中的 id 集合
+  busy: false,
+};
+
+async function api(url, opt) {
+  const r = await fetch(url, opt);
+  return r.json();
+}
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtTime(t) {
+  if (!t) return '—';
+  const d = new Date(String(t).replace(' ', 'T') + (String(t).includes('Z') ? '' : 'Z'));
+  return isNaN(d) ? String(t) : d.toLocaleString('zh-CN', { hour12: false });
+}
+function memTypeLabel(mt) { return MEM_TYPE_LABELS[mt] || mt || 'general'; }
+function $(id) { return document.getElementById(id); }
+function setStatus(html) { $('status').innerHTML = html; }
+
+/* ── 库总览 ── */
+async function loadLibraries() {
+  try {
+    const d = await api('/api/manage/libraries');
+    state.libs = d.libraries || [];
+    renderLibraries();
+    renderTargetOptions();
+  } catch (e) {
+    $('libs').innerHTML = `<div class="empty">总览加载失败: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderLibraries() {
+  const box = $('libs');
+  box.innerHTML = state.libs.map(l => `
+    <div class="card" data-instance="${esc(l.instance)}" data-project="${esc(l.project)}">
+      <h3><span class="lib">${esc(l.project)}</span><span class="inst">${esc(l.instance)}</span></h3>
+      <div class="nums">活跃 <b>${l.active ?? 0}</b> · 总数 <b>${l.total ?? 0}</b></div>
+      ${l.error ? `<div class="err">⚠ ${esc(l.error)}</div>` : ''}
+      <div class="go">进入 →</div>
+    </div>`).join('') || '<div class="empty">暂无库</div>';
+}
+
+$('libs').addEventListener('click', (ev) => {
+  const card = ev.target.closest('.card[data-project]');
+  if (card) openLibrary(card.dataset.instance, card.dataset.project);
+});
+
+function renderTargetOptions() {
+  const names = [...new Set(state.libs.map(l => l.project).filter(Boolean))].sort();
+  const sel = $('targetLib');
+  sel.innerHTML = names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('')
+    || '<option value="">(无可用目标)</option>';
+}
+
+/* ── 库内列表 ── */
+async function openLibrary(instance, project) {
+  state.current = { instance, project };
+  state.selected.clear();
+  state.moving.clear();
+  $('overviewSection').style.display = 'none';
+  $('detailSection').style.display = '';
+  $('detailTitle').innerHTML = `${esc(project)}<span class="inst">${esc(instance)}</span>`;
+  $('q').value = '';
+  await reloadMemories();
+}
+
+function closeLibrary() {
+  state.current = null;
+  state.selected.clear();
+  state.moving.clear();
+  $('detailSection').style.display = 'none';
+  $('overviewSection').style.display = '';
+}
+
+async function reloadMemories() {
+  if (!state.current) return;
+  const { instance, project } = state.current;
+  $('memList').innerHTML = '<div class="empty">加载中…</div>';
+  try {
+    const d = await api(`/api/manage/memories?instance=${encodeURIComponent(instance)}&project=${encodeURIComponent(project)}&limit=2000`);
+    state.memories = d.ok ? (d.memories || []) : [];
+    if (!d.ok) setStatus(`<span class="err">${esc(d.error || '加载失败')}</span>`);
+    renderMemories();
+  } catch (e) {
+    state.memories = [];
+    $('memList').innerHTML = `<div class="empty">加载失败: ${esc(e.message)}</div>`;
+  }
+}
+
+function filteredMemories() {
+  const q = $('q').value.trim().toLowerCase();
+  if (!q) return state.memories;
+  return state.memories.filter(m =>
+    (m.text || '').toLowerCase().includes(q) ||
+    (m.memType || '').toLowerCase().includes(q) ||
+    (m.type || '').toLowerCase().includes(q) ||
+    (m.category || '').toLowerCase().includes(q) ||
+    (m.source || '').toLowerCase().includes(q)
+  );
+}
+
+function renderMemories() {
+  const box = $('memList');
+  const list = filteredMemories();
+  $('listHint').textContent = `共 ${state.memories.length} 条${list.length !== state.memories.length ? ` · 匹配 ${list.length} 条` : ''}`;
+  $('selCount').textContent = state.selected.size;
+
+  if (list.length === 0) {
+    box.innerHTML = '<div class="empty">暂无记忆</div>';
+    return;
+  }
+  box.innerHTML = list.map(m => {
+    const checked = state.selected.has(m.id);
+    const moving = state.moving.has(m.id);
+    const text = m.text || '';
+    const summary = text.length > 60 ? text.slice(0, 60) + '…' : text;
+    return `
+      <div class="mem-row${moving ? ' moving' : ''}" data-id="${esc(m.id)}">
+        <input type="checkbox" class="row-check" ${checked ? 'checked' : ''} ${moving ? 'disabled' : ''}>
+        <div class="mem-body">
+          <div class="mem-text" title="${esc(text)}">${esc(summary)}${m.textTruncated ? ' …' : ''}</div>
+          <div class="mem-meta">
+            <span class="badge badge-type">${esc(memTypeLabel(m.memType))}</span>
+            <span>${esc(m.type || '?')}</span>
+            <span>${esc(m.category || '?')}</span>
+            <span>${fmtTime(m.createdAt)}</span>
+            ${moving ? '<span class="warn">移动中…</span>' : ''}
+          </div>
+        </div>
+        <div class="mem-actions">
+          <select class="row-move" ${moving ? 'disabled' : ''}>
+            <option value="">移动到…</option>
+            ${targetOptions(m.id)}
+          </select>
+          <select class="row-memtype" ${moving ? 'disabled' : ''}>
+            ${memTypeOptions(m.memType)}
+          </select>
+          <button class="mini danger row-del" ${moving ? 'disabled' : ''}>🗑</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function targetOptions(currentId) {
+  return [...new Set(state.libs.map(l => l.project).filter(Boolean))].sort()
+    .map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+}
+
+function memTypeOptions(current) {
+  const all = [...new Set([...MEM_TYPES, current].filter(Boolean))];
+  return all.map(mt => `<option value="${esc(mt)}" ${mt === current ? 'selected' : ''}>${esc(memTypeLabel(mt))}</option>`).join('');
+}
+
+/* 事件委托:行内 checkbox / 单条移动 / 改类 / 软删 */
+$('memList').addEventListener('change', (ev) => {
+  const row = ev.target.closest('.mem-row');
+  if (!row) return;
+  const id = row.dataset.id;
+  if (ev.target.classList.contains('row-check')) {
+    if (ev.target.checked) state.selected.add(id); else state.selected.delete(id);
+    renderMemories();
+  } else if (ev.target.classList.contains('row-move')) {
+    const to = ev.target.value;
+    if (to) moveOne(id, to, ev.target);
+  } else if (ev.target.classList.contains('row-memtype')) {
+    updateMemType(id, ev.target.value, ev.target);
+  }
+});
+
+$('memList').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.row-del');
+  if (!btn) return;
+  const row = btn.closest('.mem-row');
+  if (!row) return;
+  softDelete(row.dataset.id, row);
+});
+
+function toggleAll(cb) {
+  const list = filteredMemories();
+  if (cb.checked) list.forEach(m => state.selected.add(m.id));
+  else list.forEach(m => state.selected.delete(m.id));
+  renderMemories();
+}
+
+/* ── 操作 ── */
+function currentFrom() {
+  return { fromInstance: state.current.instance, fromProject: state.current.project };
+}
+
+async function moveOne(id, toProject, selEl) {
+  if (!toProject) return;
+  if (state.current.project === toProject) { setStatus('<span class="warn">目标与源库相同,跳过</span>'); selEl.value = ''; return; }
+  if (!confirm(`将 1 条记忆从「${state.current.project}」移动到「${toProject}」?`)) { selEl.value = ''; return; }
+  state.moving.add(id);
+  renderMemories();
+  setStatus('<span class="warn">移动中…</span>');
+  try {
+    const d = await api('/api/memory/move', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: [id], toProject, ...currentFrom() }),
+    });
+    if (d.ok && d.moved > 0) {
+      setStatus(`<span class="ok">✅ 已移动 1 条 → ${esc(toProject)}</span>`);
+      state.selected.delete(id);
+    } else {
+      setStatus(`<span class="err">❌ ${esc((d.failed && d.failed[0] && d.failed[0].error) || (d.skipped && d.skipped[0] && d.skipped[0].error) || d.error || '移动失败')}</span>`);
+    }
+  } catch (e) {
+    setStatus(`<span class="err">❌ ${esc(e.message)}</span>`);
+  } finally {
+    state.moving.delete(id);
+    await reloadMemories();
+    await loadLibraries();
+    setStatus('');
+  }
+}
+
+async function moveSelected() {
+  const ids = [...state.selected];
+  if (ids.length === 0) { setStatus('<span class="warn">未选中任何记忆</span>'); return; }
+  await doBatchMove(ids, `将选中 ${ids.length} 条记忆从「${state.current.project}」移动到目标库?`);
+}
+
+async function moveAllMatched() {
+  const ids = filteredMemories().map(m => m.id);
+  if (ids.length === 0) { setStatus('<span class="warn">没有匹配的记忆可移动</span>'); return; }
+  await doBatchMove(ids, `将当前匹配的 ${ids.length} 条记忆从「${state.current.project}」移动到目标库?`);
+}
+
+async function doBatchMove(ids, confirmMsg) {
+  const toProject = $('targetLib').value;
+  if (!toProject) { setStatus('<span class="warn">请先选择目标库</span>'); return; }
+  if (state.current.project === toProject) { setStatus('<span class="warn">目标与源库相同,跳过</span>'); return; }
+  if (!confirm(confirmMsg)) return;
+  ids.forEach(id => state.moving.add(id));
+  renderMemories();
+  setStatus(`<span class="warn">移动 ${ids.length} 条中…</span>`);
+  try {
+    const d = await api('/api/memory/move', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids, toProject, ...currentFrom() }),
+    });
+    const failed = d.failed || [];
+    const skipped = d.skipped || [];
+    if (d.ok) {
+      setStatus(`<span class="ok">✅ 移动 ${d.moved ?? 0} 条 → ${esc(toProject)}</span>` +
+        (skipped.length ? ` <span class="warn">跳过 ${skipped.length}</span>` : '') +
+        (failed.length ? ` <span class="err">失败 ${failed.length}</span>` : ''));
+    } else {
+      setStatus(`<span class="err">❌ ${esc(d.error || '移动失败')}</span>`);
+    }
+  } catch (e) {
+    setStatus(`<span class="err">❌ ${esc(e.message)}</span>`);
+  } finally {
+    ids.forEach(id => { state.moving.delete(id); state.selected.delete(id); });
+    await reloadMemories();
+    await loadLibraries();
+  }
+}
+
+async function updateMemType(id, memType, selEl) {
+  try {
+    const d = await api('/api/manage/memory/update', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instance: state.current.instance, project: state.current.project, id, memType }),
+    });
+    setStatus(d.ok && d.updated
+      ? `<span class="ok">✅ 已改类 → ${esc(memTypeLabel(memType))}</span>`
+      : `<span class="err">❌ 改类失败: ${esc(d.error || '未找到')}</span>`);
+  } catch (e) {
+    setStatus(`<span class="err">❌ ${esc(e.message)}</span>`);
+  } finally {
+    await reloadMemories();
+    await loadLibraries();
+    setTimeout(() => setStatus(''), 2500);
+  }
+}
+
+async function softDelete(id, row) {
+  if (!confirm('软删这条记忆(置 is_active=0)?')) return;
+  row.classList.add('moving');
+  try {
+    const d = await api('/api/manage/memory/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instance: state.current.instance, project: state.current.project, id }),
+    });
+    setStatus(d.ok && d.deleted ? '<span class="ok">✅ 已软删</span>' : `<span class="err">❌ 软删失败</span>`);
+    state.selected.delete(id);
+  } catch (e) {
+    setStatus(`<span class="err">❌ ${esc(e.message)}</span>`);
+  } finally {
+    await reloadMemories();
+    await loadLibraries();
+  }
+}
+
+/* ── 反思面板（跨库总反思 + 历史记录防误提交） ── */
+let reflectHistoryCache = [];
+
+function reflectMode() {
+  return (document.querySelector('input[name="reflectMode"]:checked') || {}).value === 'project' ? 'project' : 'all';
+}
+
+function updateReflectControls() {
+  $('reflectProjectWrap').style.display = reflectMode() === 'project' ? '' : 'none';
+  updateReflectButton();
+}
+
+function updateReflectButton() {
+  const dry = $('reflectDryRun').checked;
+  const btn = $('btnReflect');
+  if (dry) {
+    btn.classList.remove('danger');
+    btn.textContent = '🧠 运行反思';
+  } else {
+    btn.classList.add('danger');
+    btn.textContent = '🧠 运行反思（将写入 reflect 库！）';
+  }
+}
+
+function setReflectStatus(html) { $('reflectStatus').innerHTML = html; }
+
+async function runReflectPanel() {
+  const mode = reflectMode();
+  const projects = mode === 'project' ? [$('reflectProject').value.trim()].filter(Boolean) : [];
+  if (mode === 'project' && projects.length === 0) {
+    setReflectStatus('<span class="err">请填写项目级反思的库名</span>');
+    return;
+  }
+  const dryRun = $('reflectDryRun').checked;
+  if (!dryRun) {
+    const target = mode === 'project' ? `库「${projects[0]}」` : '全机所有库';
+    if (!confirm(`将真实写入 reflect 库（${target} 的洞察会落库），继续？`)) return;
+  }
+
+  const btn = $('btnReflect');
+  btn.disabled = true;
+  btn.textContent = '⏳ 反思中…（LLM 调用可能需 1-3 分钟）';
+  setReflectStatus('<span class="warn">⏳ 反思中…</span>');
+  $('reflectOutput').value = '反思中，请稍候…（跨库扫描 + LLM 整合，可能 1-3 分钟）';
+  try {
+    const r = await fetch('/api/reflect/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode, projects: mode === 'project' ? projects : undefined, dryRun }),
+    });
+    const d = await r.json();
+    renderReflectResult(d);
+    await loadReflectHistory();
+  } catch (e) {
+    setReflectStatus(`<span class="err">❌ ${esc(e.message)}</span>`);
+    $('reflectOutput').value = '反思请求失败: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    updateReflectButton();
+  }
+}
+
+function renderReflectResult(d) {
+  const modeLabel = d.mode === 'project' ? '项目级反思' : '总反思（全库）';
+  const writeLabel = d.dryRun ? 'dryRun 预演（未写入 reflect 库）' : '已真实写入 reflect 库';
+  const scanned = d.scanned || {};
+  const llm = d.llm || {};
+  const L = [];
+  L.push(`反思结果 — ${modeLabel} · ${writeLabel}`);
+  L.push('');
+  L.push(`扫描: ${scanned.libraries ?? 0} 库 / ${scanned.memories ?? 0} 条记忆`);
+  L.push(`洞察: ${llm.insights ?? 0} 条 · 写入 ${llm.saved ?? 0} 条 · 跳过 ${llm.skipped ?? 0} 条`);
+  L.push('');
+  const list = d.insightList || [];
+  if (list.length) {
+    L.push('── 洞察明细 ──');
+    list.forEach((ins, i) => {
+      const srcs = (ins.sources || []).map(s => `[${s.instance}/${s.project}]`).join(' ');
+      L.push(`${i + 1}. [${ins.memType || 'general'} · 重要度 ${ins.importance ?? '?'}] ${ins.text}`);
+      if (srcs) L.push(`   来源: ${srcs}`);
+    });
+  } else {
+    L.push('（无洞察）');
+  }
+  const errs = d.errors || [];
+  if (errs.length) {
+    L.push('');
+    L.push('── 错误 ──');
+    errs.forEach(e => L.push('⚠️ ' + e));
+  }
+  $('reflectOutput').value = L.join('\n');
+  if (d.ok) {
+    setReflectStatus(`<span class="ok">✅ 完成（${d.dryRun ? '预演' : '已写入'}）</span>`);
+  } else {
+    setReflectStatus(`<span class="err">❌ ${esc((errs[0] || d.error || '失败'))}</span>`);
+  }
+}
+
+async function loadReflectHistory() {
+  try {
+    const d = await api('/api/reflect/history?limit=30');
+    reflectHistoryCache = d.history || [];
+    renderReflectHistory();
+  } catch (e) {
+    $('reflectHistory').innerHTML = `<div class="empty">历史加载失败: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderReflectHistory() {
+  const box = $('reflectHistory');
+  const list = reflectHistoryCache;
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">暂无反思历史</div>';
+    return;
+  }
+  box.innerHTML = list.map((h, i) => {
+    const t = fmtTime(h.ts);
+    const modeLabel = h.mode === 'project' ? `项目级 ${(h.projects || []).join(',')}` : '总反思全库';
+    const insCount = (h.llm && h.llm.insights != null) ? h.llm.insights : (h.insightTexts || []).length;
+    const dryBadge = h.dryRun ? '<span class="badge badge-dry">dryRun</span>' : '<span class="badge badge-real">已写入</span>';
+    const okBadge = h.ok ? '<span class="badge badge-type">ok</span>' : '<span class="badge badge-real">失败</span>';
+    return `
+      <div class="hist-item" data-idx="${i}">
+        <div class="hist-head">
+          <span class="t">${esc(t)}</span>
+          <span class="m">${esc(modeLabel)}</span>
+          ${dryBadge}${okBadge}
+          <span class="m">洞察 ${insCount} 条</span>
+        </div>
+        <div class="hist-detail"></div>
+      </div>`;
+  }).join('');
+  box.querySelectorAll('.hist-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const detail = el.querySelector('.hist-detail');
+      if (detail.classList.contains('open')) {
+        detail.classList.remove('open');
+      } else {
+        detail.innerHTML = historyDetailHtml(reflectHistoryCache[Number(el.dataset.idx)]);
+        detail.classList.add('open');
+      }
+    });
+  });
+}
+
+function historyDetailHtml(h) {
+  const texts = h.insightTexts || [];
+  const sources = h.sources || [];
+  const L = [];
+  if (texts.length) {
+    texts.forEach((t, i) => {
+      const srcs = (sources[i] || []).map(s => `[${s.instance}/${s.project}]`).join(' ');
+      L.push(`${i + 1}. ${t}${srcs ? '\n   来源: ' + srcs : ''}`);
+    });
+  } else {
+    L.push('（无洞察）');
+  }
+  const errs = h.errors || [];
+  if (errs.length) {
+    L.push('');
+    L.push('── 错误 ──');
+    errs.forEach(e => L.push('⚠️ ' + e));
+  }
+  return esc(L.join('\n'));
+}
+
+document.querySelectorAll('input[name="reflectMode"]').forEach(el => el.addEventListener('change', updateReflectControls));
+$('reflectDryRun').addEventListener('change', updateReflectButton);
+
+loadLibraries();
+updateReflectControls();
+loadReflectHistory();
+</script>
+</body>
+</html>
