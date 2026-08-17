@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "castalia": {
+      "command": "node",
+      "args": ["/absolute/path/to/castalia/dist/index.js"],
+      "env": {
+        "OLLAMA_URL": "http://127.0.0.1:11434",
+        "EMBEDDING_MODEL": "yuan-embedding-2.0-zh",
+        "MEMORY_DB_PATH": "/absolute/path/to/castalia/memory.sqlite",
+        "CHAR_ID": "default",
+        "SEARCH_MIN_SCORE": "0.15"
+      }
+    }
+  }
+}

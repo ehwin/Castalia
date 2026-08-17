@@ -1,0 +1,1600 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Castalia — Memory Constellation</title>
+<style>
+:root {
+  --bg: #15161B;
+  --panel: #1F2229;
+  --card: #2A2E38;
+  --border: #2A2E38;
+  --text: #e0e0e0;
+  --t-primary: #f0f0f0;
+  --t-secondary: #9aa3a8;
+  --t-bright: #fff;
+  --b-hover: rgba(255,255,255,0.25);
+  --accent: #00A89A;
+  --accent-deep: #008880;
+  --accent-mid: #45B9AC;
+  --accent-light: #7AE8D8;
+  --accent-hi: #A0F8E8;
+  --red: #f4554f;
+  --green: #57E6C4;
+  --rose: #f43f5e;
+  --gold: #fbbf24;
+  /* mem_type 五色 */
+  --c-user: #14b8a6;
+  --c-feedback: #f59e0b;
+  --c-project: #8b5cf6;
+  --c-reference: #3b82f6;
+  --c-general: #64748b;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; }
+#graph { position: fixed; inset: 0; }
+#loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); font-size: 1.1rem; color: var(--t-secondary); z-index: 5; }
+#loading.error { color: var(--red); }
+#top-bar { position: fixed; top: 0; left: 0; right: 0; height: 48px; display: flex; align-items: center; padding: 0 16px; background: linear-gradient(180deg, rgba(21,22,27,0.9), transparent); z-index: 10; pointer-events: none; }
+#top-bar .logo { font-weight: 600; color: var(--t-bright); letter-spacing: 1px; font-size: .95rem; }
+#top-bar .stat-pill { margin-left: 16px; font-size: .75rem; color: var(--t-secondary); }
+#top-bar .stat-pill b { color: var(--t-primary); font-weight: 500; }
+/* 记忆搜索框: 放进顶栏(最顶上),不再悬浮遮挡 3D 图 */
+#search-bar { flex: 1; max-width: 300px; margin: 0 16px 0 20px; pointer-events: auto; }
+#search-input { width: 100%; background: rgba(31,34,41,0.8); border: 1px solid var(--border); color: var(--t-primary); padding: 6px 14px; border-radius: 18px; font-size: .8rem; outline: none; backdrop-filter: blur(14px); }
+.tool-btn { pointer-events: auto; margin-left: 10px; background: rgba(31,34,41,0.8); border: 1px solid var(--border); color: var(--t-primary); padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: .8rem; transition: .2s; backdrop-filter: blur(10px); }
+.tool-btn:hover { border-color: var(--accent-light); color: var(--accent-light); }
+.tool-btn.active { border-color: var(--accent-hi); color: var(--accent-hi); background: rgba(126,232,216,0.15); }
+.tool-btn:disabled { opacity: .4; cursor: not-allowed; }
+#admin-btn { margin-left: auto; }
+#legend { position: fixed; left: 16px; bottom: 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; font-size: .72rem; color: var(--t-secondary); backdrop-filter: blur(14px); z-index: 10; min-width: 160px; }
+.legend-title { font-weight: 600; margin-bottom: 8px; color: var(--t-primary); }
+.legend-item { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
+.legend-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.legend-count { margin-left: auto; opacity: .6; }
+.legend-divider { border-top: 1px solid var(--border); margin: 8px 0; }
+#controls-hint { position: fixed; bottom: 16px; right: 16px; font-size: .7rem; color: rgba(255,255,255,0.3); z-index: 10; }
+
+/* ─── 统计宫格 (MNEMO MemoryStats) — 右上角,不挡 3D 图 ─── */
+#stats-bar { position: fixed; top: 52px; right: 16px; left: auto; transform: none; display: flex; align-items: center; gap: 8px; z-index: 9; }
+#stats-grid { display: flex; gap: 8px; flex-wrap: nowrap; }
+.stat-cell { background: rgba(0,0,0,0.4); border: 1px solid; border-radius: 10px; padding: 8px 14px; text-align: center; min-width: 76px; backdrop-filter: blur(10px); }
+.stat-num { font-size: 1.4rem; font-weight: 800; line-height: 1; }
+.stat-label { font-size: 0.55rem; color: var(--t-secondary); font-weight: 600; letter-spacing: 1px; margin-top: 4px; }
+#stats-toggle { pointer-events: auto; background: rgba(31,34,41,0.8); border: 1px solid var(--border); color: var(--t-secondary); width: 26px; height: 26px; border-radius: 6px; cursor: pointer; }
+#stats-bar.collapsed #stats-grid { display: none; }
+
+/* ─── Auto-Tour 指示器 ─── */
+#tour-indicator { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); display: none; align-items: center; gap: 8px; background: rgba(20,184,166,0.15); border: 1px solid rgba(20,184,166,0.3); padding: 6px 12px; border-radius: 20px; z-index: 9; }
+#tour-indicator.on { display: flex; }
+#tour-indicator .dot { width: 8px; height: 8px; border-radius: 50%; background: #14b8a6; animation: breathe 2s ease-in-out infinite; display: inline-block; }
+#tour-indicator .label { font-size: 0.6rem; color: #14b8a6; font-family: 'JetBrains Mono', Consolas, monospace; font-weight: 600; letter-spacing: 1px; }
+@keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+
+/* ─── 详情卡片 (MNEMO MemoryDetail) ─── */
+#side-panel { position: fixed; right: 16px; top: 64px; bottom: 56px; width: 360px; background: rgba(0,0,0,0.5); border: 1px solid var(--border); border-left: 2px solid #14b8a6; border-radius: 14px; padding: 18px; transform: translateX(420px); transition: transform .45s cubic-bezier(.22,1.2,.36,1); overflow-y: auto; backdrop-filter: blur(20px) saturate(1.2); z-index: 20; box-shadow: -8px 0 32px rgba(0,0,0,0.5); }
+#side-panel.open { transform: translateX(0); }
+.panel-header { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 12px; }
+.panel-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; margin-top: 3px; }
+.panel-badge { font-size: .65rem; letter-spacing: 2px; font-weight: 600; flex: 1; }
+.panel-actions { display: flex; gap: 6px; align-items: center; }
+.panel-actions button { background: transparent; border: none; color: var(--t-secondary); cursor: pointer; font-size: 1.05rem; line-height: 1; padding: 2px 4px; }
+.panel-actions button:hover { color: var(--t-bright); }
+.panel-actions .close-btn { background: none; border: 1px solid var(--border); color: var(--t-secondary); width: 26px; height: 26px; border-radius: 6px; cursor: pointer; font-size: .9rem; }
+.panel-actions .close-btn:hover { color: var(--t-bright); border-color: var(--b-hover); }
+.panel-actions #panel-star-btn.on { color: var(--rose); }
+.panel-text { font-size: .95rem; line-height: 1.7; color: var(--t-primary); margin-bottom: 14px; white-space: pre-wrap; word-break: break-word; }
+.panel-section { margin-top: 12px; }
+.panel-section-label { font-size: .6rem; color: var(--t-secondary); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+.panel-value { font-size: .78rem; color: var(--t-primary); }
+.tag { display: inline-block; background: rgba(0,168,154,0.15); color: var(--accent-light); border-radius: 6px; padding: 2px 8px; font-size: .72rem; margin: 2px 4px 2px 0; }
+.importance-bar { background: rgba(255,255,255,0.08); border-radius: 4px; height: 6px; overflow: hidden; }
+.importance-fill { background: linear-gradient(90deg, var(--accent-deep), var(--accent-light)); height: 100%; border-radius: 4px; transition: width .4s; }
+.panel-importance-val { font-size: .7rem; color: var(--t-secondary); margin-top: 4px; }
+
+/* ─── 管理抽屉 ─── */
+#admin-drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 420px; background: #1F2229; border-left: 1px solid var(--border); transform: translateX(100%); transition: transform .3s ease; z-index: 30; overflow-y: auto; padding: 16px; }
+#admin-drawer.open { transform: translateX(0); }
+.adm-header { display: flex; align-items: center; margin-bottom: 14px; }
+.adm-header h2 { font-size: 1rem; color: var(--t-primary); }
+.adm-close { margin-left: auto; background: none; border: 1px solid var(--border); color: var(--t-secondary); width: 28px; height: 28px; border-radius: 6px; cursor: pointer; }
+.adm-close:hover { color: var(--t-bright); }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+.card h3 { font-size: .88rem; margin-bottom: 10px; color: var(--accent); }
+.row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.row label { min-width: 72px; color: #888; font-size: .78rem; }
+.row input, .row select { flex: 1; background: #15161B; border: 1px solid var(--border); color: var(--text); padding: 7px 10px; border-radius: 6px; font-size: .82rem; outline: none; }
+.row input:focus, .row select:focus { border-color: var(--accent); }
+.btn { padding: 7px 14px; border: none; border-radius: 6px; font-size: .8rem; cursor: pointer; transition: .2s; }
+.btn-primary { background: linear-gradient(90deg, var(--accent), var(--accent-deep)); color: #fff; }
+.btn-primary:hover { filter: brightness(1.15); }
+.btn-danger { background: var(--red); color: #fff; }
+.btn-success { background: #0f7a66; color: var(--accent-light); }
+.btn-orange { background: #f90; color: #000; }
+.btn-gray { background: #333; color: #fff; }
+.btn-group { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+#log { background: #15161B; border: 1px solid var(--border); border-radius: 8px; padding: 10px; height: 200px; overflow-y: auto; font-family: 'Cascadia Code', Consolas, monospace; font-size: .72rem; line-height: 1.5; white-space: pre-wrap; }
+.log-info { color: #aaa; }
+.log-ok { color: var(--green); }
+.log-err { color: var(--red); }
+.log-hl { color: var(--accent); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: .7rem; margin-left: 6px; }
+.badge-ok { background: #0f7a66; color: var(--green); }
+.badge-err { background: #5c1a1a; color: var(--red); }
+.status-bar { display: flex; gap: 12px; font-size: .72rem; color: #888; margin-top: 8px; flex-wrap: wrap; }
+#memList { max-height: 260px; overflow-y: auto; font-size: .75rem; }
+.mem-item { padding: 6px 0; border-bottom: 1px solid var(--border); display: flex; align-items: flex-start; gap: 8px; }
+.mem-item .mem-body { flex: 1; min-width: 0; }
+.mem-item .mem-cat { color: var(--accent); font-size: .72rem; }
+.mem-item .mem-text { margin-top: 2px; word-break: break-all; }
+.mem-item .mem-meta { color: #666; font-size: .65rem; margin-top: 2px; }
+.note { color: #888; font-size: .72rem; margin-top: 6px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div id="loading">✦ Castalia 记忆星图正在展开...</div>
+<div id="graph"></div>
+
+<div id="top-bar">
+  <span class="logo">✦ Castalia</span>
+  <span class="stat-pill">记忆 <b id="stat-nodes">—</b></span>
+  <span class="stat-pill">连线 <b id="stat-links">—</b></span>
+  <div id="search-bar">
+    <input type="text" id="search-input" placeholder="搜索记忆..." />
+  </div>
+  <button id="tour-btn" class="tool-btn" onclick="toggleTour()" disabled>▶ 自动导览</button>
+  <button id="fs-btn" class="tool-btn" onclick="toggleFullscreen()">⛶ 全屏</button>
+  <button id="view-btn" class="tool-btn" onclick="toggleView()">🗂 总成视图</button>
+  <button id="admin-btn" class="tool-btn" onclick="toggleAdmin()">⚙ 管理</button>
+  <a href="/aggregate.html" style="pointer-events:auto;color:var(--t-primary);font-size:.85rem;margin-left:10px;text-decoration:none;border:1px solid var(--border);padding:4px 10px;border-radius:8px;">🗂 记忆总成</a>
+  <a href="/manage.html" style="pointer-events:auto;color:var(--t-primary);font-size:.85rem;margin-left:10px;text-decoration:none;border:1px solid var(--border);padding:4px 10px;border-radius:8px;">🗂 库管理</a>
+</div>
+
+<div id="stats-bar">
+  <div id="stats-grid"></div>
+  <button id="stats-toggle" onclick="toggleStats()" title="折叠/展开统计">▾</button>
+</div>
+
+<div id="tour-indicator"><span class="dot"></span><span class="label" id="tour-indicator-label">AUTO-TOUR</span></div>
+
+<div id="legend">
+  <div class="legend-title">记忆类型</div>
+  <div id="legend-items"></div>
+  <div class="legend-divider"></div>
+  <div class="legend-link">━ 关系 &nbsp; ┄ 相似度</div>
+</div>
+
+<div id="controls-hint">拖拽旋转 · 滚轮缩放 · 点击查看 · ▶ 自动导览 · ⛶ 全屏</div>
+
+<div id="side-panel">
+  <div class="panel-header">
+    <span class="panel-dot" id="panel-dot"></span>
+    <span class="panel-badge" id="panel-badge"></span>
+    <div class="panel-actions">
+      <button id="panel-star-btn" onclick="toggleStar()" title="星标">⭐</button>
+      <button id="panel-del-btn" onclick="deletePanelNode()" title="删除">🗑</button>
+      <button class="close-btn" onclick="closePanel()">×</button>
+    </div>
+  </div>
+  <div class="panel-text" id="panel-text"></div>
+  <div class="panel-section">
+    <div class="panel-section-label">时间</div>
+    <div class="panel-value" id="panel-time"></div>
+  </div>
+  <div class="panel-section">
+    <div class="panel-section-label">来源</div>
+    <div class="panel-value" id="panel-source"></div>
+  </div>
+  <div class="panel-section">
+    <div class="panel-section-label">重要度</div>
+    <div class="importance-bar"><div class="importance-fill" id="panel-importance"></div></div>
+    <div class="panel-importance-val" id="panel-importance-val"></div>
+  </div>
+  <div class="panel-section" id="panel-tags-section">
+    <div class="panel-section-label">标签</div>
+    <div id="panel-tags"></div>
+  </div>
+</div>
+
+<!-- ═══ 管理抽屉(副界面) ═══ -->
+<div id="admin-drawer">
+  <div class="adm-header">
+    <h2>🧠 记忆管理</h2>
+    <button class="adm-close" onclick="toggleAdmin()">×</button>
+  </div>
+
+  <div class="card">
+    <h3>🚀 反思整理</h3>
+    <p class="note" style="margin-bottom:8px">把记忆发给大模型判断合并/拆分/关联/重分类(需下方配置 LLM API)</p>
+    <div class="btn-group">
+      <button class="btn btn-primary" id="btnRun" onclick="runReflect('auto')">▶ 日常反思</button>
+      <button class="btn btn-orange" id="btnDeep" onclick="runReflect('deep')">🔬 深度校准</button>
+    </div>
+    <div class="status-bar"><span id="lastRun">上次运行: 从未</span></div>
+  </div>
+
+  <div class="card">
+    <h3>🧬 嵌入模型</h3>
+    <div class="row">
+      <label>来源</label>
+      <select id="embedMode" onchange="toggleEmbedMode()">
+        <option value="ollama">Ollama(本地)</option>
+        <option value="api">API(云端,Key)</option>
+      </select>
+    </div>
+    <div id="embedOllamaFields">
+      <div class="row"><label>Ollama URL</label><input id="embOllamaUrl" placeholder="http://127.0.0.1:11436"></div>
+      <div class="row"><label>模型</label><input id="embOllamaModel" placeholder="yuan-embedding-2.0-zh"></div>
+    </div>
+    <div id="embedApiFields" style="display:none">
+      <div class="row"><label>API 地址</label><input id="embApiUrl" placeholder="https://api.siliconflow.cn/v1"></div>
+      <div class="row"><label>API Key</label><input id="embApiKey" type="password" placeholder="sk-..."></div>
+      <div class="row"><label>模型</label><input id="embApiModel" placeholder="BAAI/bge-m3"></div>
+    </div>
+    <p class="note">⚠️ 嵌入维度固定 1024,换模型需同维或重建库;保存后重启 MCP server 生效</p>
+  </div>
+
+  <div class="card">
+    <h3>⚙️ 反思 LLM</h3>
+    <div class="row"><label>API 地址</label><input id="refUrl" placeholder="https://api.deepseek.com/v1"></div>
+    <div class="row"><label>API Key</label><input id="refKey" type="password" placeholder="sk-..."></div>
+    <div class="row"><label>模型</label><input id="refModel" placeholder="deepseek-chat"></div>
+    <div class="row"><label>事实提取</label>
+      <select id="refFactExtract">
+        <option value="auto">auto(反思时提取 facts)</option>
+        <option value="off">off(只整理 actions)</option>
+      </select>
+    </div>
+    <div class="row"><label>单轮上限</label><input id="refMaxFacts" type="number" min="1" max="100" placeholder="15"></div>
+    <p class="note">事实提取=off 时,反思不提取 SPO 三元组、不写 facts 表;上限控制每轮最多落库几条 facts。保存后重启 MCP server 生效</p>
+  </div>
+
+  <div class="card">
+    <h3>🔀 分拣 LLM (triage, LLM1)</h3>
+    <p class="note" style="margin-bottom:8px">入站记忆分拣通道:轻量分类入站文本 → user/feedback/project/reference/general。不填则回退用上方"反思 LLM"的配置</p>
+    <div class="row"><label>API 地址</label><input id="triUrl" placeholder="https://api.deepseek.com/v1"></div>
+    <div class="row"><label>API Key</label><input id="triKey" type="password" placeholder="sk-..."></div>
+    <div class="row"><label>模型</label><input id="triModel" placeholder="deepseek-chat"></div>
+    <p class="note">留空 = 走 REFLECT_* 回退通道。保存后重启 MCP server 生效</p>
+  </div>
+
+  <div class="btn-group" style="margin-bottom:12px">
+    <button class="btn btn-primary" onclick="saveAllConfig()">💾 保存全部配置</button>
+    <span id="configStatus"></span>
+  </div>
+
+  <div class="card">
+    <h3>📝 记忆管理</h3>
+    <div class="row">
+      <input id="memFilter" placeholder="搜索记忆..." oninput="filterMems()">
+      <button class="btn btn-gray" onclick="loadMems()">↻</button>
+    </div>
+    <div id="memList"></div>
+  </div>
+
+  <div class="card">
+    <h3>📋 运行日志</h3>
+    <div id="log"></div>
+    <div class="btn-group"><button class="btn btn-gray" onclick="clearLog()">🗑 清日志</button></div>
+  </div>
+</div>
+
+<script type="module">
+  /* 最新版: three r160 + 3d-force-graph 1.80, esbuild 全打进单文件(自包含,零外部依赖) */
+  import ForceGraph3D, { THREE } from '/vendor/fg-1.80-full-v2.mjs';
+  window.THREE = THREE;
+  window.ForceGraph3D = ForceGraph3D;
+  window.dispatchEvent(new CustomEvent('viz-libs-ready'));
+</script>
+<script>
+/* [viz-diag] 3D 库加载诊断(排查 ForceGraph3D is not defined) */
+window.__vizDiag = { three: typeof THREE, forceGraph3D: typeof ForceGraph3D };
+console.log('[viz-diag]', JSON.stringify(window.__vizDiag));
+/* 超时兜底: module script 若不执行(浏览器不支持 ESM), 4 秒后提示 */
+setTimeout(function () {
+  if (typeof ForceGraph3D === 'undefined') {
+    var el = document.getElementById('loading');
+    if (el) el.innerHTML = '❌ 3D 库诊断: three=' + typeof THREE + ' | ForceGraph3D=undefined — 浏览器未执行 module script(不支持 ESM)或加载失败,请用较新浏览器';
+  }
+}, 4000);
+window.addEventListener('viz-libs-ready', function () {
+  window.__vizDiag = { three: typeof THREE, forceGraph3D: typeof ForceGraph3D };
+  console.log('[viz-diag] ready:', JSON.stringify(window.__vizDiag));
+  if (typeof ForceGraph3D === 'undefined') {
+    var el = document.getElementById('loading');
+    if (el) el.innerHTML = '❌ 3D 库诊断: three=' + window.__vizDiag.three + ' | ForceGraph3D=' + window.__vizDiag.forceGraph3D + ' — 浏览器不支持 ESM(module script)或脚本被拦截,请用较新浏览器';
+  }
+});
+</script>
+<script>
+/* ═══════════════════ MNEMO 风格常量 ═══════════════════ */
+const MEM_TYPE_COLORS = {
+  user: '#14b8a6',
+  feedback: '#f59e0b',
+  project: '#8b5cf6',
+  reference: '#3b82f6',
+  general: '#64748b',
+};
+const MEM_TYPE_LABELS = {
+  user: '用户画像',
+  feedback: '反馈纠偏',
+  project: '项目上下文',
+  reference: '外部引用',
+  general: '通用',
+};
+const TYPE_FALLBACK_COLORS = { episodic: '#f59e0b', semantic: '#8b5cf6', working: '#14b8a6' };
+const SOFTWARE_COLOR = '#00A89A';
+const LIBRARY_COLOR = '#7c6ff7';
+const MEM_TYPE_ORDER = ['user', 'feedback', 'project', 'reference', 'general'];
+
+/* ═══════════════════ 连线语义编码 (ContextOS / V1) ═══════════════════ */
+/* 关系边按类型着色:暖色=因果/时序,冷色=同主题/相关/跟随 */
+const LINK_TYPE_COLORS = {
+  causes: '#ff7a45', caused_by: '#ff7a45',
+  leads_to: '#ffa940', sequence: '#ffc53d',
+  same_subject: '#5cdbd3', related_to: '#69c0ff',
+  follows: '#40a9ff', context: '#b37feb', part_of: '#ff85c0', same_event: '#ffadd2',
+};
+/* 强度估算(server 端已返回 strength,这里仅作回退) */
+const LINK_TYPE_STRENGTH = {
+  part_of: 0.9, same_event: 0.85, causes: 0.7, caused_by: 0.7,
+  leads_to: 0.65, sequence: 0.6, context: 0.5, same_subject: 0.5,
+  related_to: 0.4, follows: 0.4, similarity: 0.5,
+};
+function linkStrength(l) {
+  if (typeof l.strength === 'number') return l.strength;
+  if (typeof l.similarity === 'number') return l.similarity;
+  return LINK_TYPE_STRENGTH[l.type] != null ? LINK_TYPE_STRENGTH[l.type] : 0.5;
+}
+function isWarmLinkType(t) { return t === 'causes' || t === 'caused_by' || t === 'leads_to' || t === 'sequence'; }
+function linkTypeColor(l) { return LINK_TYPE_COLORS[l.type] || null; }
+function isSyntheticLink(l) {
+  return l.type === 'galaxy-bridge' || l.type === 'subgalaxy-spoke' || l.type === 'subgalaxy-bridge';
+}
+function linkSrcId(l) { return (l.source && typeof l.source === 'object') ? l.source.id : l.source; }
+function linkTgtId(l) { return (l.target && typeof l.target === 'object') ? l.target.id : l.target; }
+
+const sidePanel = document.getElementById('side-panel');
+const loading = document.getElementById('loading');
+const adminDrawer = document.getElementById('admin-drawer');
+let graphInstance = null;
+let allData = null;
+let assemblyData = null;
+let currentView = 'star';
+let selectedNodeId = null;
+let panelNode = null;
+let autoTourActive = false;
+let autoTourTimer = null;
+let autoTargetId = null;
+
+/* ═══════════════════ 节点渲染 (THREE.Group = 核心球 + 光晕 + 文字 Sprite) ═══════════════════ */
+const _geoCache = new Map();
+const _texCache = new Map();
+
+function sphereGeo(radius) {
+  const key = Math.round(radius * 100);
+  if (!_geoCache.has(key)) _geoCache.set(key, new THREE.SphereGeometry(radius, 24, 24));
+  return _geoCache.get(key);
+}
+
+function makeLabelTexture(text, color) {
+  const key = text + '|' + color;
+  if (_texCache.has(key)) return _texCache.get(key);
+  const canvas = document.createElement('canvas');
+  canvas.width = 512;
+  canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  const maxChars = 22;
+  const displayText = text.length > maxChars ? text.substring(0, maxChars) + '…' : text;
+  ctx.font = 'bold 24px "JetBrains Mono", Consolas, monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(0,0,0,0.8)';
+  ctx.shadowBlur = 6;
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.85;
+  ctx.fillText(displayText, 256, 32);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  if (_texCache.size > 800) { const first = _texCache.keys().next().value; _texCache.delete(first); }
+  _texCache.set(key, texture);
+  return texture;
+}
+
+function memColor(node) {
+  if (node.group === 'galaxy-core') return node.__galaxyColor || '#fbbf24';
+  if (node.group === 'subgalaxy-core') return node.__galaxyColor || '#64748b';
+  if (node.group === 'software') return SOFTWARE_COLOR;
+  if (node.group === 'library') return LIBRARY_COLOR;
+  if (node.memType && MEM_TYPE_COLORS[node.memType]) return MEM_TYPE_COLORS[node.memType];
+  if (node.type && TYPE_FALLBACK_COLORS[node.type]) return TYPE_FALLBACK_COLORS[node.type];
+  return '#64748b';
+}
+
+/* 核心大星通用构建:大球 + 双层光晕 + 名字标签(柔和低调,不抢节点) */
+function buildCoreNode(node, R, labelW) {
+  const color = node.__galaxyColor || '#fbbf24';
+  const group = new THREE.Group();
+  const core = new THREE.Mesh(sphereGeo(R), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 }));
+  group.add(core);
+  const glow1 = new THREE.Mesh(sphereGeo(R * 1.6), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.25 }));
+  group.add(glow1);
+  const glow2 = new THREE.Mesh(sphereGeo(R * 2.6), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.08 }));
+  group.add(glow2);
+  const name = (node.label || node.project || '').toUpperCase();
+  if (name) {
+    const mat = new THREE.SpriteMaterial({ map: makeLabelTexture(name, color), transparent: true, depthTest: false, sizeAttenuation: true });
+    const spr = new THREE.Sprite(mat);
+    spr.scale.set(R * labelW, R * 1.1, 1);
+    spr.position.set(0, -(R + 5), 0);
+    group.add(spr);
+  }
+  node.__group = group;
+  node.__coreMesh = core;
+  node.__glowMesh = glow1;
+  node.__baseColor = color;
+  return group;
+}
+
+/* 星系核心大星(项目级) */
+function buildGalaxyCore(node) { return buildCoreNode(node, 4.5, 7); }
+
+/* 小星系核心小星(分类级,memType 色) */
+function buildSubGalaxyCore(node) { return buildCoreNode(node, 2.4, 8); }
+
+/* 点击星系核心:飞行到该星系并弹出项目统计 */
+function onGalaxyCoreClick(node) {
+  if (!node) return;
+  stopAutoTour();
+  flyTo(node, 1200);
+  const p = node.project || node.lib || '';
+  const projNodes = (allData?.nodes || []).filter(n => (n.project || n.lib) === p);
+  const counts = {};
+  projNodes.forEach(n => { const mt = n.memType || 'general'; counts[mt] = (counts[mt] || 0) + 1; });
+  showPanel({
+    id: node.id,
+    group: 'galaxy-core',
+    __galaxyColor: node.__galaxyColor || '#fbbf24',
+    label: (node.label || p).toUpperCase() + ' 星系',
+    fullText: `${p} 项目星系 · ${projNodes.length} 条记忆\n` + Object.entries(counts).map(([k, v]) => `  ${MEM_TYPE_LABELS[k] || k}: ${v}`).join('\n'),
+    importance: 1,
+    memType: 'general',
+    tags: [],
+    createdAt: null,
+    source: 'galaxy',
+  });
+}
+
+/* 点击小星系核心:飞行到该小星系并弹出分类统计 */
+function onSubGalaxyCoreClick(node) {
+  if (!node) return;
+  stopAutoTour();
+  flyTo(node, 900);
+  const p = node.project || node.lib || '';
+  const mt = node.memType || 'general';
+  const subNodes = (allData?.nodes || []).filter(n => (n.project || n.lib) === p && (n.memType || 'general') === mt);
+  showPanel({
+    id: node.id,
+    group: 'subgalaxy-core',
+    __galaxyColor: node.__galaxyColor || '#64748b',
+    label: (MEM_TYPE_LABELS[mt] || mt).toUpperCase() + ' 小星系',
+    fullText: `${p} · ${MEM_TYPE_LABELS[mt] || mt} 小星系 · ${subNodes.length} 条记忆`,
+    importance: 0.6,
+    memType: mt,
+    tags: [],
+    createdAt: null,
+    source: 'subgalaxy',
+  });
+}
+
+/* 语义簇色板(renderStar 聚类时使用,下标与 __clusterColorKey 对应) */
+const CLUSTER_COLORS_GLOBAL = ['#5cdbd3', '#ffa940', '#b37feb', '#69c0ff', '#ff85c0', '#95de64', '#ffd666', '#f759ab', '#40a9ff', '#a0d911'];
+
+function buildNode(node) {
+  if (typeof THREE === 'undefined') return null; // CDN 失败时回退默认球体
+  if (node.group === 'galaxy-core') return buildGalaxyCore(node);
+  if (node.group === 'subgalaxy-core') return buildSubGalaxyCore(node);
+  const size = node.size || 6;
+  const color = memColor(node);
+  const important = (node.importance || 0) >= 0.85;   // V3:重要记忆更强发光
+  const clusterCol = node.__cluster ? CLUSTER_COLORS_GLOBAL[node.__clusterColorKey || 0] : null;
+  const group = new THREE.Group();
+
+  const coreMesh = new THREE.Mesh(sphereGeo(size * 0.5), new THREE.MeshBasicMaterial({ color }));
+  group.add(coreMesh);
+  // 簇成员:光晕用簇色(叠加语义扎堆);非簇成员保持原色
+  const glowColor = clusterCol || color;
+  const glowMesh = new THREE.Mesh(sphereGeo(important ? size * 1.15 : size * 0.85), new THREE.MeshBasicMaterial({ color: glowColor, transparent: true, opacity: important ? 0.42 : 0.25 }));
+  group.add(glowMesh);
+
+  let labelSprite = null, labelMat = null;
+  // V3:文字标签默认隐藏(防密集),选中/悬停时才显示;星系/小星系核心始终显示
+  const labelText = node.fullText || node.label || '';
+  if (labelText) {
+    labelMat = new THREE.SpriteMaterial({ map: makeLabelTexture(labelText, color), transparent: true, depthTest: false, sizeAttenuation: true });
+    labelSprite = new THREE.Sprite(labelMat);
+    labelSprite.scale.set(size * 6, size * 0.9, 1);
+    labelSprite.position.set(0, -(size + 4), 0);
+    labelSprite.visible = false;
+    group.add(labelSprite);
+  }
+
+  let starMesh = null;
+  if (node.starred) {
+    starMesh = new THREE.Mesh(sphereGeo(size * 0.2), new THREE.MeshBasicMaterial({ color: 0xf43f5e }));
+    starMesh.position.set(0, size + 2, 0);
+    group.add(starMesh);
+  }
+
+  node.__group = group;
+  node.__coreMesh = coreMesh;
+  node.__glowMesh = glowMesh;
+  node.__coreMat = coreMesh.material;
+  node.__glowMat = glowMesh.material;
+  node.__labelSprite = labelSprite;
+  node.__labelMat = labelMat;
+  node.__starMesh = starMesh;
+  node.__important = important;
+  node.__baseColor = color;
+
+  return group;
+}
+
+/* 单节点视觉状态刷新(选中/导览金高亮/搜索变灰) — 直接改材质,不重建几何/纹理 */
+function applyNodeVisual(node) {
+  if (!node.__glowMat) return;
+  const isDim = !!node.dimmed;
+  const isTour = autoTargetId != null && node.id === autoTargetId;
+  const isSel = selectedNodeId != null && node.id === selectedNodeId;
+  const isHover = hoveredNodeId != null && node.id === hoveredNodeId;
+  const base = node.__baseColor || '#64748b';
+  // 簇成员:基础光晕色 = 簇色(非 dim/导览/选中/悬停态时显示簇色扎堆)
+  const baseGlowColor = node.__cluster ? (CLUSTER_COLORS_GLOBAL[node.__clusterColorKey || 0] || base) : base;
+  const glowColor = isDim ? '#3c3c46' : (isTour ? '#fbbf24' : baseGlowColor);
+  const baseGlow = node.__important ? 0.42 : 0.25;
+  const glowOpacity = isDim ? 0.04 : (isTour ? 0.85 : (isSel ? 0.7 : (isHover ? 0.6 : baseGlow)));
+  node.__glowMat.color.set(glowColor);
+  node.__glowMat.opacity = glowOpacity;
+  if (node.__coreMat) node.__coreMat.color.set(isDim ? '#3c3c46' : (isTour ? '#fbbf24' : base));
+  // 标签:选中/悬停才显示(dim 时隐藏)
+  if (node.__labelSprite) node.__labelSprite.visible = !isDim && (isSel || isHover);
+  if (node.__labelMat) node.__labelMat.opacity = isDim ? 0 : 0.95;
+}
+
+function refreshNodeVisuals() {
+  if (!allData || !allData.nodes) return;
+  for (const n of allData.nodes) applyNodeVisual(n);
+}
+
+/* 星标切换 → 重设尺寸/星标小球(保留相机视角) */
+function applyNodeSizeAndStar(node) {
+  if (typeof THREE === 'undefined') return;
+  const size = node.size || 6;
+  if (node.__coreMesh) node.__coreMesh.geometry = sphereGeo(size * 0.5);
+  if (node.__glowMesh) node.__glowMesh.geometry = sphereGeo(node.__important ? size * 1.15 : size * 0.85);
+  if (node.__labelSprite) {
+    node.__labelSprite.position.set(0, -(size + 4), 0);
+    node.__labelSprite.scale.set(size * 6, size * 0.9, 1);
+  }
+  if (node.starred && !node.__starMesh) {
+    node.__starMesh = new THREE.Mesh(sphereGeo(size * 0.2), new THREE.MeshBasicMaterial({ color: 0xf43f5e }));
+    node.__starMesh.position.set(0, size + 2, 0);
+    node.__group.add(node.__starMesh);
+  } else if (!node.starred && node.__starMesh) {
+    node.__group.remove(node.__starMesh);
+    node.__starMesh = null;
+  }
+}
+
+function flyTo(node, ms) {
+  const nx = node.x || 0, ny = node.y || 0, nz = node.z || 0;
+  const distance = 120;
+  const d = Math.hypot(nx, ny, nz) || 1;
+  const distRatio = 1 + distance / d;
+  graphInstance.cameraPosition({ x: nx * distRatio, y: ny * distRatio, z: nz * distRatio }, { x: nx, y: ny, z: nz }, ms);
+}
+
+/* ═══════════════════ 星空背景 (V2) ═══════════════════ */
+let starField = null;
+function addStarField() {
+  if (!graphInstance || typeof THREE === 'undefined') return;
+  try {
+    const scene = graphInstance.scene();
+    if (starField && starField.parent === scene) return;   // 已添加
+    if (starField && starField.parent) starField.parent.remove(starField);
+    const N = 2000, R = 2000;
+    const pos = new Float32Array(N * 3);
+    for (let i = 0; i < N; i++) {
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+      const r = R * (0.4 + 0.6 * Math.random());
+      pos[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+      pos[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+      pos[i * 3 + 2] = r * Math.cos(phi);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const mat = new THREE.PointsMaterial({ color: 0x9fb4c8, size: 3.0, sizeAttenuation: true, transparent: true, opacity: 0.8, depthWrite: false });
+    starField = new THREE.Points(geo, mat);
+    scene.add(starField);
+  } catch (e) { console.error('starfield:', e.message); }
+}
+
+/* ═══════════════════ 相机自动环绕 (M2) ═══════════════════ */
+let orbitRAF = null;
+let orbitAngle = null;
+let lastInteraction = 0;
+let interactionBound = false;
+const ORBIT_RESUME_MS = 30000;
+function markInteraction() { lastInteraction = Date.now(); }
+function orbitTick() {
+  if (orbitRAF == null) return;
+  if (currentView === 'star' && graphInstance && !autoTourActive && selectedNodeId == null && (Date.now() - lastInteraction) > ORBIT_RESUME_MS) {
+    try {
+      const cam = graphInstance.camera();
+      const r = Math.hypot(cam.position.x, cam.position.z);
+      if (r > 10) {
+        if (orbitAngle == null) orbitAngle = Math.atan2(cam.position.z, cam.position.x);
+        orbitAngle += 0.0012;
+        graphInstance.cameraPosition({ x: r * Math.cos(orbitAngle), y: cam.position.y, z: r * Math.sin(orbitAngle) }, { x: 0, y: 0, z: 0 }, 0);
+      }
+    } catch (e) {}
+  } else {
+    orbitAngle = null;
+  }
+  orbitRAF = requestAnimationFrame(orbitTick);
+}
+function startOrbit() {
+  markInteraction();
+  if (orbitRAF == null) orbitRAF = requestAnimationFrame(orbitTick);
+}
+function bindInteraction() {
+  if (interactionBound) return;
+  interactionBound = true;
+  const graphEl = document.getElementById('graph');
+  graphEl.addEventListener('pointerdown', markInteraction);
+  graphEl.addEventListener('wheel', markInteraction, { passive: true });
+  graphEl.addEventListener('touchstart', markInteraction);
+}
+
+/* ═══════════════════ 悬停邻居高亮 (I1) ═══════════════════ */
+let hoverSet = null;
+let hoveredNodeId = null;
+let searchQuery = '';
+function oneHopNeighbors(nodeId) {
+  const set = new Set([nodeId]);
+  for (const l of (allData?.links || [])) {
+    if (isSyntheticLink(l)) continue;
+    const s = linkSrcId(l), t = linkTgtId(l);
+    if (s === nodeId) set.add(t);
+    if (t === nodeId) set.add(s);
+  }
+  return set;
+}
+function recomputeDim() {
+  for (const n of (allData?.nodes || [])) {
+    n.dimmed = (searchQuery && !matchesNode(n, searchQuery)) || (hoverSet != null && !hoverSet.has(n.id));
+  }
+  refreshNodeVisuals();
+}
+function applyLinkHoverVisibility() {
+  if (!graphInstance || typeof graphInstance.linkVisibility !== 'function') return;
+  graphInstance.linkVisibility(l => {
+    if (hoverSet == null) return true;
+    if (isSyntheticLink(l)) return true;   // 结构背景保持
+    return hoverSet.has(linkSrcId(l)) && hoverSet.has(linkTgtId(l));
+  });
+}
+function onHoverNode(node) {
+  if (currentView !== 'star') return;
+  const isCore = !!node && (node.group === 'galaxy-core' || node.group === 'subgalaxy-core');
+  hoveredNodeId = (node && !isCore) ? node.id : null;
+  hoverSet = (node && !isCore) ? oneHopNeighbors(node.id) : null;
+  recomputeDim();
+  applyLinkHoverVisibility();
+}
+
+/* ═══════════════════ 统计宫格 ═══════════════════ */
+function addStatCell(grid, value, label, color) {
+  const cell = document.createElement('div');
+  cell.className = 'stat-cell';
+  cell.style.borderColor = color + '55';
+  cell.innerHTML = `<div class="stat-num" style="color:${color};text-shadow:0 2px 8px ${color}30">${value}</div><div class="stat-label">${label}</div>`;
+  grid.appendChild(cell);
+}
+
+function renderStats() {
+  const grid = document.getElementById('stats-grid');
+  grid.innerHTML = '';
+  if (currentView === 'assembly' && assemblyData) {
+    const sw = assemblyData.nodes.filter(n => n.group === 'software').length;
+    const lb = assemblyData.nodes.filter(n => n.group === 'library').length;
+    addStatCell(grid, sw, 'SOFTWARE', SOFTWARE_COLOR);
+    addStatCell(grid, lb, 'LIBRARY', LIBRARY_COLOR);
+  } else if (allData) {
+    const byMemType = {};
+    allData.nodes.forEach(n => { const mt = n.memType || 'general'; byMemType[mt] = (byMemType[mt] || 0) + 1; });
+    addStatCell(grid, allData.nodes.length, 'TOTAL', '#14b8a6');
+    for (const mt of MEM_TYPE_ORDER) {
+      addStatCell(grid, byMemType[mt] || 0, mt.toUpperCase(), MEM_TYPE_COLORS[mt] || '#64748b');
+    }
+  }
+}
+
+function toggleStats() {
+  const bar = document.getElementById('stats-bar');
+  bar.classList.toggle('collapsed');
+}
+
+/* ═══════════════════ 视图渲染 ═══════════════════ */
+function updateStats(nodes, links) {
+  document.getElementById('stat-nodes').textContent = nodes;
+  document.getElementById('stat-links').textContent = links;
+}
+
+function setLegend(title, items, linkText) {
+  const legendEl = document.getElementById('legend-items');
+  legendEl.innerHTML = '';
+  const titleEl = document.querySelector('#legend .legend-title');
+  if (titleEl) titleEl.textContent = title;
+  for (const it of items) {
+    const item = document.createElement('div');
+    item.className = 'legend-item';
+    item.innerHTML = `<span class="legend-dot" style="background:${it.color}"></span> ${it.label} <span class="legend-count">${it.count}</span>`;
+    legendEl.appendChild(item);
+  }
+  const linkEl = document.querySelector('#legend .legend-link');
+  if (linkEl) linkEl.textContent = linkText || '';
+}
+
+function onStarNodeClick(node) {
+  if (!node) return;
+  stopAutoTour();
+  selectedNodeId = node.id;
+  refreshNodeVisuals();
+  showPanel(node);
+  flyTo(node, 1500);
+}
+
+function renderStar(data) {
+  window.__galaxyMode = true;
+  hoverSet = null; hoveredNodeId = null;   // 重渲染时清空悬停状态
+  /* 清理上一次追加的合成边(renderStar 会被多次调用,避免重复) */
+  data.links = (data.links || []).filter(l =>
+    l.type !== 'galaxy-bridge' && l.type !== 'subgalaxy-spoke' && l.type !== 'subgalaxy-bridge');
+  /* ── L0 项目星系:按 project 分组,每项目一个星系,球面分布中心 ── */
+  const projects = [...new Set(data.nodes.map(n => n.project || n.lib || 'default'))];
+  const GALAXY_COLORS = { airi: '#8b5cf6', hermes: '#14b8a6', reflect: '#f59e0b' };
+  const GALAXY_R = 210;
+  const galaxyCenter = {};
+  projects.forEach((p, i) => {
+    const phi = Math.acos(1 - 2 * (i + 0.5) / projects.length);
+    const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+    galaxyCenter[p] = {
+      x: GALAXY_R * Math.sin(phi) * Math.cos(theta),
+      y: GALAXY_R * Math.sin(phi) * Math.sin(theta),
+      z: GALAXY_R * Math.cos(phi),
+    };
+  });
+
+  /* ── L1 分类小星系:项目内按 memType 细分,小核心围绕项目核心分布 ── */
+  const SUB_SHELL_R = 70;   // 小星系中心距项目核心的半径(拉大避免小星系互相重叠)
+  const SUB_SCATTER = 14;   // 个体节点初始散布半径(±)
+  const memTypeOf = n => n.memType || 'general';
+  const subCenter = {};     // key = project::memType → {x,y,z}
+  const subCoreNodes = [];  // 小星系核心代表节点(锁定位置)
+  projects.forEach(p => {
+    const mts = [...new Set(data.nodes.filter(n => (n.project || n.lib || 'default') === p).map(memTypeOf))].sort();
+    const g = galaxyCenter[p];
+    mts.forEach((mt, idx) => {
+      const count = mts.length;
+      const phi = Math.acos(1 - 2 * (idx + 0.5) / count);
+      const theta = Math.PI * (1 + Math.sqrt(5)) * idx;
+      const c = {
+        x: g.x + SUB_SHELL_R * Math.sin(phi) * Math.cos(theta),
+        y: g.y + SUB_SHELL_R * Math.sin(phi) * Math.sin(theta),
+        z: g.z + SUB_SHELL_R * Math.cos(phi),
+      };
+      const key = p + '::' + mt;
+      subCenter[key] = c;
+      const nCount = data.nodes.filter(n => (n.project || n.lib || 'default') === p && memTypeOf(n) === mt).length;
+      subCoreNodes.push({
+        id: 'subgalaxy:' + key,
+        rawId: 'subgalaxy:' + key,
+        lib: p,
+        project: p,
+        label: (MEM_TYPE_LABELS[mt] || mt).toUpperCase(),
+        fullText: `${p} · ${MEM_TYPE_LABELS[mt] || mt} 小星系 (${nCount} 条)`,
+        group: 'subgalaxy-core',
+        memType: mt,
+        category: 'subgalaxy',
+        size: 7,
+        importance: 0.6,
+        __galaxyColor: MEM_TYPE_COLORS[mt] || '#64748b',
+        x: c.x, y: c.y, z: c.z,
+        fx: c.x, fy: c.y, fz: c.z,
+      });
+    });
+  });
+
+  /* 星系核心代表节点(大星,点击查看项目详情) */
+  const coreNodes = projects.map(p => ({
+    id: 'galaxy:' + p,
+    rawId: 'galaxy:' + p,
+    lib: p,
+    project: p,
+    label: p.toUpperCase(),
+    fullText: p + ' 项目星系',
+    group: 'galaxy-core',
+    memType: 'general',
+    category: 'galaxy',
+    size: 14,
+    importance: 1,
+    __galaxyColor: GALAXY_COLORS[p] || '#fbbf24',
+    x: galaxyCenter[p].x, y: galaxyCenter[p].y, z: galaxyCenter[p].z,
+    fx: galaxyCenter[p].x, fy: galaxyCenter[p].y, fz: galaxyCenter[p].z,
+  }));
+
+  /* 个体节点:固定在小星系核心周围球壳上(斐波那契均匀分布,位置锁定,绝不被吸成团)
+   * 半径按小星系节点数自适应:节点越多球壳越大,保证不重叠 */
+  const nodeById = {};
+  const subNodeCount = {};   // key = project::memType → 节点数
+  data.nodes.forEach(node => {
+    const p = node.project || node.lib || 'default';
+    const k = p + '::' + memTypeOf(node);
+    subNodeCount[k] = (subNodeCount[k] || 0) + 1;
+  });
+  const subOrbitR = {};      // key → 球壳半径
+  for (const k in subNodeCount) {
+    subOrbitR[k] = 16 + Math.sqrt(subNodeCount[k]) * 4;  // n=45→42.8 / n=12→29.9
+  }
+  const subIdx = {};         // key → 已分配索引
+  data.nodes.forEach(node => {
+    nodeById[node.id] = node;
+    node.fx = null; node.fy = null; node.fz = null;
+    node.size = (node.importance || 0.5) * 6 + 4;
+    node.starred = (node.importance || 0.5) >= 0.9;
+    const p = node.project || node.lib || 'default';
+    const g = galaxyCenter[p] || galaxyCenter[projects[0]];
+    const k = p + '::' + memTypeOf(node);
+    const c = subCenter[k] || g;
+    node.__galaxyCenter = g;
+    node.__subCenter = c;
+    if (c) {
+      // 斐波那契球面分布:第 i 个节点落在小核心周围固定半径球壳上
+      const n = subNodeCount[k] || 1;
+      const i = subIdx[k] || 0;
+      subIdx[k] = i + 1;
+      const r = subOrbitR[k] || 26;
+      const phi = Math.acos(1 - 2 * (i + 0.5) / n);
+      const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+      const dx = r * Math.sin(phi) * Math.cos(theta);
+      const dy = r * Math.sin(phi) * Math.sin(theta);
+      const dz = r * Math.cos(phi);
+      node.x = c.x + dx; node.y = c.y + dy; node.z = c.z + dz;
+      node.fx = node.x; node.fy = node.y; node.fz = node.z;  // 锁定:力模拟不再移动
+    } else {
+      node.x = node.y = node.z = 0;
+      node.fx = node.x; node.fy = node.y; node.fz = node.z;
+    }
+  });
+
+  /* ── 星系桥:方向规则(用户拍板 2026-08-16)
+   *  - 主节点 = {airi, reflect}:airi ↔ reflect 双向互联
+   *  - 子节点 = 其他项目(hermes 等):不与主节点互通,仅 reflect 单向读取子节点
+   *  - 子节点之间不连
+   *  视觉:双向 = 金色粗线双向粒子;单向 = 金色细线 + 箭头指向读取方(reflect) */
+  const MAIN_PROJECTS = ['airi', 'reflect'];
+  const bridges = [];
+  const isMain = p => MAIN_PROJECTS.includes(p);
+  // 1) 主节点之间:airi ↔ reflect 双向(两条反向 link → 双向粒子光流)
+  for (let i = 0; i < MAIN_PROJECTS.length; i++) {
+    for (let j = i + 1; j < MAIN_PROJECTS.length; j++) {
+      const pa = MAIN_PROJECTS[i], pb = MAIN_PROJECTS[j];
+      if (!projects.includes(pa) || !projects.includes(pb)) continue;
+      bridges.push({ source: 'galaxy:' + pa, target: 'galaxy:' + pb, type: 'galaxy-bridge', dir: 'both', width: 1.5 });
+      bridges.push({ source: 'galaxy:' + pb, target: 'galaxy:' + pa, type: 'galaxy-bridge', dir: 'both', width: 1.5 });
+    }
+  }
+  // 2) reflect 单向读取子节点(箭头指向 reflect:source=子节点, target=reflect)
+  projects.forEach(p => {
+    if (isMain(p)) return;               // 主节点之间已处理
+    if (!projects.includes('reflect')) return;
+    bridges.push({ source: 'galaxy:' + p, target: 'galaxy:reflect', type: 'galaxy-bridge', dir: 'oneway', width: 1.0 });
+  });
+
+  /* ── 小星系层级边:项目核心 ↔ 小核心(spoke)+ 同项目小核心之间(bridge)── */
+  const linkSrc = l => (l.source && typeof l.source === 'object') ? l.source.id : l.source;
+  const linkTgt = l => (l.target && typeof l.target === 'object') ? l.target.id : l.target;
+  const spokes = subCoreNodes.map(sc => ({ source: 'galaxy:' + sc.project, target: sc.id, type: 'subgalaxy-spoke', value: 1 }));
+  const subBridgeWeight = {};
+  (data.links || []).forEach(l => {
+    const s = linkSrc(l), t = linkTgt(l);
+    const ns = nodeById[s], nt = nodeById[t];
+    if (!ns || !nt) return;
+    const ps = ns.project || ns.lib, pt = nt.project || nt.lib;
+    if (ps !== pt) return;                    // 只统计同项目内的跨小星系边
+    const ks = ps + '::' + memTypeOf(ns);
+    const kt = pt + '::' + memTypeOf(nt);
+    if (ks === kt) return;                    // 同小星系内不重复
+    if (!subCenter[ks] || !subCenter[kt]) return;
+    const key = [ks, kt].sort().join('|');
+    subBridgeWeight[key] = (subBridgeWeight[key] || 0) + 1;
+  });
+  const subBridges = Object.entries(subBridgeWeight).map(([key, w]) => {
+    const [a, b] = key.split('|');
+    return { source: 'subgalaxy:' + a, target: 'subgalaxy:' + b, type: 'subgalaxy-bridge', value: w, width: Math.min(0.5 + w * 0.18, 1.8) };
+  });
+
+  data.links = (data.links || []).concat(bridges).concat(spokes).concat(subBridges);
+  const allNodes = coreNodes.concat(subCoreNodes).concat(data.nodes);
+  const allLinks = data.links;
+
+  /* ── 语义簇聚类(借鉴 supermemory computeClusterAssignments):
+   * 在真实关系边(非合成边)上做 BFS 连通分量,同簇节点共享簇色
+   * 视觉:节点光晕 = 簇色(半透明),簇内连线 = 簇色,跨簇=灰——"扎堆"一眼可见 */
+  const clusterOf = {};      // node.id → clusterKey
+  const clusterColor = {};   // clusterKey → 颜色
+  // 只用强关系边聚类(排除 similarity 自动相似边——supermemory 经验:纯视觉边不进结构聚类)
+  const realLinks = allLinks.filter(l => !isSyntheticLink(l) && l.type !== 'similarity');
+  const adj = {};
+  realLinks.forEach(l => {
+    const s = linkSrcId(l), t = linkTgtId(l);
+    if (s === t) return;
+    (adj[s] = adj[s] || new Set()).add(t);
+    (adj[t] = adj[t] || new Set()).add(s);
+  });
+  let clusterIdx = 0;
+  const visited = new Set();
+  Object.keys(adj).forEach(startId => {
+    if (visited.has(startId)) return;
+    const comp = [];
+    const queue = [startId];
+    visited.add(startId);
+    while (queue.length) {
+      const id = queue.shift();
+      comp.push(id);
+      (adj[id] || []).forEach(nid => { if (!visited.has(nid)) { visited.add(nid); queue.push(nid); } });
+    }
+    if (comp.length < 2) return;                      // 孤立节点不成簇
+    const key = 'cluster:' + clusterIdx++;
+    const color = CLUSTER_COLORS_GLOBAL[clusterIdx % CLUSTER_COLORS_GLOBAL.length];
+    clusterColor[key] = color;
+    comp.forEach(id => { clusterOf[id] = key; });
+  });
+  // 节点打簇标记(供 buildNode/applyNodeVisual 用):__cluster=key,__clusterColorKey=色板下标
+  allNodes.forEach(n => {
+    n.__cluster = clusterOf[n.id] || null;
+    n.__clusterColorKey = n.__cluster ? (parseInt(n.__cluster.split(':')[1], 10) % CLUSTER_COLORS_GLOBAL.length) : null;
+  });
+  // 簇内真实边染色;合成边(桥/spoke/bridge)保持原逻辑
+  allLinks.forEach(l => {
+    if (isSyntheticLink(l)) return;
+    const k = clusterOf[linkSrcId(l)];
+    if (k && clusterOf[linkTgtId(l)] === k) l.__clusterColor = clusterColor[k];
+  });
+
+  graphInstance = (graphInstance || new ForceGraph3D(document.getElementById('graph')))
+    .graphData({ nodes: allNodes, links: allLinks })
+    .backgroundColor(document.fullscreenElement ? '#000000' : '#15161B')
+    .nodeThreeObject(node => buildNode(node))
+    .nodeVal(n => n.size || 4)
+    .nodeColor(n => memColor(n))
+    .nodeLabel(null)
+    .linkColor(l => {
+      if (l.type === 'galaxy-bridge') return 'rgba(255,214,120,0.55)';
+      if (l.type === 'subgalaxy-bridge') return 'rgba(190,200,235,0.5)';
+      if (l.type === 'subgalaxy-spoke') return 'rgba(150,160,185,0.22)';
+      if (l.type === 'similarity') return 'rgba(100,100,120,0.12)';
+      if (l.__clusterColor) return l.__clusterColor;   // 语义簇内连线:簇色
+      const tc = linkTypeColor(l);
+      if (tc) return tc;
+      return 'rgba(0,168,154,0.25)';
+    })
+    .linkWidth(l => {
+      if (l.type === 'galaxy-bridge') return (l.width || 1.2);
+      if (l.type === 'subgalaxy-bridge') return (l.width || 0.8);
+      if (l.type === 'subgalaxy-spoke') return 0.4;
+      if (l.type === 'similarity') return 0.15;
+      if (isWarmLinkType(l.type)) return 0.7;
+      if (l.type === 'same_subject') return 0.3;
+      if (l.type === 'related_to' || l.type === 'context' || l.type === 'part_of' || l.type === 'same_event') return 0.45;
+      return 0.5;
+    })
+    .linkDirectionalParticles(l => {
+      // 星系桥:双向=两方向粒子流动;单向=单方向粒子 + 箭头(指向读取方 reflect)
+      if (l.type === 'galaxy-bridge') return l.dir === 'both' ? 3 : 2;
+      if (l.type === 'subgalaxy-bridge') return 1;
+      if (l.type === 'subgalaxy-spoke') return 0;
+      if (l.type === 'similarity') return 0;
+      const n = Math.round(linkStrength(l) * 8);   // V1:按强度 0-8 粒子
+      return n > 0 ? n : 1;
+    })
+    .linkDirectionalParticleWidth(0.06)
+    .linkDirectionalParticleSpeed(0.004)
+    // 单向桥:粒子从子节点流向 reflect,并加箭头标注方向;语义边按类型上色
+    .linkDirectionalParticleColor(l => {
+      if (l.type === 'galaxy-bridge') return '#ffd678';
+      return linkTypeColor(l) || undefined;
+    })
+    .linkDirectionalArrowLength(l => (l.type === 'galaxy-bridge' && l.dir === 'oneway') ? 6 : 0)
+    .linkDirectionalArrowColor(() => 'rgba(255,214,120,0.9)')
+    .linkDirectionalArrowRelPos(0.5)
+    .linkOpacity(l => {
+      if (l.type === 'galaxy-bridge') return 0.7;
+      if (l.type === 'subgalaxy-bridge') return 0.55;
+      if (l.type === 'subgalaxy-spoke') return 0.2;
+      if (l.type === 'similarity') return 0.3;
+      return 0.5;
+    })
+    .showNavInfo(false)
+    .onNodeClick(node => {
+      if (node.group === 'galaxy-core') return onGalaxyCoreClick(node);
+      if (node.group === 'subgalaxy-core') return onSubGalaxyCoreClick(node);
+      onStarNodeClick(node);
+    })
+    .onNodeHover(node => {
+      document.body.style.cursor = node ? 'pointer' : 'default';
+      onHoverNode(node);
+    })
+    .onLinkClick(l => {
+      if (l && graphInstance && typeof graphInstance.emitParticle === 'function') graphInstance.emitParticle(l);
+    });
+  addStarField();
+  startOrbit();
+  bindInteraction();
+  /* 力模拟:
+   *  - subgalaxy-attract:个体节点聚拢到各自 memType 小核心(强)
+   *  - galaxy-attract:个体节点再被较弱地拉向项目核心(维持星系整体内聚)
+   *  强度固定,不随 alpha 衰减 */
+  try {
+    graphInstance.d3Force('subgalaxy-attract', () => {
+      const strength = 0.13;
+      data.nodes.forEach(n => {
+        const c = n.__subCenter;
+        if (!c) return;
+        n.vx += (c.x - n.x) * strength;
+        n.vy += (c.y - n.y) * strength;
+        n.vz += (c.z - n.z) * strength;
+      });
+    });
+    graphInstance.d3Force('galaxy-attract', () => {
+      const strength = 0.02;
+      data.nodes.forEach(n => {
+        const c = n.__galaxyCenter;
+        if (!c) return;
+        n.vx += (c.x - n.x) * strength;
+        n.vy += (c.y - n.y) * strength;
+        n.vz += (c.z - n.z) * strength;
+      });
+    });
+    // 星系内:电荷斥力按节点大小增强,防止个体被吸到小核心重叠
+    const charge = graphInstance.d3Force('charge');
+    if (charge && typeof charge.strength === 'function') {
+      charge.strength(d => -(45 + (d.size || 4) * 14));
+    }
+    const linkF = graphInstance.d3Force('link');
+    if (linkF && typeof linkF.distance === 'function') linkF.distance(30);
+    // 碰撞检测半径按节点大小,节点不重叠穿透
+    const collide = graphInstance.d3Force('collide');
+    if (collide && typeof collide.radius === 'function') collide.radius(d => (d.size || 4) * 0.8);
+  } catch (e) { console.error('galaxy force:', e.message); }
+}
+
+function renderStarLegend(data) {
+  const counts = {};
+  data.nodes.forEach(n => { const mt = n.memType || 'general'; counts[mt] = (counts[mt] || 0) + 1; });
+  const items = MEM_TYPE_ORDER
+    .filter(mt => counts[mt])
+    .map(mt => ({ color: MEM_TYPE_COLORS[mt], label: MEM_TYPE_LABELS[mt] || mt, count: counts[mt] }));
+  // 星系图例:每个项目一个星系
+  const projects = [...new Set(data.nodes.map(n => n.project || n.lib || 'default'))];
+  const GALAXY_COLORS = { airi: '#8b5cf6', hermes: '#14b8a6', reflect: '#f59e0b' };
+  const galItems = projects.map(p => {
+    const cnt = data.nodes.filter(n => (n.project || n.lib) === p).length;
+    return { color: GALAXY_COLORS[p] || '#fbbf24', label: p.toUpperCase() + ' 星系', count: cnt };
+  });
+  setLegend('星系与记忆类型', items.concat(galItems), '⭐ 双向互联 · ➤ 单向读取 · 🔶 因果/时序 · 🔷 同主题/相关 · ┄ 相似度');
+}
+
+function renderAssembly(data) {
+  data.nodes.forEach(n => {
+    n.fx = n.group === 'software' ? -250 : 250;
+    n.fy = null; n.fz = null;
+    n.x = n.fx;
+    n.y = (Math.random() - 0.5) * 260;
+    n.z = (Math.random() - 0.5) * 260;
+    n.size = 4 + Math.sqrt(n.value || 0) * 2;
+    n.starred = false;
+  });
+
+  graphInstance = (graphInstance || new ForceGraph3D(document.getElementById('graph')))
+    .graphData({ nodes: data.nodes, links: data.links || [] })
+    .backgroundColor(document.fullscreenElement ? '#000000' : '#15161B')
+    .nodeThreeObject(node => buildNode(node))
+    .nodeVal(n => n.size || 4)
+    .nodeColor(n => memColor(n))
+    .nodeLabel(null)
+    .linkColor(() => 'rgba(0,168,154,0.32)')
+    .linkWidth(l => 0.6 + Math.sqrt(l.value || 0) * 0.18)
+    .linkDirectionalParticles(0)
+    .linkDirectionalParticleWidth(0)
+    .linkOpacity(0.45)
+    .showNavInfo(false)
+    .onNodeClick(node => {
+      if (!node) return;
+      graphInstance.cameraPosition(
+        { x: node.x * 1.8, y: node.y * 1.8, z: node.z * 1.8 },
+        { x: node.x, y: node.y, z: node.z },
+        1500
+      );
+    })
+    .onNodeHover(node => { document.body.style.cursor = node ? 'pointer' : 'default'; });
+}
+
+function renderAssemblyLegend(data) {
+  const sw = data.nodes.filter(n => n.group === 'software').length;
+  const lb = data.nodes.filter(n => n.group === 'library').length;
+  setLegend('总成视图', [
+    { color: SOFTWARE_COLOR, label: '软件实例', count: sw },
+    { color: LIBRARY_COLOR, label: '记忆库', count: lb },
+  ], '━ 归属连线');
+}
+
+function toggleView() {
+  const btn = document.getElementById('view-btn');
+  if (currentView === 'star') {
+    btn.disabled = true;
+    stopAutoTour();
+    fetch('/api/aggregate/graph')
+      .then(r => r.json())
+      .then(d => {
+        if (d.error || !Array.isArray(d.nodes)) throw new Error(d.error || '总成数据解析失败');
+        if (!d.nodes.length) {
+          loading.textContent = '📭 总成视图暂无数据(各实例 memory 目录下没有 project-*.sqlite)';
+          loading.classList.add('error');
+          loading.style.display = '';
+          return;
+        }
+        loading.style.display = 'none';
+        loading.classList.remove('error');
+        assemblyData = d;
+        closePanel();
+        selectedNodeId = null;
+        renderAssembly(d);
+        renderAssemblyLegend(d);
+        updateStats(d.nodes.length, d.links.length);
+        currentView = 'assembly';
+        btn.textContent = '✦ 记忆星图';
+        btn.classList.add('active');
+        document.getElementById('tour-btn').disabled = true;
+        renderStats();
+      })
+      .catch(err => {
+        loading.textContent = '❌ 总成视图加载失败: ' + err.message;
+        loading.classList.add('error');
+        loading.style.display = '';
+      })
+      .finally(() => { btn.disabled = false; });
+  } else {
+    closePanel();
+    selectedNodeId = null;
+    renderStar(allData);
+    renderStarLegend(allData);
+    updateStats(allData.nodes.length, allData.stats ? allData.stats.totalLinks : allData.links.length);
+    currentView = 'star';
+    btn.textContent = '🗂 总成视图';
+    btn.classList.remove('active');
+    document.getElementById('tour-btn').disabled = false;
+    loading.style.display = 'none';
+    loading.classList.remove('error');
+    renderStats();
+    setTimeout(applySearchVisuals, 0);
+  }
+}
+
+/* ═══════════════════ Auto-Tour 自动导览 ═══════════════════ */
+function toggleTour() {
+  if (currentView !== 'star') return;
+  if (autoTourActive) stopAutoTour();
+  else startAutoTour();
+}
+
+function startAutoTour() {
+  if (!allData || !allData.nodes || !allData.nodes.length) return;
+  autoTourActive = true;
+  const btn = document.getElementById('tour-btn');
+  btn.classList.add('active');
+  btn.textContent = '⏸ 停止导览';
+  document.getElementById('tour-indicator').classList.add('on');
+  flyToRandomNode();
+  autoTourTimer = setInterval(flyToRandomNode, 60000);
+}
+
+function flyToRandomNode() {
+  if (!allData || !allData.nodes || !allData.nodes.length || !graphInstance) return;
+  const visible = allData.nodes.filter(n => !n.dimmed);
+  const pool = visible.length ? visible : allData.nodes;
+  const node = pool[Math.floor(Math.random() * pool.length)];
+  autoTargetId = node.id;
+  document.getElementById('tour-indicator-label').textContent = 'AUTO-TOUR • ' + ((node.fullText || node.label || '').substring(0, 25));
+  refreshNodeVisuals();
+  const nx = node.x || 0, ny = node.y || 0, nz = node.z || 0;
+  const distance = 80;
+  const d = Math.hypot(nx, ny, nz) || 1;
+  const distRatio = 1 + distance / d;
+  graphInstance.cameraPosition({ x: nx * distRatio, y: ny * distRatio, z: nz * distRatio }, { x: nx, y: ny, z: nz }, 2500);
+}
+
+function stopAutoTour() {
+  if (autoTourTimer) { clearInterval(autoTourTimer); autoTourTimer = null; }
+  autoTourActive = false;
+  autoTargetId = null;
+  const btn = document.getElementById('tour-btn');
+  if (btn) { btn.classList.remove('active'); btn.textContent = '▶ 自动导览'; }
+  document.getElementById('tour-indicator').classList.remove('on');
+  refreshNodeVisuals();
+}
+
+/* ═══════════════════ 沉浸全屏 ═══════════════════ */
+function toggleFullscreen() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    const el = document.body;
+    const fn = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+    if (fn) { try { fn.call(el); } catch (e) {} }
+  }
+}
+
+document.addEventListener('fullscreenchange', () => {
+  const fs = !!document.fullscreenElement;
+  const btn = document.getElementById('fs-btn');
+  btn.textContent = fs ? '⛶ 退出全屏' : '⛶ 全屏';
+  btn.classList.toggle('active', fs);
+  if (graphInstance) graphInstance.backgroundColor(fs ? '#000000' : '#15161B');
+  document.body.style.background = fs ? '#000' : '';
+});
+
+/* ═══════════════════ 详情卡片 ═══════════════════ */
+function showPanel(node) {
+  panelNode = node;
+  const color = memColor(node);
+  const starred = !!(node.starred);
+  const panel = sidePanel;
+  panel.style.borderLeftColor = color;
+  panel.style.borderLeftWidth = starred ? '2px' : '1px';
+  panel.style.borderLeftStyle = 'solid';
+
+  document.getElementById('panel-dot').style.background = color;
+  document.getElementById('panel-badge').textContent = `${(node.memType || node.type || 'general').toUpperCase()} · ${(node.type || '').toUpperCase()}`;
+  document.getElementById('panel-badge').style.color = color;
+  document.getElementById('panel-text').textContent = node.fullText || node.text || '';
+  document.getElementById('panel-time').textContent = node.createdAt ? new Date(node.createdAt).toLocaleString('zh-CN') : '—';
+
+  const srcParts = [];
+  if (node.source) srcParts.push('来源: ' + node.source);
+  if (node.project) srcParts.push('项目: ' + node.project);
+  document.getElementById('panel-source').textContent = srcParts.join(' · ') || '—';
+
+  document.getElementById('panel-importance').style.width = ((node.importance || 0) * 100) + '%';
+  document.getElementById('panel-importance-val').textContent = Math.round((node.importance || 0) * 100) + '%';
+
+  const tagsEl = document.getElementById('panel-tags');
+  tagsEl.innerHTML = '';
+  document.getElementById('panel-tags-section').style.display = '';
+  if (node.tags && node.tags.length) {
+    for (const t of node.tags) {
+      const span = document.createElement('span');
+      span.className = 'tag';
+      span.textContent = t;
+      tagsEl.appendChild(span);
+    }
+  } else {
+    document.getElementById('panel-tags-section').style.display = 'none';
+  }
+
+  updateStarButton();
+  panel.classList.add('open');
+}
+
+function updateStarButton() {
+  const btn = document.getElementById('panel-star-btn');
+  if (!panelNode) return;
+  btn.classList.toggle('on', !!panelNode.starred);
+}
+
+async function toggleStar() {
+  if (!panelNode) return;
+  const id = panelNode.rawId !== undefined ? panelNode.rawId : panelNode.id;
+  const lib = panelNode.lib;
+  try {
+    const r = await fetch('/api/memory/toggle_important', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, project: lib })
+    });
+    const d = await r.json();
+    if (!d.ok) return;
+    panelNode.importance = d.importance;
+    panelNode.starred = d.starred;
+    panelNode.size = (d.importance || 0.5) * 6 + 4;
+    const inAll = allData && allData.nodes ? allData.nodes.find(n => n.id === panelNode.id) : null;
+    if (inAll) { inAll.importance = d.importance; inAll.starred = d.starred; inAll.size = panelNode.size; }
+    applyNodeSizeAndStar(panelNode);
+    refreshNodeVisuals();
+    updateStarButton();
+    document.getElementById('panel-importance').style.width = (d.importance * 100) + '%';
+    document.getElementById('panel-importance-val').textContent = Math.round(d.importance * 100) + '%';
+    sidePanel.style.borderLeftWidth = d.starred ? '2px' : '1px';
+  } catch (e) { /* ignore */ }
+}
+
+async function deletePanelNode() {
+  if (!panelNode) return;
+  const id = panelNode.rawId !== undefined ? panelNode.rawId : panelNode.id;
+  const lib = panelNode.lib;
+  if (!confirm('删除这条记忆?')) return;
+  try {
+    const r = await fetch('/api/memory/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, project: lib })
+    });
+    const d = await r.json();
+    if (d.deleted) {
+      allData.nodes = allData.nodes.filter(n => n.id !== id);
+      allData.links = (allData.links || []).filter(l => {
+        const s = typeof l.source === 'object' ? l.source.id : l.source;
+        const t = typeof l.target === 'object' ? l.target.id : l.target;
+        return s !== id && t !== id;
+      });
+      allData.stats = allData.stats || {};
+      allData.stats.totalLinks = allData.links.length;
+      closePanel();
+      renderStar(allData);
+      renderStarLegend(allData);
+      updateStats(allData.nodes.length, allData.links.length);
+      renderStats();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function closePanel() {
+  sidePanel.classList.remove('open');
+  selectedNodeId = null;
+  panelNode = null;
+  refreshNodeVisuals();
+}
+
+/* ═══════════════════ 搜索过滤(直接改材质) ═══════════════════ */
+function matchesNode(n, q) {
+  return (n.fullText || '').toLowerCase().includes(q) ||
+    (n.tags || []).some(t => (t || '').toLowerCase().includes(q)) ||
+    (n.category || '').toLowerCase().includes(q) ||
+    (n.type || '').toLowerCase().includes(q) ||
+    (n.memType || '').toLowerCase().includes(q);
+}
+
+function applySearchVisuals() {
+  if (!allData || !allData.nodes) return;
+  searchQuery = (document.getElementById('search-input').value || '').trim().toLowerCase();
+  recomputeDim();
+}
+
+document.getElementById('search-input').addEventListener('input', () => {
+  if (currentView !== 'star') return;
+  applySearchVisuals();
+});
+
+/* ═══════════════════ 初始加载 ═══════════════════ */
+function __init() {
+fetch('/api/graph')
+  .then(r => r.json())
+  .then(data => {
+    if (data.error || !data.nodes) throw new Error(data.error || '无法读取记忆库');
+    allData = data;
+    updateStats(data.nodes.length, data.stats.totalLinks);
+    renderStarLegend(data);
+    renderStar(data);
+    renderStats();
+    loading.style.display = 'none';
+    document.getElementById('tour-btn').disabled = false;
+    return fetch('/api/status').then(r => r.json());
+  })
+  .then(s => {
+    if (s && s.dbExists === false) {
+      loading.innerHTML = '📭 记忆库为空或未创建——启动 MCP server 或写入第一条记忆后,图谱会自动出现';
+      loading.classList.add('error');
+      loading.style.display = '';
+    } else {
+      loading.style.display = 'none';
+    }
+  })
+  .catch(err => {
+    fetch('/api/status').then(r => r.json()).then(s => {
+      if (s && s.dbExists === false) {
+        loading.innerHTML = '📭 记忆库为空或未创建——启动 MCP server 或写入第一条记忆后,图谱会自动出现';
+      } else {
+        loading.textContent = '❌ 加载失败: ' + err.message;
+      }
+      loading.classList.add('error');
+    }).catch(() => {
+      loading.textContent = '❌ 加载失败: ' + err.message;
+      loading.classList.add('error');
+    });
+  });
+}
+if (typeof ForceGraph3D !== 'undefined') __init();
+else window.addEventListener('viz-libs-ready', __init);
+
+/* ═══════════════════ 管理抽屉逻辑 ═══════════════════ */
+function toggleAdmin() {
+  const open = adminDrawer.classList.toggle('open');
+  document.getElementById('admin-btn').classList.toggle('active', open);
+  if (open) { loadConfig(); loadMems(); }
+}
+
+function toggleEmbedMode() {
+  const mode = document.getElementById('embedMode').value;
+  document.getElementById('embedOllamaFields').style.display = mode === 'ollama' ? '' : 'none';
+  document.getElementById('embedApiFields').style.display = mode === 'api' ? '' : 'none';
+}
+
+function log(msg, cls='log-info') {
+  const el = document.getElementById('log');
+  const time = new Date().toLocaleTimeString();
+  el.innerHTML += `<span class="${cls}">[${time}] ${msg}</span>\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    const d = await r.json();
+    const emb = d.embedding || {};
+    document.getElementById('embedMode').value = emb.mode || 'ollama';
+    document.getElementById('embOllamaUrl').value = emb.ollama_url || 'http://127.0.0.1:11436';
+    document.getElementById('embOllamaModel').value = emb.model || 'yuan-embedding-2.0-zh';
+    document.getElementById('embApiUrl').value = emb.api_url || '';
+    document.getElementById('embApiKey').value = emb.api_key && emb.api_key !== '****' ? emb.api_key : '';
+    document.getElementById('embApiModel').value = emb.api_model || '';
+    const ref = d.reflect || {};
+    document.getElementById('refUrl').value = ref.llm_url || 'https://api.deepseek.com/v1';
+    document.getElementById('refKey').value = ref.api_key && ref.api_key !== '****' ? ref.api_key : '';
+    document.getElementById('refModel').value = ref.model || 'deepseek-chat';
+    document.getElementById('refFactExtract').value = ref.factExtraction || 'auto';
+    document.getElementById('refMaxFacts').value = ref.maxFacts ?? 15;
+    const tri = d.triage || {};
+    document.getElementById('triUrl').value = tri.llm_url || '';
+    document.getElementById('triKey').value = tri.api_key && tri.api_key !== '****' ? tri.api_key : '';
+    document.getElementById('triModel').value = tri.model || '';
+    toggleEmbedMode();
+    document.getElementById('configStatus').innerHTML = '<span class="badge badge-ok">已加载</span>';
+  } catch(e) {
+    document.getElementById('configStatus').innerHTML = '<span class="badge badge-err">加载失败</span>';
+    log('加载配置失败: ' + e.message, 'log-err');
+  }
+}
+
+async function saveAllConfig() {
+  const mode = document.getElementById('embedMode').value;
+  const cfg = {
+    embedding: {
+      mode,
+      ollama_url: document.getElementById('embOllamaUrl').value.trim(),
+      model: document.getElementById('embOllamaModel').value.trim(),
+      api_url: document.getElementById('embApiUrl').value.trim(),
+      api_key: document.getElementById('embApiKey').value.trim(),
+      api_model: document.getElementById('embApiModel').value.trim(),
+    },
+    reflect: {
+      llm_url: document.getElementById('refUrl').value.trim(),
+      api_key: document.getElementById('refKey').value.trim(),
+      model: document.getElementById('refModel').value.trim() || 'deepseek-chat',
+      factExtraction: document.getElementById('refFactExtract').value === 'off' ? 'off' : 'auto',
+      maxFacts: parseInt(document.getElementById('refMaxFacts').value, 10) || 15,
+    },
+    triage: {
+      llm_url: document.getElementById('triUrl').value.trim(),
+      api_key: document.getElementById('triKey').value.trim(),
+      model: document.getElementById('triModel').value.trim(),
+    },
+  };
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg)
+    });
+    const d = await r.json();
+    document.getElementById('configStatus').innerHTML = '<span class="badge badge-ok">已保存</span>';
+    log('配置已保存 ✓ ' + (d.note || ''), 'log-ok');
+  } catch(e) {
+    document.getElementById('configStatus').innerHTML = '<span class="badge badge-err">保存失败</span>';
+    log('保存失败: ' + e.message, 'log-err');
+  }
+}
+
+async function runReflect(mode) {
+  const btn = mode === 'deep' ? document.getElementById('btnDeep') : document.getElementById('btnRun');
+  btn.disabled = true; btn.textContent = '⏳ 反思中(可能需 1-2 分钟)...';
+  log(mode === 'deep' ? '🔬 深度校准 — 分析全部记忆...' : '▶ 日常反思...', 'log-hl');
+  try {
+    const r = await fetch('/api/reflect/run', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ mode })
+    });
+    const d = await r.json();
+    if (d.error) {
+      log('❌ ' + d.error, 'log-err');
+    } else if (d.skipped) {
+      log('⏭ 跳过: ' + (d.errors || []).join('; '), 'log-info');
+    } else {
+      log(`✅ 完成! 分析 ${d.conversationCount || d.memoryCount || '?'} 条,应用了 ${d.applied}/${d.actions} 个操作`, 'log-ok');
+      (d.errors || []).forEach(e => log('⚠️ ' + e, 'log-err'));
+      document.getElementById('lastRun').textContent = '上次运行: ' + new Date().toLocaleString();
+      refreshGraph();
+    }
+  } catch(e) {
+    log('❌ 反思失败: ' + e.message, 'log-err');
+  }
+  btn.disabled = false; btn.textContent = mode === 'deep' ? '🔬 深度校准' : '▶ 日常反思';
+}
+
+function clearLog() { document.getElementById('log').innerHTML = ''; }
+
+let allMems = [];
+
+async function loadMems() {
+  try {
+    const r = await fetch('/api/memory?limit=200');
+    allMems = await r.json();
+    renderMems(allMems);
+  } catch(e) { log('记忆加载失败: '+e.message, 'log-err'); }
+}
+
+function filterMems() {
+  const q = document.getElementById('memFilter').value.toLowerCase();
+  renderMems(q ? allMems.filter(m => (m.text||'').toLowerCase().includes(q)) : allMems);
+}
+
+function renderMems(list) {
+  const el = document.getElementById('memList');
+  el.innerHTML = list.slice(0,80).map(m => {
+    return `<div class="mem-item">
+      <div class="mem-body">
+        <span class="mem-cat">${m.category||'?'}</span>
+        ${m.tier==='critical'?'<span class="badge badge-ok">critical</span>':''}
+        ${m.locked?'<span style="color:#f90">🔒</span>':''}
+        <div class="mem-text">${(m.text||'').substring(0,70)}</div>
+        <div class="mem-meta">${(m.id||'').substring(0,8)} | ${(m.createdAt||'').substring(0,10)} | ${(m.source||'').substring(0,12)}</div>
+      </div>
+      <div class="mem-actions">
+        <button class="btn btn-danger" onclick="delMem('${m.id}')">✕</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function delMem(id) {
+  if (!confirm('删除这条记忆?')) return;
+  try {
+    const r = await fetch('/api/memory/delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id}) });
+    const d = await r.json();
+    log(d.deleted ? '已删除: '+id.substring(0,8) : '删除失败', d.deleted ? 'log-ok' : 'log-err');
+    loadMems();
+    refreshGraph();
+  } catch(e) { log('删除失败: '+e.message, 'log-err'); }
+}
+
+function refreshGraph() {
+  fetch('/api/graph').then(r => r.json()).then(data => {
+    allData = data;
+    updateStats(data.nodes.length, data.stats ? data.stats.totalLinks : data.links.length);
+    if (currentView === 'star') {
+      renderStar(data);
+      renderStarLegend(data);
+      renderStats();
+      setTimeout(applySearchVisuals, 0);
+    }
+  }).catch(() => {});
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "castalia-web",
+  "version": "1.0.0",
+  "description": "Web console for Castalia: 3D visualization (main) + admin panel (side)",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.21.2",
+    "sqlite-vec": "^0.1.9"
+  },
+  "license": "Apache-2.0"
+}
