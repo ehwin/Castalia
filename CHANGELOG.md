@@ -3,6 +3,26 @@
 > 本文件记录每次功能/架构变更,供 AIRI 主系统(`D:\system\AIRI\memory`)吸收改进时快速对账。
 > 格式:Keep a Changelog 简化版(Added / Changed / Fixed / Removed)。
 
+## [v1.15.0] — 2026-08-24 LobeHub 精细化吸收(身份 CRUD + 四维评分 + 偏好触发条件)
+
+> 调研 LobeHub 2.2.14 memory-user-memory 源码后确认:五层语义已由 type 性质维度(episodic/semantic/entity/preference)+ categories 查询表 + memory_log 覆盖;本次吸收其"精细化"设计(identity CRUD / 评分 / 偏好触发条件),gatekeeper 预筛经用户拍板不做(缓冲+增量反思+双查重已覆盖)。
+
+### Added
+- **身份记忆 CRUD**(applyIdentityActions):type=entity 支持 add/update/remove;update 带 mergeStrategy(merge 字段级合并 / replace 整体替换);幻觉 id 白名单校验拒绝(unknown-id / not-entity / inactive)
+- **identity_locked 保护列**:锁定身份禁 LLM 自动删改(forgetMemory 与 applyIdentityActions 双重校验)
+- **四维评分列**:score_confidence / score_impact / score_priority / score_urgency;memory_search 支持 sort=priority|urgency 排序
+- **偏好触发条件**:增量反思新增 preferences 输出段(type=preference + metadata.originContext{trigger/applicableWhen/notApplicableWhen} + score.priority);memory_context 新增「■ 用户偏好」段(触发条件渲染、priority 排序、最先展示)
+- **增量反思身份段**:prompt 注入既有身份白名单(≤30,importance 降序),输出 identity{add/update/remove};偏好段仅提取跨会话意图(单次任务约束明确排除)
+
+### Changed
+- memory 表新增 8 列(metadata/title/status/四评分/identity_locked)+ idx_memory_type 索引(ALTER 迁移,存量无损)
+- StoreParams/MemoryRecord 扩展;saveMemory / updateMemory(含跨分类搬移分支)落新列
+- reflect.ts:ReflectAction 新增 identityUpdate 动作(applyReflectActions 分支,rejected 进 errors)
+
+### 验证
+- `npm run build` EXIT=0;scripts/verify_v115.mjs 19 项行为断言全过(幻觉 id 拒 / merge 更新 / locked 保护 / 偏好 metadata);smoke_test.py 全 PASS
+- gatekeeper 预筛**未做**(用户拍板:不增加不必要的模块)
+
 ## [v1.14.0] — 2026-08-17 星图星系化大版本(布局重构 + 视觉升级 + 全项目审计)
 
 > 大版本修复:星图从"力导向乱图"重构为"三层固定星系布局",修复 3D 渲染崩溃(黑屏根因),完成六项目开源分析吸收,并对全项目做安全/一致性审计。技术报告:`docs/tech-report-v1.14.md`。
