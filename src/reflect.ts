@@ -15,7 +15,7 @@
 
 import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { getEmbeddingCached } from './ollama.js';
-import { saveFacts, saveMemory, reEmbedMemory, batchEmbedPending } from './store.js';
+import { saveFacts, saveMemory, reEmbedMemory, batchEmbedPending, applyIdentityActions, type IdentityActions } from './store.js';
 import { normalizeProject } from './env.js';
 import { MemType, isMemType, MEM_TYPES } from './memType.js';
 import fs from 'node:fs';
@@ -48,7 +48,7 @@ export interface ReflectReceipt {
 }
 
 export interface ReflectAction {
-  action: 'merge' | 'split' | 'relate' | 'reclassify' | 'delete' | 'boost' | 'decay' | 'extract';
+  action: 'merge' | 'split' | 'relate' | 'reclassify' | 'delete' | 'boost' | 'decay' | 'extract' | 'identityUpdate';
   // merge: 把多个记忆合并成一个
   sourceIds?: string[];
   newText?: string;
@@ -70,6 +70,8 @@ export interface ReflectAction {
   // 使用 sourceId + newText/newType/newCategory/newTags/newImportance/tier/newMemType
   tier?: string;
   newMemType?: string;  // v1.8: 提取时分类到 4 种封闭类型(user/feedback/project/reference)
+  // v1.15: 身份记忆 CRUD(add/update/remove,id 白名单校验在 applyIdentityActions)
+  identityActions?: IdentityActions;
   // delete: 软删除
   // boost/decay: 调整 importance
   delta?: number;
@@ -365,6 +367,25 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
 
           if (receipt.status === 'applied') result.applied++;
           result.details.push(`extract: from ${action.sourceId} → ${validType}/${validCat} (${tier})`);
+          break;
+        }
+
+        case 'identityUpdate': {
+          // v1.15: 身份记忆 CRUD — add/update/remove,幻觉 id 由 applyIdentityActions 白名单校验拒绝
+          if (!action.identityActions) {
+            result.errors.push('identityUpdate: need identityActions');
+            receipt.status = 'failed'; receipt.reason = 'need identityActions';
+            continue;
+          }
+          const r = await applyIdentityActions(action.identityActions, project);
+          receipt.rowsAffected = r.applied;
+          if (r.rejected.length > 0) {
+            receipt.status = 'failed';
+            receipt.reason = `rejected: ${r.rejected.join(', ')}`;
+            result.errors.push(`identityUpdate: ${r.rejected.join(', ')}`);
+          }
+          if (receipt.status === 'applied') result.applied++;
+          result.details.push(`identityUpdate: +${r.applied} applied, ${r.rejected.length} rejected`);
           break;
         }
 

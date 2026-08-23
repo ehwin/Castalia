@@ -32,6 +32,8 @@ export interface SearchOptions {
   topK?: number;
   minScore?: number;
   profile?: 'quick' | 'balanced' | 'deep';
+  // v1.15: LobeHub 精细化吸收 — 评分排序
+  sort?: 'default' | 'priority' | 'urgency';  // priority=score_priority 优先,urgency=score_urgency 优先
 }
 
 // minScore 阈值可配;harness 可用 SEARCH_MIN_SCORE 覆盖
@@ -211,7 +213,11 @@ function tagSearch(db: any, options: SearchOptions): SearchResult[] {
       m.created_at, m.last_accessed_at, m.accessed_count
     FROM memory m
     WHERE ${conditions.join(' AND ')}
-    ORDER BY m.importance DESC, m.created_at DESC
+    ORDER BY ${options.sort === 'priority'
+      ? 'COALESCE(m.score_priority, 0) DESC, m.importance DESC, m.created_at DESC'
+      : options.sort === 'urgency'
+        ? 'COALESCE(m.score_urgency, 0) DESC, m.importance DESC, m.created_at DESC'
+        : 'm.importance DESC, m.created_at DESC'}
     LIMIT ?
   `).all(...params, topK * 3) as any[];
 
