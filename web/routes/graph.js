@@ -19,8 +19,16 @@ function edgeStrength(type, similarity) {
 }
 
 // ═══ API: GET /api/graph ═══
+function graphScope(req) {
+  return String(req.query.scope || process.env.GRAPH_SCOPE || 'local').toLowerCase();
+}
+function libsForScope(scope) {
+  if (scope === 'federation' || scope === 'all' || scope === 'fed') return libFiles();
+  return currentInstanceLibs();
+}
+
 router.get('/graph', (req, res) => {
-  const libs = libFiles();
+  const libs = libsForScope(graphScope(req));
   const nodes = [];
   const links = [];
   let totalMemories = 0;

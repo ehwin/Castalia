@@ -10,9 +10,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT = join(__dirname, '..', '..');   // routes/ 位于 <root>/viz/routes/,ROOT = <root>(castalia-run 等实例根)
 const LEGACY_DB_PATH = process.env.MEMORY_DB_PATH || '';
-const CONFIG_PATH = process.env.MEMORY_CONFIG || join(ROOT, 'memory', 'config.json');
+const CONFIG_PATH = process.env.MEMORY_CONFIG || (process.env.MEMORY_DB_DIR ? join(process.env.MEMORY_DB_DIR, 'config.json') : join(ROOT, 'memory', 'config.json'));
 const NODE_BIN = process.env.NODE_BIN || (existsSync('D:\\system\\New Folder\\node.exe') ? 'D:\\system\\New Folder\\node.exe' : 'node');
-const MCP_SERVER = join(ROOT, 'dist', 'index.js');
+function resolveMcpServer() {
+  if (process.env.CASTALIA_MCP && existsSync(process.env.CASTALIA_MCP)) return process.env.CASTALIA_MCP;
+  if (process.env.ANIMA_DIR) {
+    const p = join(process.env.ANIMA_DIR, 'dist', 'index.js');
+    if (existsSync(p)) return p;
+  }
+  return join(ROOT, 'dist', 'index.js');
+}
+const MCP_SERVER = resolveMcpServer();
 const PORT = parseInt(process.env.WEB_PORT || '3345', 10);
 
 // 读 config 前确保 memory/ 目录存在(首次启动自动创建)
@@ -179,14 +187,22 @@ function mcpCall(toolName, args = {}, timeoutMs = 120000) {
 
 // ═══ 记忆总成(聚合本机多实例库) ═══
 const AGGREGATE_DIRS = (() => {
-  const raw = process.env.AGGREGATE_DIRS;
-  if (raw) { try { const d = JSON.parse(raw); if (Array.isArray(d) && d.length) return d; } catch {} }
-  const cands = [
-    { name: 'Hermes', dir: 'D:\\AI\\castalia-run\\memory' },
+  const parse = (raw) => {
+    if (!raw) return null;
+    try {
+      const d = JSON.parse(raw);
+      if (Array.isArray(d) && d.length) {
+        return d.map(x => ({ name: String(x.name || ''), dir: String(x.dir || '') })).filter(x => x.dir);
+      }
+    } catch {}
+    return null;
+  };
+  const cands = parse(process.env.FEDERATION_DIRS) || parse(process.env.AGGREGATE_DIRS) || [
+    { name: 'Hermes', dir: 'D:\\AI\\castalia\\run\\Castalia\\memory' },
     { name: 'LobeHub', dir: 'D:\\AI\\lobehub-run\\memory' },
-    { name: 'AIRI', dir: 'D:\\AI\\anima-run\\memory' },
-    { name: '当前实例', dir: DB_DIR },
+    { name: 'AIRI', dir: 'D:\\AI\\castalia\\run\\Castalia-Anima\\memory' },
   ];
+  if (DB_DIR && !cands.some(c => c.dir === DB_DIR)) cands.push({ name: '当前实例', dir: DB_DIR });
   const seen = new Set();
   return cands.filter(c => c.dir && existsSync(c.dir) && !seen.has(c.dir) && seen.add(c.dir));
 })();

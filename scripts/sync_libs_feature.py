@@ -2,8 +2,8 @@
 """2026-08-16 多库互通特性:同源补丁同步到 Anima / 主系统 memory-fused(保留各自情感增强)"""
 import os, sys, shutil
 
-AI = r'/path\ai-memory'
-REPOS = [r'/path/to/ai-memory', r'D:\system\AIRI\memory\memory-fused']
+AI = r'/path/to/castalia\Castalia-Full'
+REPOS = [r'/path/to/castalia\Castalia-Anima', r'D:\system\AIRI\memory\memory-fused']
 
 def rd(p):
     with open(p, 'r', encoding='utf-8') as f:
