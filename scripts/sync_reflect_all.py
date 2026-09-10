@@ -2,8 +2,8 @@
 """2026-08-16 reflect_all 模块同步到 Anima / 主系统(锚点补丁,保留各自增强)"""
 import os, shutil
 
-AI = r'D:\AI\ai-memory'
-REPOS = [r'D:\AI\AI memory', r'D:\system\AIRI\memory\memory-fused']
+AI = r'D:\AI\castalia\Castalia-Full'
+REPOS = [r'D:\AI\castalia\Castalia-Anima', r'D:\system\AIRI\memory\memory-fused']
 
 main_idx = open(os.path.join(AI, 'src', 'index.ts'), encoding='utf-8').read()
 start = main_idx.index("register(\n  'reflect_all', 'admin',")

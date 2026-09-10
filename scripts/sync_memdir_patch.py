@@ -4,7 +4,7 @@
 """
 import sys, re
 
-GEN = r"D:\AI\ai-memory\src"
+GEN = r"D:\AI\castalia\Castalia-Full\src"
 
 def read(p):
     with open(p, encoding='utf-8') as f:
@@ -57,7 +57,7 @@ def sync_file(target, fname, funcs, extra=None):
         print(r)
 
 def main():
-    target = sys.argv[1] if len(sys.argv) > 1 else r"D:\AI\AI memory\src"
+    target = sys.argv[1] if len(sys.argv) > 1 else r"D:\AI\castalia\Castalia-Anima\src"
     print(f"目标: {target}\n")
 
     # db.ts / federation.ts:无情感差异,直接复制

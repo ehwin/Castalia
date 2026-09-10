@@ -86,9 +86,9 @@ def migrate_dir(memdir):
 
 def main():
     dirs = sys.argv[1:] or [
-        r"D:\AI\castalia-run\memory",
+        r"D:\AI\castalia\run\Castalia\memory",
         r"D:\AI\lobehub-run\memory",
-        r"D:\AI\anima-run\memory",
+        r"D:\AI\castalia\run\Castalia-Anima\memory",
     ]
     for d in dirs:
         if os.path.isdir(d):
