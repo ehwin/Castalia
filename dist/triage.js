@@ -15,7 +15,7 @@
  */
 import { callLlm, makeLlmChannel } from './reflectDriver.js';
 import { isMemType, isClosedMemType, normalizeMarkdown } from './memType.js';
-import { getSessionMemory, upsertSessionMemory, promoteToProject, deleteSessionFragments } from './store.js';
+import { getSessionMemory, upsertSessionMemory, promoteToProject, deleteSessionFragments, applyIdentityActions, saveMemory } from './store.js';
 import { normalizeProject } from './env.js';
 import { embed, cosineSimilarity } from './ollama.js';
 import { createHash } from 'node:crypto';
@@ -130,15 +130,34 @@ export const INCREMENTAL_REFLECT_PROMPT = `You are a memory extraction sub-agent
 - 相对时间必须转成绝对日期(如 2026-08-12);旧快照已包含的信息不要重复 promote
 - 只关注当前任务上下文;用户长期偏好等不依赖单次会话的内容 → 归 promoted 长效
 
+【任务3:身份维护(identity)】— 仅当对话涉及用户身份/关系/属性/角色变化时才输出。
+【既有身份列表】(update/remove 的 id 必须从下面选择,禁止发明新 id;找不到对应 → 用 add):
+{{identityList}}
+- add:全新身份事实(列表没有的)→ text 自包含、无代词
+- update:既有条目精化/角色变化 → id 必须来自列表;mergeStrategy=merge(字段级合并,保留未变字段)/replace(整体替换);set 只放变化的字段
+- remove:条目已错误/过时/重复 → id 必须来自列表 + reason
+输出格式(无动作给空数组):
+"identity": {"add":[{"text":"...","tags":[],"scoreConfidence":0.8}],
+             "update":[{"id":"<真实id>","mergeStrategy":"merge","set":{"text":"..."}}],
+             "remove":[{"id":"<真实id>","reason":"..."}]}
+
+【任务4:偏好提取(preferences)】— 仅当对话含跨会话持久偏好(always/never/from now on/我更喜欢/以后都...等明确跨会话意图)时才输出:
+{"text":"...","metadata":{"originContext":{"trigger":"触发条件","applicableWhen":"适用场景","notApplicableWhen":"不适用场景"}},"score":{"priority":0.8}}
+- 单次任务要求、一次性指令、本任务产出约束(如"这个logo要简洁")不是偏好,不要提取
+- 偏好必须是"无论什么对话主题都该遵守的行为指令"
+
 【输出】只返回严格 JSON 对象,不要代码围栏,不要任何其他文字:
 {
   "sessionMemory": "更新后的滚动状态(无变化可省略此字段)",
   "promoted": [
     {"memType": "user", "text": "长效记忆内容"}
-  ]
+  ],
+  "identity": {"add": [], "update": [], "remove": []},
+  "preferences": []
 }
 - promoted 允许空数组 [];memType 必须属于 user/feedback/project/reference
-- sessionMemory 字段可选,省略则不更新会话状态`;
+- sessionMemory 字段可选,省略则不更新会话状态
+- identity/preferences 字段可选,省略则不做身份/偏好维护`;
 /** 从 LLM 原始输出中解析增量反思 JSON(容忍代码围栏/尾逗号/控制字符) */
 function parseIncrementalReflection(raw) {
     let s = (raw || '').trim();
@@ -251,12 +270,22 @@ export async function runIncrementalReflection(project, sessionId, recentMessage
             const who = m.role === 'user' ? 'USER' : m.role === 'assistant' ? 'ASSISTANT' : String(m.role || '').toUpperCase();
             return `${who}: ${(m.content || '').slice(0, 2000)}`;
         }).join('\n');
+        // v1.15: 注入既有身份列表(update/remove 的 id 白名单,防 LLM 幻觉 id)
+        let identityList = '(无既有身份记忆)';
+        try {
+            const idb = DatabaseManager.getInstance(proj);
+            const rows = idb.prepare(`SELECT id, substr(text,1,120) AS t FROM memory WHERE type='entity' AND is_active = 1 AND project = ? ORDER BY importance DESC LIMIT 30`).all(proj);
+            if (rows.length > 0)
+                identityList = rows.map(r => `- ${r.id} | ${r.t}`).join('\n');
+        }
+        catch { /* 注入失败不影响反思 */ }
         const userPrompt = `[Session ID] ${sessionId}
 [Existing session snapshot] ${oldSnapshot ?? '(none)'}
 <transcript>
 ${lines}
 </transcript>`;
-        const llm = await callLlm(INCREMENTAL_REFLECT_PROMPT, userPrompt, channel);
+        const promptWithIdentity = INCREMENTAL_REFLECT_PROMPT.replace('{{identityList}}', identityList);
+        const llm = await callLlm(promptWithIdentity, userPrompt, channel);
         if (!llm)
             return { ...base, errors: ['LLM 调用失败'] };
         const parsed = parseIncrementalReflection(llm.content || llm.reasoning);
@@ -314,6 +343,80 @@ ${lines}
             catch (e) {
                 console.error('[reflect-incremental] 会话滚动覆盖失败:', e.message);
             }
+        }
+        // ③ v1.15: 身份维护(identity CRUD,白名单校验在 applyIdentityActions)
+        const idResult = parsed.identity && typeof parsed.identity === 'object'
+            ? await (async () => {
+                const ida = parsed.identity;
+                try {
+                    const r = await applyIdentityActions({
+                        add: Array.isArray(ida.add) ? ida.add.map((a) => ({
+                            text: String(a?.text ?? '').trim(),
+                            tags: Array.isArray(a?.tags) ? a.tags : undefined,
+                            title: typeof a?.title === 'string' ? a.title : undefined,
+                            scoreConfidence: typeof a?.scoreConfidence === 'number' ? a.scoreConfidence : undefined,
+                            scoreImpact: typeof a?.scoreImpact === 'number' ? a.scoreImpact : undefined,
+                            scorePriority: typeof a?.scorePriority === 'number' ? a.scorePriority : undefined,
+                            scoreUrgency: typeof a?.scoreUrgency === 'number' ? a.scoreUrgency : undefined,
+                            metadata: a?.metadata && typeof a.metadata === 'object' ? JSON.stringify(a.metadata) : undefined,
+                        })).filter((x) => x.text) : undefined,
+                        update: Array.isArray(ida.update) ? ida.update.map((u) => ({
+                            id: String(u?.id ?? ''),
+                            mergeStrategy: u?.mergeStrategy === 'replace' ? 'replace' : 'merge',
+                            set: {
+                                text: typeof u?.set?.text === 'string' ? u.set.text : undefined,
+                                tags: Array.isArray(u?.set?.tags) ? u.set.tags : undefined,
+                                title: typeof u?.set?.title === 'string' ? u.set.title : undefined,
+                                status: u?.set?.status,
+                                scoreConfidence: typeof u?.set?.scoreConfidence === 'number' ? u.set.scoreConfidence : undefined,
+                                scorePriority: typeof u?.set?.scorePriority === 'number' ? u.set.scorePriority : undefined,
+                                metadata: u?.set?.metadata && typeof u.set.metadata === 'object' ? JSON.stringify(u.set.metadata) : undefined,
+                            },
+                        })).filter((x) => x.id) : undefined,
+                        remove: Array.isArray(ida.remove) ? ida.remove.map((rm) => ({
+                            id: String(rm?.id ?? ''), reason: typeof rm?.reason === 'string' ? rm.reason : undefined,
+                        })).filter((x) => x.id) : undefined,
+                    }, proj);
+                    if (r.rejected.length > 0)
+                        console.log(`[reflect-incremental] 身份动作拒绝: ${r.rejected.join(', ')}`);
+                    return r;
+                }
+                catch (e) {
+                    console.error('[reflect-incremental] 身份维护失败:', e.message);
+                    return { applied: 0, rejected: [] };
+                }
+            })()
+            : { applied: 0, rejected: [] };
+        // ④ v1.15: 偏好提取(type=preference + 触发条件 metadata + 优先级评分)
+        let prefCount = 0;
+        if (Array.isArray(parsed.preferences)) {
+            for (const p of parsed.preferences) {
+                if (!p || typeof p !== 'object')
+                    continue;
+                const text = typeof p.text === 'string' ? p.text.trim() : '';
+                if (!text)
+                    continue;
+                if (await isDuplicate(proj, text, 'user'))
+                    continue;
+                const meta = p.metadata && typeof p.metadata === 'object'
+                    ? JSON.stringify(p.metadata) : undefined;
+                const sc = p.score || {};
+                try {
+                    await saveMemory({
+                        text: normalizeMarkdown(text, 'user'), type: 'preference', memType: 'user',
+                        metadata: meta,
+                        scorePriority: typeof sc.priority === 'number' ? sc.priority : undefined,
+                        importance: 0.75, project: proj, source: 'reflect_preference',
+                    });
+                    prefCount++;
+                }
+                catch (e) {
+                    console.error('[reflect-incremental] 偏好落库失败:', e.message);
+                }
+            }
+        }
+        if (idResult.rejected.length > 0 || idResult.applied > 0 || prefCount > 0) {
+            console.log(`[reflect-incremental] 身份: +${idResult.applied} (拒 ${idResult.rejected.length});偏好: +${prefCount}`);
         }
         return { ok: true, sessionMemoryUpdated, promoted: promotedCount, errors: [] };
     }

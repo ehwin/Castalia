@@ -40,6 +40,10 @@ export async function saveMemory(params) {
             tier: params.tier ?? 'standard', expiresAt: null,
             isActive: true,
             createdAt: now, updatedAt: now, lastAccessedAt: now, accessedCount: 0,
+            metadata: params.metadata ?? null, title: params.title ?? null, status: params.status ?? null,
+            scoreConfidence: params.scoreConfidence ?? null, scoreImpact: params.scoreImpact ?? null,
+            scorePriority: params.scorePriority ?? null, scoreUrgency: params.scoreUrgency ?? null,
+            identityLocked: params.identityLocked === true,
         };
     }
     // ═══ 向量去重：仅当不跳过 embed 且嵌入可用时执行(仅限同项目) ═══
@@ -92,12 +96,16 @@ export async function saveMemory(params) {
         expiresAt,
         isActive: true,
         createdAt: now, updatedAt: now, lastAccessedAt: now, accessedCount: 0,
+        metadata: params.metadata ?? null, title: params.title ?? null, status: params.status ?? null,
+        scoreConfidence: params.scoreConfidence ?? null, scoreImpact: params.scoreImpact ?? null,
+        scorePriority: params.scorePriority ?? null, scoreUrgency: params.scoreUrgency ?? null,
+        identityLocked: params.identityLocked === true,
     };
     const storeTx = db.transaction(() => {
         db.prepare(`
-      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory, JSON.stringify(record.tags), record.importance, record.characterId, record.source, record.subject, record.tier, record.expiresAt, 1, record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0);
+      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, metadata, title, status, score_confidence, score_impact, score_priority, score_urgency, identity_locked)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory, JSON.stringify(record.tags), record.importance, record.characterId, record.source, record.subject, record.tier, record.expiresAt, 1, record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0, 0, record.metadata, record.title, record.status, record.scoreConfidence, record.scoreImpact, record.scorePriority, record.scoreUrgency, record.identityLocked ? 1 : 0);
         // v5.0: 仅在非 skipEmbed 时写入向量
         if (!skipEmbed && vector) {
             const info = db.prepare('SELECT rowid FROM memory WHERE id = ?').get(record.id);
@@ -132,6 +140,10 @@ export function forgetMemory(id, project) {
     const found = findDbByMemoryId(id, project);
     if (!found)
         return false;
+    // v1.15: identity_locked=1 的身份记忆禁止自动软删(LLM 提取的 remove 会被拦,人工可先解锁)
+    const row = found.db.prepare('SELECT identity_locked FROM memory WHERE id = ? AND is_active = 1').get(id);
+    if (row && row.identity_locked === 1)
+        return false;
     return found.db.prepare('UPDATE memory SET is_active = 0 WHERE id = ?').run(id).changes > 0;
 }
 export function restoreMemory(id, project) {
@@ -157,9 +169,9 @@ export async function updateMemory(id, updates) {
         const tags = updates.tags !== undefined ? JSON.stringify(updates.tags) : (existing.tags ?? '[]');
         const now = new Date().toISOString();
         newDb.prepare(`
-      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-    `).run(id, text, proj, existing.session_id, updates.type !== undefined ? updates.type : existing.type, newMt, updates.category !== undefined ? updates.category : existing.category, updates.subcategory !== undefined ? updates.subcategory : existing.subcategory, tags, updates.importance !== undefined ? updates.importance : existing.importance, updates.characterId !== undefined ? updates.characterId : existing.character_id, updates.source !== undefined ? updates.source : existing.source, updates.subject !== undefined ? updates.subject : existing.subject, updates.tier !== undefined ? updates.tier : existing.tier, existing.expires_at ?? null, existing.created_at, now, now, existing.accessed_count, existing.reference_count ?? 0, existing.locked ?? 0);
+      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, metadata, title, status, score_confidence, score_impact, score_priority, score_urgency, identity_locked)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, text, proj, existing.session_id, updates.type !== undefined ? updates.type : existing.type, newMt, updates.category !== undefined ? updates.category : existing.category, updates.subcategory !== undefined ? updates.subcategory : existing.subcategory, tags, updates.importance !== undefined ? updates.importance : existing.importance, updates.characterId !== undefined ? updates.characterId : existing.character_id, updates.source !== undefined ? updates.source : existing.source, updates.subject !== undefined ? updates.subject : existing.subject, updates.tier !== undefined ? updates.tier : existing.tier, existing.expires_at ?? null, existing.created_at, now, now, existing.accessed_count, existing.reference_count ?? 0, existing.locked ?? 0, updates.metadata !== undefined ? updates.metadata : (existing.metadata ?? null), updates.title !== undefined ? updates.title : (existing.title ?? null), updates.status !== undefined ? updates.status : (existing.status ?? null), updates.scoreConfidence !== undefined ? updates.scoreConfidence : (existing.score_confidence ?? null), updates.scoreImpact !== undefined ? updates.scoreImpact : (existing.score_impact ?? null), updates.scorePriority !== undefined ? updates.scorePriority : (existing.score_priority ?? null), updates.scoreUrgency !== undefined ? updates.scoreUrgency : (existing.score_urgency ?? null), updates.identityLocked !== undefined ? (updates.identityLocked ? 1 : 0) : (existing.identity_locked ?? 0));
         // 向量一并搬移(若有)
         try {
             const srcVec = db.prepare('SELECT embedding FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id = ?)').get(id);
@@ -209,6 +221,39 @@ export async function updateMemory(id, updates) {
     if (updates.importance !== undefined) {
         fields.push('importance = ?');
         values.push(updates.importance);
+    }
+    // v1.15: LobeHub 精细化吸收
+    if (updates.metadata !== undefined) {
+        fields.push('metadata = ?');
+        values.push(updates.metadata);
+    }
+    if (updates.title !== undefined) {
+        fields.push('title = ?');
+        values.push(updates.title);
+    }
+    if (updates.status !== undefined) {
+        fields.push('status = ?');
+        values.push(updates.status);
+    }
+    if (updates.scoreConfidence !== undefined) {
+        fields.push('score_confidence = ?');
+        values.push(updates.scoreConfidence);
+    }
+    if (updates.scoreImpact !== undefined) {
+        fields.push('score_impact = ?');
+        values.push(updates.scoreImpact);
+    }
+    if (updates.scorePriority !== undefined) {
+        fields.push('score_priority = ?');
+        values.push(updates.scorePriority);
+    }
+    if (updates.scoreUrgency !== undefined) {
+        fields.push('score_urgency = ?');
+        values.push(updates.scoreUrgency);
+    }
+    if (updates.identityLocked !== undefined) {
+        fields.push('identity_locked = ?');
+        values.push(updates.identityLocked ? 1 : 0);
     }
     if (fields.length === 0)
         return existing;
@@ -526,4 +571,82 @@ export function deleteSessionFragments(project, sessionId) {
     WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1
   `).run(proj, sessionId);
     return r.changes;
+}
+export async function applyIdentityActions(actions, project) {
+    const rejected = [];
+    let applied = 0;
+    // add:新身份事实(不走 exact-dup 抑制?保留,重复文本仍会 reference_count++,天然防重复)
+    for (const a of actions.add ?? []) {
+        await saveMemory({
+            text: a.text, type: 'entity', tags: a.tags, title: a.title,
+            importance: a.importance ?? 0.7, metadata: a.metadata, project,
+            scoreConfidence: a.scoreConfidence, scoreImpact: a.scoreImpact,
+            scorePriority: a.scorePriority, scoreUrgency: a.scoreUrgency,
+        });
+        applied++;
+    }
+    // update:id 白名单校验(存在 + type=entity + active)
+    for (const u of actions.update ?? []) {
+        const found = findDbByMemoryId(u.id, project);
+        if (!found) {
+            rejected.push(`update:unknown-id:${u.id}`);
+            continue;
+        }
+        const existing = found.db.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(u.id);
+        if (!existing) {
+            rejected.push(`update:inactive:${u.id}`);
+            continue;
+        }
+        if (existing.type !== 'entity') {
+            rejected.push(`update:not-entity:${u.id}`);
+            continue;
+        }
+        if (u.mergeStrategy === 'replace') {
+            await updateMemory(u.id, { ...u.set, project, type: 'entity' });
+        }
+        else {
+            // merge:tags 合并去重、metadata 对象级 merge,其余字段由 set 覆盖
+            const merged = { ...u.set, project, type: 'entity' };
+            if (u.set.tags && existing.tags) {
+                try {
+                    merged.tags = [...new Set([...JSON.parse(existing.tags), ...u.set.tags])];
+                }
+                catch { /* 保持 set */ }
+            }
+            if (u.set.metadata && existing.metadata) {
+                try {
+                    merged.metadata = JSON.stringify({ ...JSON.parse(existing.metadata), ...JSON.parse(u.set.metadata) });
+                }
+                catch { /* 保持 set */ }
+            }
+            await updateMemory(u.id, merged);
+        }
+        applied++;
+    }
+    // remove:白名单校验 + identity_locked 保护(forgetMemory 内二次校验)
+    for (const r of actions.remove ?? []) {
+        const found = findDbByMemoryId(r.id, project);
+        if (!found) {
+            rejected.push(`remove:unknown-id:${r.id}`);
+            continue;
+        }
+        const existing = found.db.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(r.id);
+        if (!existing) {
+            rejected.push(`remove:inactive:${r.id}`);
+            continue;
+        }
+        if (existing.type !== 'entity') {
+            rejected.push(`remove:not-entity:${r.id}`);
+            continue;
+        }
+        if (existing.identity_locked === 1) {
+            rejected.push(`remove:locked:${r.id}`);
+            continue;
+        }
+        if (forgetMemory(r.id, project))
+            applied++;
+        else
+            rejected.push(`remove:failed:${r.id}`);
+    }
+    return { applied, rejected };
 }

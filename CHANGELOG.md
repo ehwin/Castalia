@@ -3,6 +3,14 @@
 > 本文件记录每次功能/架构变更,供 AIRI 主系统(`D:\system\AIRI\memory`)吸收改进时快速对账。
 > 格式:Keep a Changelog 简化版(Added / Changed / Fixed / Removed)。
 
+## [v1.16.0] — 2026-09-11 cosmograph-org 宇宙图(星图在 Full)
+
+> Lite 本仓无联邦星图。宇宙视图落在 **Castalia-Full**:顶栏「星系 / 宇宙」,嵌入 PCA 铺点,细丝连线。方案:`docs/吸收方案-Cosmograph.md`。
+> 结论:吸收 cosmograph-org 的宇宙图语义,不搬 Obsidian 行星大陆,也不把引擎换成 cosmos.gl。
+
+
+> **工程固化(2026-09-12)**:src/search.ts 补 decay 分级(与 Full 09-05 修复同源,build 0 error);dist 对齐当前 src;吸收方案文档入库;mock/备份目录入 gitignore。
+
 ## [v1.15.0] — 2026-08-24 LobeHub 精细化吸收(身份 CRUD + 四维评分 + 偏好触发条件)
 
 > 调研 LobeHub 2.2.14 memory-user-memory 源码后确认:五层语义已由 type 性质维度(episodic/semantic/entity/preference)+ categories 查询表 + memory_log 覆盖;本次吸收其"精细化"设计(identity CRUD / 评分 / 偏好触发条件),gatekeeper 预筛经用户拍板不做(缓冲+增量反思+双查重已覆盖)。
