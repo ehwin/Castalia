@@ -303,6 +303,43 @@ export function initProjectSchema(db) {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_mem_type ON memory(mem_type, is_active)`);
     }
     catch (_e) { }
+    // v1.15: LobeHub 精细化吸收 — 四维评分/元数据/身份 CRUD 维护
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN metadata TEXT`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN title TEXT`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN status TEXT`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN score_confidence REAL`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN score_impact REAL`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN score_priority REAL`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN score_urgency REAL`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN identity_locked INTEGER DEFAULT 0`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type, is_active)`);
+    }
+    catch (_e) { }
     // Unique index for fact dedup (per-project: same SPO allowed across projects)
     try {
         db.exec(`DROP INDEX IF EXISTS idx_facts_spo`);

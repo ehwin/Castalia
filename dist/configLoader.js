@@ -76,6 +76,8 @@ try {
         }
         // 嵌入模型配置
         const emb = cfg.embedding || {};
+        if (emb.mode)
+            process.env.EMBED_MODE = String(emb.mode).toLowerCase();
         if (emb.mode === 'api') {
             if (emb.api_url)
                 process.env.OLLAMA_URL = emb.api_url.replace(/\/+$/, '');
@@ -84,8 +86,7 @@ try {
             if (emb.api_key && !process.env.EMBEDDING_API_KEY)
                 process.env.EMBEDDING_API_KEY = emb.api_key;
         }
-        else {
-            // 默认 Ollama 模式
+        else if (emb.mode !== 'none') {
             if (emb.ollama_url)
                 process.env.OLLAMA_URL = emb.ollama_url.replace(/\/+$/, '');
             if (emb.model)
@@ -108,6 +109,8 @@ try {
             process.env.REFLECT_MIN_GAP_HOURS = String(ref.minGapHours);
         if (ref.minUnanalyzed != null)
             process.env.REFLECT_MIN_UNANALYZED = String(ref.minUnanalyzed);
+        if (ref.intervalHours != null)
+            process.env.REFLECT_INTERVAL_HOURS = String(ref.intervalHours);
         // v1.11: triage(LLM1 入站分拣)配置 — admin 第三个通道
         const tri = cfg.triage || {};
         if (tri.llm_url)
@@ -119,6 +122,8 @@ try {
         // v1.11 Part2: 渐进式临时反思配置(admin 留路;缺省用 env/默认值)
         if (tri.bufferSize != null)
             process.env.BUFFER_SIZE = String(tri.bufferSize);
+        if (tri.bufferTokens != null)
+            process.env.BUFFER_TOKENS = String(tri.bufferTokens);
         if (tri.sessionTtlDays != null)
             process.env.SESSION_MEMORY_TTL_DAYS = String(tri.sessionTtlDays);
         // v1.10: 记忆整合配置(可选,给 admin 界面留路;没有则用 env/默认值)
@@ -127,6 +132,8 @@ try {
             process.env.CONSOLIDATE_MIN_MEMORIES = String(cons.minMemories);
         if (cons.similarity != null)
             process.env.CONSOLIDATE_SIMILARITY = String(cons.similarity);
+        if (cons.autoOnStart != null)
+            process.env.CONSOLIDATE_AUTO_ON_START = (cons.autoOnStart === false || cons.autoOnStart === 0 || cons.autoOnStart === '0') ? '0' : '1';
         console.error(`[config] loaded ${CONFIG_PATH} (embed=${emb.mode || 'ollama'}, reflect=${ref.model || 'unset'}, facts=${process.env.REFLECT_FACT_EXTRACTION || 'auto'}, consolidate=${process.env.CONSOLIDATE_MIN_MEMORIES || '15'}/${process.env.CONSOLIDATE_SIMILARITY || '0.88'}, triage=${tri.model || 'unset'}, buffer=${process.env.BUFFER_SIZE || '5'}, sessionTtl=${process.env.SESSION_MEMORY_TTL_DAYS || '7'}d)`);
     }
 }

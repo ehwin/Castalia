@@ -11,3 +11,7 @@ reflect-receipts/
 keys.enc
 keys.key
 memory/receipts/
+
+# 设计稿工作目录(本地保留,不入库)
+_ui-redesign-mock/
+docs/_bak-20260824/

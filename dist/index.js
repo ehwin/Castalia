@@ -406,6 +406,35 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
             }
         }
         sections.push(`【当前记忆上下文】总记忆 ${stats.c} 条。请优先参考以下记忆,它们是之前会话沉淀的事实与经验:`);
+        // v1.15: 用户偏好段(带触发条件,score_priority 排序,最先展示)
+        const prefs = db.prepare(`
+        SELECT text, metadata, score_priority FROM memory
+        WHERE is_active = 1 AND project = ? AND type = 'preference' AND mem_type = 'user'
+        ORDER BY COALESCE(score_priority, 0) DESC, importance DESC LIMIT 8
+      `).all(proj);
+        if (prefs.length > 0) {
+            sections.push(`\n■ 用户偏好(跨会话行为指令,优先遵守):`);
+            prefs.forEach((p, i) => {
+                let ctxLine = '';
+                try {
+                    const meta = JSON.parse(p.metadata || '{}');
+                    const oc = meta.originContext;
+                    if (oc) {
+                        const parts = [];
+                        if (oc.trigger)
+                            parts.push(`触发:${oc.trigger}`);
+                        if (oc.applicableWhen)
+                            parts.push(`适用:${oc.applicableWhen}`);
+                        if (oc.notApplicableWhen)
+                            parts.push(`不适用:${oc.notApplicableWhen}`);
+                        if (parts.length)
+                            ctxLine = ` (${parts.join(';')})`;
+                    }
+                }
+                catch { /* metadata 非 JSON 忽略 */ }
+                sections.push(`${i + 1}. ${String(p.text || '').replace(/^# .*\n/, '')}${ctxLine}`);
+            });
+        }
         if (recent.length > 0) {
             sections.push(`\n■ 近期重要记忆(近 ${hoursBack} 小时):`);
             recent.forEach((m, i) => {
