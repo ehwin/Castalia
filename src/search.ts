@@ -70,11 +70,32 @@ function timeDecay(hoursSinceCreated: number): number {
   return Math.pow(0.5, hoursSinceCreated / HALF_LIFE_HOURS);
 }
 
+// 时效类内容(对话/卦例/会话记录)半衰期缩短 —— 六爻卦例按时间慢慢丢(可配,默认 10 天)
+const EPHEMERAL_HALF_LIFE_HOURS = parseFloat(process.env.EPHEMERAL_HALF_LIFE_HOURS || (10 * 24).toString());
+const EPHEMERAL_CATEGORIES = new Set(['conversation', '卦例', 'session', 'context']);
+
+/**
+ * 分级时间衰减:
+ * - critical 定案/权威结论(术数定盘、大运口径、身份/里程碑)→ 时间不衰减(ban 时间,永葆权威)
+ * - 时效类(对话/卦例/会话记录)→ 短半衰期,自然沉底「慢慢丢」
+ * - 其余(standard 画像等)→ 默认 30 天半衰期
+ */
+function decayFor(row: any, hoursSinceCreated: number): number {
+  if (hoursSinceCreated <= 0) return 1;
+  if (row.tier === 'critical') return 1;  // 术数结论 ban 时间衰减
+  const cat = row.category || '';
+  const src = row.source || '';
+  if (EPHEMERAL_CATEGORIES.has(cat) || src === 'conversation_log' || src === 'session_memory') {
+    return Math.pow(0.5, hoursSinceCreated / EPHEMERAL_HALF_LIFE_HOURS);
+  }
+  return timeDecay(hoursSinceCreated);
+}
+
 /** 统一评分:一致性 + 情绪(弱) + 时间 */
 function computeScore(similarity: number, row: any): number {
   const consistency = Math.min(Math.max(similarity, 0), 0.85);
   const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
-  const decay = timeDecay(hoursSinceCreated);
+  const decay = decayFor(row, hoursSinceCreated);
 
   const tierBoost = row.tier === 'critical' ? 2.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
   const importanceMult = 0.5 + (row.importance || 0.5);
