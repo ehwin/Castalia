@@ -118,11 +118,11 @@ python scripts/setup.py json       # print standard mcpServers JSON
 ### Storage layout — per-project DB files
 
 ```
-memory/                          ← MEMORY_DB_DIR(一切记忆的物理载体)
-  global.sqlite                  ← 指令 L1/L2 + 规则组 + 项目注册表
-  project-<name>.sqlite          ← 每项目一库:记忆/向量/facts/指令L3(物理隔离)
-  config.json                    ← 记忆服务配置(embedding/triage/reflect)
-  receipts/                      ← 反思回执
+memory/                              ← MEMORY_DB_DIR(一切记忆的物理载体)
+  global.sqlite                      ← 指令 L1/L2 + 规则组 + 项目注册表
+  <project>/<memType>/memory.sqlite  ← memdir:项目 × 分类文件夹 各一库(物理隔离)
+  config.json                        ← 记忆服务配置(embedding/triage/reflect)
+  receipts/                          ← 反思回执
 ```
 
 **Per-project physical isolation**: project A's memories, vectors and facts live in their own `.sqlite` — backups, deletes and vector KNN never cross project boundaries.
@@ -203,13 +203,13 @@ Memories are **strictly layered** — nothing falls into an unclassified pile, e
 
 ---
 
-## Tools (29, profile-gated)
+## Tools (30, profile-gated)
 
-| Profile | Tools | Purpose |
-|---------|-------|---------|
-| **agent** (6) | `memory_search` / `fact_search` / `memory_get` / `memory_recent` / `memory_index` / `memory_graph` | Read-only recall for the LLM |
-| **harness** (11) | `auto_process` / `conversation_save` / `digest_run` / `reflect_auto` / `reflect_deep` / `reflect_batch_embed` / `memory_save` / `memory_update` / `memory_delete` / `memory_log` / `instruction_save` | Writes + pipeline, called by harness/system |
-| **admin** (12) | `memory_list` / `stats_get` / `recent_conversations` / `daily_summary_data` / `reflect_analyze` / `reflect_apply` / `memory_context` / `context_get` / `project_list` / `instruction_list` / `instruction_delete` / `consolidate_deep` | Management, Web Console |
+| Profile | Representative tools | Purpose |
+|---------|----------------------|---------|
+| **agent** | `memory_search` / `fact_search` / `memory_get` / `memory_recent` / `memory_index` / `memory_graph` | Read-only recall for the LLM |
+| **harness** | `auto_process` / `conversation_save` / `digest_run` / `reflect_auto` / `reflect_deep` / `reflect_batch_embed` / `memory_save` / `memory_update` / `memory_delete` / `memory_log` / `instruction_save` | Writes + pipeline, called by harness/system |
+| **admin** | `memory_list` / `stats_get` / `recent_conversations` / `daily_summary_data` / `reflect_analyze` / `reflect_apply` / `memory_context` / `context_get` / `project_list` / `instruction_list` / `instruction_delete` / `consolidate_deep` | Management, Web Console |
 
 `MCP_TOOLS=all` registers everything (backward compatible).
 
@@ -268,17 +268,17 @@ node server.mjs        # → http://127.0.0.1:3345
 - Config saved to `memory/config.json` (embedding source + triage LLM + reflection LLM), applied on MCP server restart
 - Admin panel configures all **three channels** (embedding / triage / reflect)
 
-### 3D Star Map (v1.14 galaxy layout)
+### 3D Star Map (v1.22 — UMAP semantic layout + density blobs)
 
-The 3D view is organized as a **three-layer fixed galaxy** (no force-simulation drift):
+The 3D view is a **semantic map**, not a decorative layout:
 
-- **L0 project galaxies** — each project is its own galaxy on a sphere (R=210), with a core star
-- **L1 category mini-galaxies** — inside each project, memories group by memType (user/feedback/project/reference/general)
-- **L2 fixed orbit nodes** — Fibonacci sphere distribution around each mini-core; positions locked (`fx/fy/fz`), so nodes never collapse into a blob
-- **Directional bridges** — airi ↔ reflect bidirectional; reflect reads children one-way (arrow indicates direction)
-- **Semantic clusters** (v1.14) — BFS connected components over strong relation edges; same-cluster nodes share glow/edge color
-- Visual: typed edge colors (causal warm / thematic cool), important-node glow, starfield background, auto camera orbit, hover neighbor highlight, particle flow
-
+- **Positions come from UMAP-3D** over the memory embeddings (`umap-js`, vendored — works offline). No force simulation, no Fibonacci shells: a node lands where its *meaning* puts it.
+- **Density blobs** — memories group by `project/memType`; each blob's radius scales with its member count (`R = R_med × (n/n_med)^0.45`), and members relax to a count-derived minimum spacing — big groups *grow* instead of packing.
+- **Blobs separate along all three axes** (rigid translation, vacuum in between); the on-screen badge reports blob count + depth ratio.
+- **Trunk pipelines** — one gate per blob pair, anchored to **support points on the blob surfaces** (never to individual nodes), so a trunk cannot cut through its own blob; near-parallel trunks may share a corridor.
+- **Point-to-point links are hover-only** — no permanent cross-blob spaghetti.
+- **Legend layers** — region (agent/instance) → folder (`memType`) → library (project); hue encodes the folder, shade encodes the library.
+- Vectors that lack an embedding land on a deterministic in-blob spiral (never stacked onto one point).
 
 ---
 

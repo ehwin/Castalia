@@ -17,7 +17,8 @@ import { cleanupExpiredMemories } from './store.js';
 import { normalizeProject } from './env.js';
 
 const MIN_DIGEST_GAP_MS = 60 * 1000;
-let lastDigestTime = 0;
+/* v1.19 B6:digest 热闸 per-project */
+const lastDigestTimeByProject = new Map<string, number>();
 
 export interface DigestResult {
   success: boolean;
@@ -58,18 +59,20 @@ export async function runDigest(characterId: string = 'default', project?: strin
 
 export function maybeDigest(characterId: string = 'default', project?: string): Promise<DigestResult> | null {
   const now = Date.now();
-  if (now - lastDigestTime < MIN_DIGEST_GAP_MS) return null;
+  const proj = normalizeProject(project);
+  const last = lastDigestTimeByProject.get(proj) || 0;
+  if (now - last < MIN_DIGEST_GAP_MS) return null;
 
   const db = DatabaseManager.getInstance(project);
   const unanalyzed = (db.prepare(`
     SELECT COUNT(*) as c FROM memory
-    WHERE is_active = 1 AND source = 'conversation_log'
+    WHERE is_active = 0 AND source = 'conversation_log'  /* v1.19 分隔带 */
       AND last_accessed_at = created_at
   `).get() as any)?.c || 0;
 
   if (unanalyzed === 0) return null;
 
-  lastDigestTime = now;
+  lastDigestTimeByProject.set(proj, now);
   return runDigest(characterId, project);
 }
 
