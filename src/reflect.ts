@@ -568,7 +568,7 @@ export function getUnanalyzedConversations(
   return db.prepare(`
     SELECT id, text, created_at
     FROM memory
-    WHERE is_active = 1
+    WHERE is_active = 0
       AND source = 'conversation_log'
       AND project = ?
       AND created_at > ?

@@ -129,6 +129,7 @@ export const INCREMENTAL_REFLECT_PROMPT = `You are a memory extraction sub-agent
 - 从对话增量中提炼具有跨会话长期价值的信息,分类到上述 4 种封闭类型之一
 - 相对时间必须转成绝对日期(如 2026-08-12);旧快照已包含的信息不要重复 promote
 - 只关注当前任务上下文;用户长期偏好等不依赖单次会话的内容 → 归 promoted 长效
+- 每条 promoted 必须给出语义类别 category(自由词,不超过 4 个词),从这些常用语义中就近取用,没有贴切的就自创准确的:identity(身份属性)/ milestone(里程碑)/ decision(定案结论)/ mistake(教训)/ preference(偏好)/ relationship(关系)/ knowledge(知识)/ emotional(情绪事件)/ conversation(对话存档)/ session(会话状态);禁用 'session_promoted' 这种机制名
 
 【任务3:身份维护(identity)】— 仅当对话涉及用户身份/关系/属性/角色变化时才输出。
 【既有身份列表】(update/remove 的 id 必须从下面选择,禁止发明新 id;找不到对应 → 用 add):
@@ -150,7 +151,7 @@ export const INCREMENTAL_REFLECT_PROMPT = `You are a memory extraction sub-agent
 {
   "sessionMemory": "更新后的滚动状态(无变化可省略此字段)",
   "promoted": [
-    {"memType": "user", "text": "长效记忆内容"}
+    {"memType": "user", "text": "长效记忆内容", "category": "milestone"}
   ],
   "identity": {"add": [], "update": [], "remove": []},
   "preferences": []
@@ -309,7 +310,8 @@ ${lines}
                     skippedDup++;
                     continue;
                 }
-                promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw) });
+                const catRaw = typeof raw.category === 'string' ? String(raw.category).trim().slice(0, 40) : undefined;
+                promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw), category: catRaw || undefined });
             }
         }
         if (skippedDup > 0)

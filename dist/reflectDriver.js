@@ -144,8 +144,19 @@ function outputFormatSpec(factExtraction, maxFacts) {
 }
 
 【actions 规则】
-- 仅当确实需要整理已有记忆时才产生 actions
-- 不需要操作时 actions 为空数组 []
+- 仅当确实需要整理已有记忆时才产生 actions；不需要操作时 actions 为空数组 []
+- 字段必须严格按下面 8 种写(字段名写错会被直接拒收)：
+  merge      {"action":"merge","sourceIds":["id1","id2"],"newText":"合并后的文本","newType":"episodic","newCategory":"conversation","newTags":["标签"],"newImportance":0.5}
+  extract    {"action":"extract","sourceId":"id","newText":"提取的文本","newType":"semantic","newCategory":"identity","newTags":["标签"],"newImportance":0.9,"tier":"critical","newMemType":"user"}
+  split      {"action":"split","targetId":"id","fragments":[{"text":"片段1"},{"text":"片段2"}]}
+  relate     {"action":"relate","sourceId":"id","targetIdRelate":"id2","relationType":"sequence"}
+  reclassify {"action":"reclassify","targetId":"id","newText":"改写后的文本","newCategory":"milestone"}
+  delete     {"action":"delete","targetId":"id"}
+  boost      {"action":"boost","targetId":"id","delta":0.2}
+  decay      {"action":"decay","targetId":"id","delta":-0.2}
+- 禁止省略 targetId / sourceId；禁止自造字段名(如 id / ids / target / targetIdRelate 写成 target)
+【长度纪律】一次最多输出 12 条 action(按重要性排序,宁少勿滥)；
+JSON 必须完整闭合——内容多时先减少 action 条数、facts 条数，绝不允许写到一半断掉。
 ${memTypeRules()}
 ${factExtraction === 'off'
         ? '【facts】本轮不提取 facts。'
@@ -252,28 +263,122 @@ ${outputFormatSpec(factExtraction, maxFacts)}
 export const REFLECT_SYSTEM_PROMPT = buildReflectSystemPrompt();
 export const DEEP_REFLECT_PROMPT = buildDeepReflectPrompt();
 /**
+ * 按当前解析状态补全未闭合的括号与字符串(用于截断救济)
+ * 只做词法扫描,不解析语义:字符串内的括号不计数,被截断的字符串补引号,左括号逐个补右括号。
+ */
+function closeBrackets(x) {
+    let inStr = false, esc = false;
+    const stack = [];
+    for (const ch of x) {
+        if (esc) {
+            esc = false;
+            continue;
+        }
+        if (ch === '\\') {
+            esc = true;
+            continue;
+        }
+        if (ch === '"') {
+            inStr = !inStr;
+            continue;
+        }
+        if (inStr)
+            continue;
+        if (ch === '{' || ch === '[')
+            stack.push(ch);
+        else if (ch === '}' || ch === ']')
+            stack.pop();
+    }
+    let out = x;
+    if (inStr)
+        out += '"';
+    while (stack.length)
+        out += (stack.pop() === '[' ? ']' : '}');
+    return out;
+}
+/** 常见坏 JSON 修补:尾随逗号 / 裸控制字符 / 非法反斜杠转义(LLM 写 Windows 路径 `D:\AI\x` 时必犯) */
+function repairJson(x) {
+    return x
+        .replace(/,\s*([}\]])/g, '$1')
+        .replace(/[\x00-\x1f]+/g, ' ')
+        .replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
+}
+/** 判断末尾是否停在未闭合的字符串字面量里(截断的典型特征) */
+function endsInsideString(x) {
+    let inStr = false, esc = false;
+    for (const ch of x) {
+        if (esc) {
+            esc = false;
+            continue;
+        }
+        if (ch === '\\') {
+            esc = true;
+            continue;
+        }
+        if (ch === '"') {
+            inStr = !inStr;
+        }
+    }
+    return inStr;
+}
+/**
+ * 截断救济:LLM 输出被 max_tokens 截断时(常见:action 条数多),
+ * 从尾部逐级回退到最后一个完整元素的收尾符,丢弃残缺元素后补全括号再解析。
+ * 宁可少应用几条 action,也不要整轮丢弃。
+ */
+function salvageTruncatedJson(body) {
+    const accept = (x) => {
+        try {
+            const r = JSON.parse(repairJson(x));
+            if (Array.isArray(r))
+                return { actions: r };
+            if (r && typeof r === 'object')
+                return r;
+        }
+        catch { /* keep trimming */ }
+        return null;
+    };
+    let cut = body.length;
+    // 末尾停在未闭合字符串 → 最后一条元素残缺:回退到"上一个完整元素的收尾符"再补括号,
+    // 不能退到元素内部的逗号(那会把残缺元素补成半个对象,如 {action:"merge"})
+    if (endsInsideString(body)) {
+        const next = Math.max(body.lastIndexOf('}', cut - 1), body.lastIndexOf(']', cut - 1));
+        if (next > 1)
+            cut = next;
+    }
+    for (let i = 0; i < 80 && cut > 1; i++) {
+        const cand = body.slice(0, cut).replace(/[,\s]+$/, '');
+        const r = accept(closeBrackets(cand));
+        if (r)
+            return r;
+        const next = Math.max(body.lastIndexOf(',', cut - 1), body.lastIndexOf('}', cut - 1), body.lastIndexOf(']', cut - 1));
+        if (next <= 1)
+            break;
+        cut = next;
+    }
+    return null;
+}
+/**
  * 多策略解析 LLM 返回的 JSON(容忍常见错误)
  * 支持 [...] 数组和 {...} 对象,以及 markdown 代码围栏包裹:
  *   - 数组 → 包成 { actions: [...] }(老 prompt 的只返回数组格式)
  *   - 对象 → 原样返回
+ *   - 被 max_tokens 截断 → 回退到最后一个完整元素并补全括号(salvageTruncatedJson)
  */
-function parseJsonRobust(raw) {
+export function parseJsonRobust(raw) {
     let s = (raw || '').trim();
     // 剥离 markdown 代码围栏
     const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (fence)
         s = fence[1].trim();
-    // 提取最外层 {...} 或 [...] 块
+    // 提取最外层 {...} 或 [...] 块;有前导文字时从首个括号取到结尾(不要贪心到最后一个 '}',
+    // 否则截断输出的尾部会被切掉,救济就无从下手)
     const body = (() => {
         if (s.startsWith('{') || s.startsWith('['))
             return s;
-        const obj = s.match(/\{[\s\S]*\}/);
-        if (obj)
-            return obj[0];
-        const arr = s.match(/\[[\s\S]*\]/);
-        if (arr)
-            return arr[0];
-        return null;
+        const i = Math.min(...[{ '{': s.indexOf('{') }, { '[': s.indexOf('[') }]
+            .map(o => Object.values(o)[0]).filter(v => v >= 0).concat([Number.MAX_SAFE_INTEGER]));
+        return Number.isFinite(i) && i < Number.MAX_SAFE_INTEGER ? s.slice(i) : null;
     })();
     if (!body)
         return null;
@@ -294,7 +399,8 @@ function parseJsonRobust(raw) {
         }
         catch { /* try next */ }
     }
-    return null;
+    // 收尾:截断救济(内部第一步即"补全原 body",失败再逐级回退元素边界)
+    return salvageTruncatedJson(body);
 }
 /** 把 parseJsonRobust 结果规范化为 applyReflectResult 期望的 ReflectResult */
 function normalizeReflectResult(parsed) {
@@ -319,30 +425,40 @@ export async function callLlm(systemPrompt, userPrompt, channel) {
     const ch = channel ?? makeLlmChannel('reflect');
     if (!ch.apiKey)
         return null;
-    try {
-        const resp = await fetch(`${ch.url}/chat/completions`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ch.apiKey}` },
-            body: JSON.stringify({
-                model: ch.model,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userPrompt },
-                ],
-                max_tokens: 8192,
-                stream: false,
-            }),
-        });
-        if (!resp.ok)
-            throw new Error(`LLM ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-        const data = await resp.json();
-        const msg = data?.choices?.[0]?.message || {};
-        return { content: msg.content || '', reasoning: msg.reasoning_content || '' };
+    // 到 API 的连接偶发被断(大 prompt/限流),单次失败就放弃会让整轮反思白跑 → 退避重试
+    const attempts = Math.max(1, Number(process.env.REFLECT_LLM_RETRIES || 3));
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            const resp = await fetch(`${ch.url}/chat/completions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ch.apiKey}` },
+                body: JSON.stringify({
+                    model: ch.model,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt },
+                    ],
+                    max_tokens: 8192,
+                    stream: false,
+                }),
+            });
+            if (!resp.ok)
+                throw new Error(`LLM ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+            const data = await resp.json();
+            const msg = data?.choices?.[0]?.message || {};
+            return { content: msg.content || '', reasoning: msg.reasoning_content || '' };
+        }
+        catch (e) {
+            const cause = e?.cause ? ` (cause: ${e.cause.code || e.cause.message || String(e.cause)})` : '';
+            if (i >= attempts) {
+                console.error(`[reflect-driver] LLM call failed after ${attempts} tries:`, e.message + cause);
+                return null;
+            }
+            console.error(`[reflect-driver] LLM call failed (try ${i}/${attempts}):`, e.message + cause);
+            await new Promise(r => setTimeout(r, 1500 * i));
+        }
     }
-    catch (e) {
-        console.error('[reflect-driver] LLM call failed:', e.message);
-        return null;
-    }
+    return null;
 }
 /** 日常反思:未分析对话 → 日记浓缩/提取 */
 export async function runAutoReflect(charId, limit = 30, project) {
@@ -374,7 +490,12 @@ export async function runAutoReflect(charId, limit = 30, project) {
         return { ...base, errors: [e.message] };
     }
 }
-/** 深度校准:全量记忆 → 去重/画像/图谱 */
+/**
+ * 深度校准:全量记忆 → 去重/画像/图谱
+ * v1.20: 分批送模型(默认每批 12 条,单次最多 4 批)。一次性塞 30+ 条会让模型输出超过
+ * max_tokens 被截断,JSON 解析失败反而整轮丢弃;分批后每批输出小、必闭合,代价是多次调用。
+ * 可用 REFLECT_DEEP_CHUNK / REFLECT_DEEP_MAXCALLS 调参。
+ */
 export async function runDeepReflect(charId, limit = 500, project) {
     const base = { ok: false, mode: 'deep', actions: 0, applied: 0, errors: [] };
     if (!isReflectConfigured()) {
@@ -394,20 +515,44 @@ export async function runDeepReflect(charId, limit = 500, project) {
             locked: m.locked || 0, source: m.source || '',
             date: (m.createdAt || '').slice(0, 10),
         }));
-        const userPrompt = `全部记忆列表：\n\n${JSON.stringify(slim, null, 1)}\n\n请深度分析，返回 JSON 操作对象。`;
-        const llm = await callLlm(buildDeepReflectPrompt(), userPrompt);
-        if (!llm)
-            return { ...base, errors: ['LLM 调用失败'] };
-        const parsed = parseJsonRobust(llm.content || llm.reasoning);
-        if (!parsed)
-            return { ...base, errors: ['未找到有效 JSON 结果'] };
-        const result = normalizeReflectResult(parsed);
-        const r = await applyReflectResult(result, charId, project);
-        return {
+        const chunk = Math.max(4, Number(process.env.REFLECT_DEEP_CHUNK || 12));
+        const maxCalls = Math.max(1, Number(process.env.REFLECT_DEEP_MAXCALLS || 4));
+        const batches = [];
+        for (let i = 0; i < slim.length; i += chunk)
+            batches.push(slim.slice(i, i + chunk));
+        const out = {
             ok: true, mode: 'deep', memoryCount: memories.length,
-            actions: (result.actions || []).length, applied: r.actionsApplied, errors: r.errors,
-            receipts: r.receipts, factsInserted: r.factsInserted, factsUpdated: r.factsUpdated,
+            actions: 0, applied: 0, factsInserted: 0, factsUpdated: 0, errors: [], receipts: [],
         };
+        let okBatches = 0;
+        for (const batch of batches.slice(0, maxCalls)) {
+            const userPrompt = `记忆列表(${batch.length} 条)：\n\n${JSON.stringify(batch, null, 1)}\n\n请深度分析本批记忆,返回 JSON 操作对象。`;
+            const llm = await callLlm(buildDeepReflectPrompt(), userPrompt);
+            if (!llm) {
+                out.errors.push('LLM 调用失败');
+                continue;
+            }
+            const parsed = parseJsonRobust(llm.content || llm.reasoning);
+            if (!parsed) {
+                out.errors.push('未找到有效 JSON 结果');
+                continue;
+            }
+            const result = normalizeReflectResult(parsed);
+            const r = await applyReflectResult(result, charId, project);
+            okBatches++;
+            out.actions += (result.actions || []).length;
+            out.applied += r.actionsApplied;
+            out.factsInserted = (out.factsInserted || 0) + (r.factsInserted || 0);
+            out.factsUpdated = (out.factsUpdated || 0) + (r.factsUpdated || 0);
+            out.receipts = [...(out.receipts || []), ...(r.receipts || [])];
+            out.errors.push(...(r.errors || []));
+        }
+        if (okBatches === 0)
+            out.ok = false;
+        if (batches.length > maxCalls) {
+            out.errors.push(`本轮只处理 ${maxCalls}/${batches.length} 批(其余留待下轮)`);
+        }
+        return out;
     }
     catch (e) {
         return { ...base, errors: [e.message] };

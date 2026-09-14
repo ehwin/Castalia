@@ -8,7 +8,7 @@ import { DatabaseManager, generateId, listMemTypeDirs } from './db.js';
 import type Database from 'better-sqlite3';
 import { embed, getEmbeddingCached } from './ollama.js';
 import { PROJECT_ID, CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
-import { MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
+import { isMemType,  MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
 
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
@@ -79,7 +79,19 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   const now = new Date().toISOString();
   const skipEmbed = params.skipEmbed === true;
   const project = normalizeProject(params.project);
-  const memType = normalizeMemType(params.memType);
+  /* v1.19 A3:autoClassify — memType 未传时走 triage 分拣 */
+  let memType: MemType;
+  if (params.memType && isMemType(params.memType)) {
+    memType = normalizeMemType(params.memType);
+  } else if ((params as any).autoClassify === true && params.text) {
+    try {
+      const { classifyMemTypeLLM } = await import('./triage.js');
+      const r = await classifyMemTypeLLM(params.text, params.project);
+      memType = r.memType || 'general';
+    } catch { memType = 'general'; }
+  } else {
+    memType = 'general';
+  };
   // v1.8: 4 种封闭类型(memType≠general)且 text 非 Markdown 时,自动规范化包装(加标题行+转列表)
   const text = normalizeMarkdown(params.text, memType);
 
@@ -212,7 +224,15 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
 /** 按 id 定位记忆所在分类库(memdir 遍历),返回库连接+分类;找不到返回 null */
 function findDbByMemoryId(id: string, project?: string): { db: Database.Database; memType: string } | null {
   const proj = normalizeProject(project);
-  for (const mt of listMemTypeDirs(proj)) {
+  const dirs = listMemTypeDirs(proj);
+  /* v1.21:先找**活跃**行。跨 memType 搬家会在源库留 is_active=0 墓碑;旧实现按目录顺序取第一个命中,
+   * 会命中墓碑 → update/forget/restore 打在死行上、真活跃副本留在原地(实测出现"同一 id 两个库同时活跃")。*/
+  for (const mt of dirs) {
+    const db = DatabaseManager.getInstance(proj, mt);
+    if (db.prepare('SELECT id FROM memory WHERE id = ? AND is_active = 1').get(id)) return { db, memType: mt };
+  }
+  for (const mt of dirs) {
+    /* 兜底:只剩死行时(restoreMemory / 软删后清理)按原顺序返回 */
     const db = DatabaseManager.getInstance(proj, mt);
     if (db.prepare('SELECT id FROM memory WHERE id = ?').get(id)) return { db, memType: mt };
   }
@@ -365,12 +385,17 @@ export async function saveConversationTurn(
     moodPrefix += ']\n';
   }
 
-  const text = `${moodPrefix}用户: ${userMsg}\n尤诺: ${assistantMsg}`;
-
+  const text = `用户: ${userMsg}\n尤诺: ${assistantMsg}`;
+  /* v1.19 分隔带:对话原文审计可见(is_active=0),检索/星图只读 is_active=1 → 不进总图;mood 入 metadata */
+  const meta: Record<string, any> = {};
+  if (moodValue !== undefined) {
+    meta.mood = moodValue;
+    if (moodReason) meta.moodReason = moodReason;
+  }
   db.prepare(`
-    INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.5, ?, 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0)
-  `).run(id, text, proj, characterId, now, now, now);
+    INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, metadata)
+    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.3, ?, 'conversation_log', 'user', 'standard', NULL, 0, ?, ?, ?, 0, 0, ?)
+  `).run(id, text, proj, characterId, now, now, now, JSON.stringify(meta));
 
   return { id, ok: true };
 }
@@ -443,10 +468,11 @@ export async function reEmbedMemory(id: string): Promise<boolean> {
  * v1.5: 支持按项目隔离 — 传 project 只处理该项目;不传则默认项目
  * 扫描 is_active=1 但 vec_memory 中无对应向量的记录
  */
-export async function batchEmbedPending(characterId: string = 'airi', project?: string): Promise<{ embedded: number; errors: string[] }> {
-  if (!isEmbedEnabled()) return { embedded: 0, errors: ['embedding disabled (EMBED_MODE=none)'] };
+export async function batchEmbedPending(characterId: string = 'airi', project?: string): Promise<{ embedded: number; embeddedFacts: number; errors: string[] }> {
+  if (!isEmbedEnabled()) return { embedded: 0, embeddedFacts: 0, errors: ['embedding disabled (EMBED_MODE=none)'] };
   const proj = normalizeProject(project);
   let embedded = 0;
+  let embeddedFacts = 0;
   const errors: string[] = [];
   // memdir:遍历项目全部分类库补嵌入
   for (const mt of listMemTypeDirs(proj)) {
@@ -485,7 +511,27 @@ export async function batchEmbedPending(characterId: string = 'airi', project?: 
     }
   }
   }
-  return { embedded, errors };
+  // v1.21: facts 补嵌入 —— saveFacts 只在写入那一刻嵌,历史 facts 会永远缺向量(fact_search 的 KNN 搜不到)
+  try {
+    const fdb = DatabaseManager.getInstance(proj);
+    const pendingFacts = fdb.prepare(`
+    SELECT rowid, subject, predicate, object FROM facts f
+    WHERE f.is_active = 1 AND f.rowid NOT IN (SELECT rowid FROM vec_facts)
+    LIMIT 200
+  `).all() as any[];
+    for (const row of pendingFacts) {
+      try {
+        const factText = `${row.subject} ${row.predicate} ${row.object}`;
+        const vec = new Float32Array(await getEmbeddingCached(factText, proj));
+        fdb.prepare('DELETE FROM vec_facts WHERE rowid = ?').run(BigInt(row.rowid));
+        fdb.prepare('INSERT INTO vec_facts (rowid, embedding) VALUES (?, ?)').run(BigInt(row.rowid), vec);
+        embeddedFacts++;
+      } catch (e: any) {
+        errors.push(`fact#${row.rowid}: ${e.message}`);
+      }
+    }
+  } catch { /* facts 表可能不存在(旧库) */ }
+  return { embedded, embeddedFacts, errors };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -654,20 +700,52 @@ export function upsertSessionMemory(
  */
 export function promoteToProject(
   project: string,
-  items: { memType: MemType; text: string }[],
+  items: { memType: MemType; text: string; category?: string }[],
   characterId?: string,
 ): string[] {
   const cid = characterId || CHAR_ID;
   const proj = normalizeProject(project);
   const now = new Date().toISOString();
   const ids: string[] = [];
+  const gateRejected: Record<string, string[]> = { tooloong: [], noInfo: [], foreign: [], delta: [] };
+  (globalThis as any).__lastPromoteGates = gateRejected;
   for (const item of items || []) {
     const mt = isClosedMemType(item.memType) ? item.memType : undefined;
     const text = typeof item.text === 'string' ? item.text.trim() : '';
     if (!mt || !text) continue;
-    // memdir 路由:反思晋升产物按 memType 落对应分类库
+    /* ── v1.19 promote 三闸(Claude 写前语义回流) ── */
+    if (text.length > 240) { gateRejected.tooloong.push(text.slice(0, 40)); continue; }
+    const infoWords = (text.match(/[\u4e00-\u9fa5A-Za-z0-9]{2,}/g) || []).join('');
+    if (infoWords.length === 0) { gateRejected.noInfo.push(text.slice(0, 40)); continue; }
+    const foreignNames = ['AIRI', 'Castalia', 'LobeHub', 'Hermes'];
+    const homeNames: Record<string, string[]> = { airi: ['AIRI'], lobehub: ['LobeHub'], shushu: ['AIRI', 'Castalia', 'LobeHub'], hermes: ['Hermes'], default: [] };
+    const ban = new Set([...(homeNames[proj] || foreignNames)].filter(x => x && x.toLowerCase() !== proj.toLowerCase()));
+    const hitForeign = [...ban].find(n => text.includes(n));
+    if (hitForeign && !(proj === 'default')) { gateRejected.foreign.push(`${hitForeign}:${text.slice(0, 30)}`); continue; }
     const db = DatabaseManager.getInstance(proj, mt);
     const md = normalizeMarkdown(text, mt);
+    {
+      const existRows = db.prepare(`
+        SELECT text FROM memory
+        WHERE is_active = 1 AND project = ? AND session_id IS NULL AND mem_type = ?
+        ORDER BY updated_at DESC LIMIT 200
+      `).all(proj, mt) as any[];
+      const norm = (x: string) => (x || '').toLowerCase().replace(/[^\u4e00-\u9fa5a-z0-9]+/g, '');
+      const bigrams = (x: string) => { const n = norm(x); const out = new Set<string>(); for (let q = 0; q + 2 <= n.length; q++) out.add(n.slice(q, q + 2)); return out; };
+      const bg = bigrams(md);
+      if (bg.size >= 6) {
+        let dupByDelta = false;
+        for (const r of existRows) {
+          const ob = bigrams(r.text || '');
+          if (ob.size < 6) continue;
+          let inter = 0;
+          for (const g of bg) if (ob.has(g)) inter++;
+          const jac = inter / (bg.size + ob.size - inter);
+          if (jac > 0.72) { dupByDelta = true; break; }
+        }
+        if (dupByDelta) { gateRejected.delta.push(md.slice(0, 40)); continue; }
+      }
+    }
     const dup = db.prepare(`
       SELECT id FROM memory
       WHERE is_active = 1 AND project = ? AND session_id IS NULL AND LOWER(TRIM(text)) = LOWER(TRIM(?))
@@ -677,8 +755,8 @@ export function promoteToProject(
     const id = generateId();
     db.prepare(`
       INSERT INTO memory (id, text, project, session_id, type, mem_type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-      VALUES (?, ?, ?, NULL, 'semantic', ?, 'session_promoted', '[]', 0.6, ?, 'session_promoted', 'user', 'standard', 1, ?, ?, ?, 0, 0)
-    `).run(id, md, proj, mt, cid, now, now, now);
+      VALUES (?, ?, ?, NULL, 'semantic', ?, ?, ?, ?, ?, 'user', 'standard', 1, ?, ?, ?, 0, 0)
+    `).run(id, md, proj, mt, (item.category && String(item.category).trim().slice(0, 40)) || 'promoted', '[]', 0.6, cid, now, now, now);
     ids.push(id);
   }
   return ids;
