@@ -11,7 +11,7 @@ const __dirname = dirname(__filename);
 const ROOT = join(__dirname, '..', '..');   // routes/ 位于 <root>/viz/routes/,ROOT = <root>(castalia-run 等实例根)
 const LEGACY_DB_PATH = process.env.MEMORY_DB_PATH || '';
 const CONFIG_PATH = process.env.MEMORY_CONFIG || (process.env.MEMORY_DB_DIR ? join(process.env.MEMORY_DB_DIR, 'config.json') : join(ROOT, 'memory', 'config.json'));
-const NODE_BIN = process.env.NODE_BIN || (existsSync('D:\\system\\New Folder\\node.exe') ? 'D:\\system\\New Folder\\node.exe' : 'node');
+const NODE_BIN = process.env.NODE_BIN || 'node';
 function resolveMcpServer() {
   if (process.env.CASTALIA_MCP && existsSync(process.env.CASTALIA_MCP)) return process.env.CASTALIA_MCP;
   if (process.env.ANIMA_DIR) {
