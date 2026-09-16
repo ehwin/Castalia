@@ -8,13 +8,15 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NODE137 = r"D:\system\New Folder\node.exe"  # better-sqlite3/sqlite-vec 按 NODE_MODULE_VERSION 137 编译
-NODE = NODE137 if os.path.exists(NODE137) else (shutil.which('node') or NODE137)  # PATH 第一个可能是 Hermes 127,会 ABI 崩溃
+NODE137 = ""  # 不再硬编码本机 node 路径;用 CASTALIA_NODE 或 PATH 里的 node  # better-sqlite3/sqlite-vec 按 NODE_MODULE_VERSION 137 编译
+# node 版本必须与 better-sqlite3 的编译版本一致(ABI 不匹配会直接崩溃)。
+# 可用 CASTALIA_NODE 指定;否则用 PATH 里的 node。
+NODE = os.environ.get('CASTALIA_NODE') or shutil.which('node') or 'node'
 SERVER = os.path.join(ROOT, "dist", "index.js")
 
 # 继承完整系统环境(env 传自定义 dict 会完全替换,导致 node crypto 初始化崩溃)
 env = {**os.environ, **{'MCP_TOOLS': os.environ.get('MCP_TOOLS', 'all'),
-    "OLLAMA_URL": os.environ.get('OLLAMA_URL', "http://127.0.0.1:11435"),
+    "OLLAMA_URL": os.environ.get('OLLAMA_URL', "http://127.0.0.1:11436"),
     "EMBEDDING_MODEL": os.environ.get('EMBEDDING_MODEL', "yuan-embedding-2.0-zh"),
     "MEMORY_DB_PATH": os.path.join(ROOT, "test_smoke.sqlite"),
     "CHAR_ID": "harness-test",

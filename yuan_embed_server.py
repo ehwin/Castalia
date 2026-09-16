@@ -133,6 +133,6 @@ def health():
     return jsonify({"status": "ok", "model": "yuan-embedding-2.0-zh"})
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 11435
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 11436
     _log(f"Yuan-EB Embed Server starting on port {port}")
     app.run(host="127.0.0.1", port=port, threaded=True)
