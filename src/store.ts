@@ -717,8 +717,14 @@ export function promoteToProject(
     if (text.length > 240) { gateRejected.tooloong.push(text.slice(0, 40)); continue; }
     const infoWords = (text.match(/[\u4e00-\u9fa5A-Za-z0-9]{2,}/g) || []).join('');
     if (infoWords.length === 0) { gateRejected.noInfo.push(text.slice(0, 40)); continue; }
-    const foreignNames = ['AIRI', 'Castalia', 'LobeHub', 'Hermes'];
-    const homeNames: Record<string, string[]> = { airi: ['AIRI'], lobehub: ['LobeHub'], shushu: ['AIRI', 'Castalia', 'LobeHub'], hermes: ['Hermes'], default: [] };
+    // 跨库污染闸门:promote 时若文本提到"属于其它库的名字"则拒绝(避免跨库串味)。
+    // 名单按实例配置,公共版不预设任何本地库名 —— 默认不拦:
+    //   CASTALIA_FOREIGN_NAMES="Name1,Name2"      其它库名总表(兜底)
+    //   CASTALIA_HOME_NAMES='{"proj":["Name"]}'   各库自己的名字(优先)
+    const foreignNames = (process.env.CASTALIA_FOREIGN_NAMES || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    let homeNames: Record<string, string[]> = {};
+    try { homeNames = JSON.parse(process.env.CASTALIA_HOME_NAMES || '{}'); } catch { homeNames = {}; }
     const ban = new Set([...(homeNames[proj] || foreignNames)].filter(x => x && x.toLowerCase() !== proj.toLowerCase()));
     const hitForeign = [...ban].find(n => text.includes(n));
     if (hitForeign && !(proj === 'default')) { gateRejected.foreign.push(`${hitForeign}:${text.slice(0, 30)}`); continue; }

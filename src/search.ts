@@ -70,14 +70,15 @@ function timeDecay(hoursSinceCreated: number): number {
   return Math.pow(0.5, hoursSinceCreated / HALF_LIFE_HOURS);
 }
 
-// 时效类内容(对话/卦例/会话记录)半衰期缩短 —— 六爻卦例按时间慢慢丢(可配,默认 10 天)
+// 时效类内容(对话/会话记录)半衰期缩短 —— 六爻卦例按时间慢慢丢(可配,默认 10 天)
 const EPHEMERAL_HALF_LIFE_HOURS = parseFloat(process.env.EPHEMERAL_HALF_LIFE_HOURS || (10 * 24).toString());
-const EPHEMERAL_CATEGORIES = new Set(['conversation', '卦例', 'session', 'context']);
+const EPHEMERAL_CATEGORIES = new Set(
+  (process.env.EPHEMERAL_CATEGORIES || 'conversation,session,context').split(',').map(s => s.trim()).filter(Boolean));
 
 /**
  * 分级时间衰减:
- * - critical 定案/权威结论(术数定盘、大运口径、身份/里程碑)→ 时间不衰减(ban 时间,永葆权威)
- * - 时效类(对话/卦例/会话记录)→ 短半衰期,自然沉底「慢慢丢」
+ * - critical 权威结论/身份/里程碑 → 时间不衰减(永葆可检索)
+ * - 时效类(对话/会话记录)→ 短半衰期,自然沉底(可配 EPHEMERAL_CATEGORIES)
  * - 其余(standard 画像等)→ 默认 30 天半衰期
  */
 function decayFor(row: any, hoursSinceCreated: number): number {

@@ -8,7 +8,7 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NODE = shutil.which('node') or r"D:\system\New Folder\node.exe"  # fallback:本机 node
+NODE = os.environ.get("CASTALIA_NODE") or shutil.which("node") or "node"  # fallback:本机 node
 SERVER = os.path.join(ROOT, "dist", "index.js")
 
 env = {**os.environ, **{'MCP_TOOLS': os.environ.get('MCP_TOOLS', 'all'),

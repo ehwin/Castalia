@@ -28,10 +28,10 @@ timeout /t 5 /nobreak >nul
 curl -s http://127.0.0.1:11436/health || echo  服务未就绪,查看 embed-server.log
 echo.
 echo  就绪后,在你的 MCP 客户端里配置:
-echo    node "D:\AI\castalia\Castalia\dist\index.js"
+echo    node "<this repo>\dist\index.js"
 echo    env: OLLAMA_URL=http://127.0.0.1:11436
 echo         EMBEDDING_MODEL=yuan-embedding-2.0-zh
-echo         MEMORY_DB_PATH=D:\AI\castalia\Castalia\memory.sqlite
+echo         MEMORY_DB_DIR=<this repo>\memory
 echo         CHAR_ID=你的角色ID(可选,默认 airi)
 echo.
 echo  完整示例见 mcp-config.example.json

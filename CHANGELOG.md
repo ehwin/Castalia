@@ -1,6 +1,6 @@
 # Changelog — Castalia(公共版)
 
-> 本文件记录每次功能/架构变更,供 AIRI 主系统(`D:\system\AIRI\memory`)吸收改进时快速对账。
+> 本文件记录每次功能/架构变更,供 AIRI 主系统(`主系统`)吸收改进时快速对账。
 > 格式:Keep a Changelog 简化版(Added / Changed / Fixed / Removed)。
 
 ## [v1.16.0] — 2026-09-11 cosmograph-org 宇宙图(星图在 Full)
@@ -72,7 +72,7 @@
 
 ### 工程
 - 四仓库同步铁律(castalia-run / ai-memory / AIRI/memory / lobehub-run 的 index.html+server.mjs+routes/)md5 一致;`npm run build` EXIT=0;dist 同步三实例
-- Node 版本坑固化:必须用 `D:\system\New Folder\node.exe`(v24 ABI 137;PATH 的 v22 因 better-sqlite3 ABI 不匹配致 /api/graph 返回 0 节点)
+- Node 版本坑固化:必须用 `node`(v24 ABI 137;PATH 的 v22 因 better-sqlite3 ABI 不匹配致 /api/graph 返回 0 节点)
 
 ## [v1.13.0] — 2026-08-16 memdir 存储架构(项目 → 四分类文件夹)
 
@@ -259,8 +259,8 @@
 ### Verified(独立复验,非自报)
 - 三仓库(通用/Anima/主系统)同源补丁 + 各自 `npm run build` exit 0(Anima 保留 charFor/情感列,补丁脚本 `scripts/sync_libs_feature.py`)
 - 运行实例 dist 全量同步(castalia-run/lobehub-run/anima-run);双桥(3310/3312)重启后新 dist 生效
-- 桥端到端:tools/list = 31 工具;`memory_search(projects=['default','shushu'])` 参数接受;`project_create('shared')` ok;`memory_search_all` libraries=3
-- 隔离性实测:存 shushu → 单库搜 default=0 条;跨库搜=1 条且标注 `project=shushu`;联邦搜=1 条且标注 `local/shushu`;测试数据已清理
+- 桥端到端:tools/list = 31 工具;`memory_search(projects=['default','shared'])` 参数接受;`project_create('shared')` ok;`memory_search_all` libraries=3
+- 隔离性实测:存 shared → 单库搜 default=0 条;跨库搜=1 条且标注 `project=shared`;联邦搜=1 条且标注 `local/shared`;测试数据已清理
 - viz 总成页 API:overview 6 库(Hermes×2 + LobeHub×3 + AIRI×1,目录去重生效);聚合搜「记忆」命中 AIRI 5 条;recent 正常;建库 shared(Hermes 侧)成功
 
 ## [v1.11.5] — 2026-08-05 web 管理界面青绿主题改版

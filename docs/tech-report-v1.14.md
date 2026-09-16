@@ -92,7 +92,7 @@ L0 项目星系         project → 球面分布(R=210),核心大星 buildGalaxy
 ## 六、工程铁律(本轮固化)
 
 1. **四仓库同步**:castalia-run / ai-memory / AIRI/memory / lobehub-run 的 index.html + server.mjs + routes/*.js 必须 md5 一致
-2. **Node 版本**:必须 `D:\system\New Folder\node.exe`(v24 ABI 137);PATH 的 v22 因 better-sqlite3 ABI 不匹配致 `/api/graph` 返回 0 节点
+2. **Node 版本**:必须 `node`(v24 ABI 137);PATH 的 v22 因 better-sqlite3 ABI 不匹配致 `/api/graph` 返回 0 节点
 3. **vendor 缓存**:改 vendor 必须换文件名(`-v2` 后缀);纯前端改动不受 1h 缓存影响
 4. **禁止调用** `d3ReheatSimulation()`(vendor 64511 行 state.layout undefined 崩溃)
 5. **验证方法**:headless Edge 截图 + Python 像素分析(颜色分布验证渲染非空 + 聚类生效)
