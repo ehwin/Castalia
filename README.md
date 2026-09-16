@@ -90,6 +90,45 @@ python scripts/setup.py json       # print standard mcpServers JSON
 
 ---
 
+## Federation — collecting any number of memory instances
+
+`memory_search_all` (and cross-library `reflect_all`) can span **any number of memory
+instances** — not a fixed set of three. The key property: **a member needs no code
+changes to be collected.** It only has to be reachable in one of two ways:
+
+| transport | what the member needs | cost | use when |
+|---|---|---|---|
+| `local-dir` | its library files on the same machine (`project-<name>.sqlite`, or `<project>/<memType>/memory.sqlite`) | microseconds | same box |
+| `mcp-http` | **any MCP endpoint** exposing `memory_search` (a Castalia memory bridge qualifies as-is) | milliseconds | other process / other machine / other backend |
+
+Configure members with `FEDERATION_MEMBERS`:
+
+```jsonc
+[
+  { "id": "hermes", "transport": "local-dir", "target": "D:/banks/hermes", "variant": "lite" },
+  { "id": "airi", "label": "Castalia Anima", "variant": "anima",
+    "capabilities": ["emotion"], "transport": "mcp-http",
+    "target": "http://127.0.0.1:3320/mcp" }
+]
+```
+
+Legacy `FEDERATION_DIRS` (`[{"name":"...","dir":"..."}]`) keeps working — every entry
+becomes a `local-dir` member, so existing deployments do not change behaviour.
+
+Notes:
+
+* **Explicit semantics, unchanged**: the engine still does *not* merge libraries on its
+  own — the caller decides interop policy. Results carry `instance`, `member`, `project`.
+* **Read-only, always**: providers never write to a peer.
+* **One bad member never breaks a search**: failures are collected in the result's
+  `errors` array instead of silently looking like "no hits".
+* **Capabilities are declarative**: `variant` / `capabilities` let a collector filter
+  members (e.g. only `emotion` members) instead of hard-coding instance names.
+
+Adding a new kind of member = adding one provider file under `src/federation/`
+(implement `FedProvider`: `available()` / `describe()` / `search()`, plus
+`libraries()` if the members' files are directly readable). Nothing else changes.
+
 ## Architecture Overview (v1.11)
 
 ```
