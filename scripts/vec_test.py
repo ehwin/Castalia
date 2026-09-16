@@ -59,7 +59,7 @@ try:
     mems = [
         "用户喜欢喝美式咖啡,每天早上都要一杯",
         "用户最近在测试一个纯记忆体框架,用于 harness 内测",
-        "用户在研究紫微斗数和六爻古籍的数字化",
+        "用户在研究紫微斗数和示例古籍的数字化",
     ]
     for m in mems:
         r = call_tool("memory_save", {"text": m, "type": "episodic", "category": "conversation", "tags": ["test"], "importance": 0.6})
