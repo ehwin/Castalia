@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AI Memory MCP Server — standalone memory framework for agent harnesses
+ * Castalia — standalone memory framework for agent harnesses (MCP)
  *
  * 全部功能通过标准 MCP 协议暴露。
  * 工具分两类：搜索/存储类工具（LLM 可见），
@@ -1127,7 +1127,7 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('[airi-memory] v5.0.0 started — unified MCP server (proxy + LLM tools)');
+  console.error(`[${SERVER_NAME}] v${SERVER_VERSION} started — unified MCP server (proxy + LLM tools)`);
 
   // ═══ 启动时自动反思 ═══
   // 触发逻辑:条件达成(距上次反思 ≥ REFLECT_MIN_GAP_HOURS 且未分析对话 > REFLECT_MIN_UNANALYZED)

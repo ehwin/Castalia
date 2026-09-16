@@ -13,6 +13,8 @@ Designed after studying Claude Code's memory architecture (closed memory types, 
 
 ---
 
+> 📦 **New here? Read [INSTALL.md](INSTALL.md)** — full setup steps, including the npm 12 native-module pitfall that makes the engine fail to start.
+
 ## Quick Start
 
 ### 1. Build + verify
