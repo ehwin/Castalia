@@ -28,7 +28,7 @@ function timeDecay(hoursSinceCreated) {
         return 1;
     return Math.pow(0.5, hoursSinceCreated / HALF_LIFE_HOURS);
 }
-// 时效类内容(对话/会话记录)半衰期缩短 —— 六爻卦例按时间慢慢丢(可配,默认 10 天)
+// 时效类内容(对话/会话记录)半衰期缩短,自然沉底(可配,默认 10 天)
 const EPHEMERAL_HALF_LIFE_HOURS = parseFloat(process.env.EPHEMERAL_HALF_LIFE_HOURS || (10 * 24).toString());
 const EPHEMERAL_CATEGORIES = new Set((process.env.EPHEMERAL_CATEGORIES || 'conversation,session,context').split(',').map(s => s.trim()).filter(Boolean));
 /**
@@ -41,7 +41,7 @@ function decayFor(row, hoursSinceCreated) {
     if (hoursSinceCreated <= 0)
         return 1;
     if (row.tier === 'critical')
-        return 1; // 术数结论 ban 时间衰减
+        return 1; // 权威结论不随时间衰减
     const cat = row.category || '';
     const src = row.source || '';
     if (EPHEMERAL_CATEGORIES.has(cat) || src === 'conversation_log' || src === 'session_memory') {
