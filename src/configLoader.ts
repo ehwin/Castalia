@@ -99,6 +99,8 @@ try {
     if (ref.model) process.env.REFLECT_LLM_MODEL = ref.model;
     if (ref.factExtraction) process.env.REFLECT_FACT_EXTRACTION = String(ref.factExtraction);
     if (ref.maxFacts != null) process.env.REFLECT_MAX_FACTS = String(ref.maxFacts);
+    // 重路径(总反思/深度/整合)的输出预算;浅层(triage/reflect_auto)不受影响
+    if (ref.maxTokens != null) process.env.REFLECT_DEEP_MAX_TOKENS = String(ref.maxTokens);
     // v1.9: 启动自动反思阈值(可选,给 admin 界面留路;没有则用 env/默认值)
     if (ref.minGapHours != null) process.env.REFLECT_MIN_GAP_HOURS = String(ref.minGapHours);
     if (ref.minUnanalyzed != null) process.env.REFLECT_MIN_UNANALYZED = String(ref.minUnanalyzed);

@@ -14,7 +14,7 @@
  *   REFLECT_INTERVAL_HOURS auto-reflect interval (hours), 0 = off, default 0
  */
 import { getUnanalyzedConversations, listAllMemories, applyReflectResult, applyReflectActions, ReflectAction, ReflectReceipt, ReflectResult } from './reflect.js';
-import { DatabaseManager } from './db.js';
+import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { isMemType } from './memType.js';
 import { findSimilarCandidates, SimilarCandidate, CONSOLIDATE_SIMILARITY, CONSOLIDATE_MAX_PAIRS } from './consolidate.js';
@@ -437,10 +437,21 @@ export interface LlmResponse {
 }
 
 /**
+ * v1.11.3 重路径(总反思/深度反思/整合)的输出预算 —— 与浅层(triage 临时反思 / reflect_auto)分开。
+ * 为什么需要:推理模型(如 deepseek-v4-pro)的**思考 token 也计入 max_tokens**,8192 会被"想"吃光,
+ * 返回 finish_reason=length 且 content 为空 → 整合报 `未找到有效 JSON 结果`(实测 reasoning 18600 字符)。
+ * 浅层仍走 callLlm 的 8192 默认值,不受此影响。config.json 的 `reflect.maxTokens` 可覆盖。
+ */
+export const REFLECT_DEEP_MAX_TOKENS = (() => {
+  const v = parseInt(process.env.REFLECT_DEEP_MAX_TOKENS || '32768', 10);
+  return Number.isFinite(v) && v >= 1024 ? v : 32768;
+})();
+
+/**
  * 调用 LLM(OpenAI 兼容,非流式)。
  * 通道:缺省用 reflect(REFLECT_*);传 channel 则用指定通道(triage/reflect)。
  */
-export async function callLlm(systemPrompt: string, userPrompt: string, channel?: LlmChannel): Promise<LlmResponse | null> {
+export async function callLlm(systemPrompt: string, userPrompt: string, channel?: LlmChannel, maxTokens: number = 8192): Promise<LlmResponse | null> {
   const ch = channel ?? makeLlmChannel('reflect');
   if (!ch.apiKey) return null;
   // 到 API 的连接偶发被断(大 prompt/限流),单次失败就放弃会让整轮反思白跑 → 退避重试
@@ -456,7 +467,7 @@ export async function callLlm(systemPrompt: string, userPrompt: string, channel?
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
           ],
-          max_tokens: 8192,
+          max_tokens: maxTokens,
           stream: false,
         }),
       });
@@ -557,7 +568,7 @@ export async function runDeepReflect(charId: string, limit = 500, project?: stri
     let okBatches = 0;
     for (const batch of batches.slice(0, maxCalls)) {
       const userPrompt = `记忆列表(${batch.length} 条)：\n\n${JSON.stringify(batch, null, 1)}\n\n请深度分析本批记忆,返回 JSON 操作对象。`;
-      const llm = await callLlm(buildDeepReflectPrompt(), userPrompt);
+      const llm = await callLlm(buildDeepReflectPrompt(), userPrompt, undefined, REFLECT_DEEP_MAX_TOKENS);
       if (!llm) { out.errors.push('LLM 调用失败'); continue; }
       const parsed = parseJsonRobust(llm.content || llm.reasoning);
       if (!parsed) { out.errors.push('未找到有效 JSON 结果'); continue; }
@@ -687,15 +698,23 @@ export async function runConsolidate(
   if (!isReflectConfigured()) {
     return { ...base, skipped: true, errors: ['REFLECT_LLM_API_KEY 未配置,跳过整合'] };
   }
-  const db = DatabaseManager.getInstance(project);
   const proj = normalizeProject(project);
 
-  const mems = db.prepare(`
-    SELECT id, mem_type, text, created_at FROM memory
-    WHERE is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
-    ORDER BY importance DESC, created_at DESC
-    LIMIT 500
-  `).all(proj) as any[];
+  // v1.11.2 memdir:逐 memType 库扫描并合并 —— 旧版只读 general:候选即便从别库产生,也会在下面
+  // 的 `mems.filter(...)`(按候选 id 过滤)里被丢掉,等于白算。这里把各库并起来再按重要度截断。
+  const mems: any[] = [];
+  for (const mt of listMemTypeDirs(proj)) {
+    try {
+      mems.push(...(DatabaseManager.getInstance(project, mt).prepare(`
+        SELECT id, mem_type, text, created_at, importance FROM memory
+        WHERE is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
+        ORDER BY importance DESC, created_at DESC
+        LIMIT 500
+      `).all(proj) as any[]));
+    } catch { /* 单个库读不到不影响其它库 */ }
+  }
+  mems.sort((a: any, b: any) => (Number(b.importance) || 0) - (Number(a.importance) || 0));
+  if (mems.length > 500) mems.length = 500;
   const scanned = mems.length;
   if (scanned < 2) {
     return { ...base, ok: true, scanned, skipped: true, errors: ['active 记忆不足 2 条,无需整合'] };
@@ -743,7 +762,7 @@ ${pairsJson}
 【近期对话转录】
 ${transcript || '无近期对话转录'}`;
 
-  const llm = await callLlm(buildConsolidationPrompt(), userPrompt);
+  const llm = await callLlm(buildConsolidationPrompt(), userPrompt, undefined, REFLECT_DEEP_MAX_TOKENS);
   if (!llm) return { ...base, scanned, candidates: candidates.length, errors: ['LLM 调用失败'] };
   const parsed = parseJsonRobust(llm.content || llm.reasoning);
   if (!parsed) return { ...base, scanned, candidates: candidates.length, errors: ['未找到有效 JSON 结果'] };

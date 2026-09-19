@@ -222,7 +222,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
 }
 
 /** 按 id 定位记忆所在分类库(memdir 遍历),返回库连接+分类;找不到返回 null */
-function findDbByMemoryId(id: string, project?: string): { db: Database.Database; memType: string } | null {
+export function findDbByMemoryId(id: string, project?: string): { db: Database.Database; memType: string } | null {
   const proj = normalizeProject(project);
   const dirs = listMemTypeDirs(proj);
   /* v1.21:先找**活跃**行。跨 memType 搬家会在源库留 is_active=0 墓碑;旧实现按目录顺序取第一个命中,

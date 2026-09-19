@@ -15,7 +15,7 @@
 
 import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { getEmbeddingCached } from './ollama.js';
-import { saveFacts, saveMemory, reEmbedMemory, batchEmbedPending, applyIdentityActions, type IdentityActions } from './store.js';
+import { saveFacts, saveMemory, reEmbedMemory, batchEmbedPending, applyIdentityActions, findDbByMemoryId, type IdentityActions } from './store.js';
 import { normalizeProject } from './env.js';
 import { MemType, isMemType, MEM_TYPES } from './memType.js';
 import fs from 'node:fs';
@@ -147,6 +147,34 @@ function safeTags(raw: any): string[] | null {
   return filtered.length > 0 ? filtered : null;
 }
 
+/**
+ * v1.11.4 跨 memType 库解析目标记忆 —— **同族坑第三次**:applyReflectActions 旧实现把 merge/split/
+ * delete/reclassify/relate/boost/decay 的语句全打在 `getInstance(project)`(= 只 general 一个 sqlite)上,
+ * 于是 user/feedback/project 里的记忆一律 "not found or locked";更糟的是 merge 仍会**无条件插入**合并结果
+ * → 源还在、又多一条 = 净增重复(2026-09-19 副本实测:9 个 merge 全失败,活跃 229→238)。
+ * 顺序:精确 id(store 的 findDbByMemoryId,内部先扫活跃再兜底墓碑)→ 前缀 LIKE(LLM 会给短 ID),先活跃后兜底;
+ * 找不到则回退 fallback(默认 general 库),让调用方原本的 "not found" 判断照常生效。
+ */
+function memDbFor(idPrefix: string, project: string | undefined, fallback: any): any {
+  try {
+    const exact = findDbByMemoryId(idPrefix, project);
+    if (exact) return exact.db;
+  } catch { /* 忽略:走前缀匹配 */ }
+  const proj = normalizeProject(project);
+  for (const activeOnly of [true, false]) {
+    for (const mt of listMemTypeDirs(proj)) {
+      try {
+        const db = DatabaseManager.getInstance(project, mt);
+        const sql = activeOnly
+          ? 'SELECT id FROM memory WHERE id LIKE ? AND is_active = 1'
+          : 'SELECT id FROM memory WHERE id LIKE ?';
+        if (db.prepare(sql).get(idPrefix + '%')) return db;
+      } catch { /* 单库读不到不影响其它库 */ }
+    }
+  }
+  return fallback;
+}
+
 export async function applyReflectActions(actions: ReflectAction[], characterId: string = 'airi', project?: string): Promise<{
   applied: number;
   errors: string[];
@@ -173,21 +201,22 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need sourceIds and newText';
             continue;
           }
-          const tx = db.transaction(() => {
-            // 旧记忆全部软删除 + 删向量
+          // 旧记忆全部软删除 + 删向量
             // v5.1: LLM 可能返回短ID前缀，用 LIKE 匹配
             // locked=1 永久锁定记忆绝不软删(护栏在代码层兜底,防止 LLM 幻觉破坏锁定记忆)
             for (const id of action.sourceIds!) {
-              const src = db.prepare('SELECT id FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').get(id + '%') as any;
+              const sdb = memDbFor(id, project, db);   // v1.11.4 跨库解析(旧实现只打 general)
+              const src = sdb.prepare('SELECT id FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').get(id + '%') as any;
               if (src) receipt.rowsAffected++;
               else { receipt.status = 'failed'; receipt.reason = `source not found or locked: ${id}`; }
-              db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(id + '%');
+              sdb.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(id + '%');
               try {
-                db.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0))').run(id + '%');
+                sdb.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0))').run(id + '%');
               } catch {}
             }
-          });
-          tx();
+
+          // v1.11.4:源未全部命中就**不许插入**合并结果
+          if (receipt.status === 'failed') { result.errors.push(`merge: ${receipt.reason}`); continue; }
 
           // saveMemory 是 async，在 transaction 外调
           // v5.0: reflect 阶段正常 embed（不 skip）
@@ -204,7 +233,6 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             project,
             source: 'reflect_merge',
           });
-          if (receipt.status === 'failed') { result.errors.push(`merge: ${receipt.reason}`); continue; }
           if (receipt.status === 'applied') result.applied++;
           result.details.push(`merge: ${action.sourceIds.length} → 1`);
           break;
@@ -218,9 +246,10 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             continue;
           }
           // 软删除旧记忆（v5.1: LIKE 匹配短ID;locked=1 永久锁定不删）
-          const _splitSrc = db.prepare('SELECT id FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').get(action.targetId + '%') as any;
+          const _sdb = memDbFor(action.targetId, project, db);
+          const _splitSrc = _sdb.prepare('SELECT id FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').get(action.targetId + '%') as any;
           if (!_splitSrc) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
-          db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(action.targetId + '%');
+          _sdb.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(action.targetId + '%');
           // 插入碎片
           const { saveMemory } = await import('./store.js');
           for (const frag of action.fragments) {
@@ -249,7 +278,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           // 护栏：规范化 relation type
           const relType = VALID_RELATIONS.has(action.relationType) ? action.relationType : 'related_to';
           const edgeId = `edge_reflect_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-          const _relR = db.prepare('INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type) VALUES (?, ?, ?, ?)')
+          const _relR = memDbFor(action.sourceId, project, db).prepare('INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type) VALUES (?, ?, ?, ?)')
             .run(edgeId, action.sourceId, action.targetIdRelate, relType);
           receipt.rowsAffected = _relR.changes;
           if (_relR.changes === 0) { receipt.status = 'failed'; receipt.reason = `edge exists or node missing: ${action.sourceId}→${action.targetIdRelate}`; }
@@ -316,7 +345,8 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           }
           if (updates.length > 0) {
             // 参数顺序:update 字段值 → updated_at → LIKE 前缀(修复历史错位 bug)
-            const _recR = db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ? AND (locked IS NULL OR locked = 0)`)
+            const _tdb = memDbFor(tid, project, db);
+            const _recR = _tdb.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ? AND (locked IS NULL OR locked = 0)`)
               .run(...values, new Date().toISOString(), tid + '%');
             receipt.rowsAffected = _recR.changes;
             if (_recR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found: ${tid}`; }
@@ -325,8 +355,8 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             // v5.x: text 变更后删除旧向量,下次 batchEmbedPending 重新 embed
             if (textChanged && _recR.changes > 0) {
               try {
-                const _vecRow = db.prepare('SELECT rowid FROM memory WHERE id LIKE ? LIMIT 1').get(tid + '%') as any;
-                if (_vecRow) db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(_vecRow.rowid);
+                const _vecRow = _tdb.prepare('SELECT rowid FROM memory WHERE id LIKE ? LIMIT 1').get(tid + '%') as any;
+                if (_vecRow) _tdb.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(_vecRow.rowid);
               } catch { /* 静默 */ }
             }
           }
@@ -363,7 +393,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           });
 
           // 给源记忆 +reference_count（v5.1: LIKE 匹配短ID）
-          db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id LIKE ?').run(action.sourceId + '%');
+          memDbFor(action.sourceId, project, db).prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id LIKE ?').run(action.sourceId + '%');
 
           if (receipt.status === 'applied') result.applied++;
           result.details.push(`extract: from ${action.sourceId} → ${validType}/${validCat} (${tier})`);
@@ -395,7 +425,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need targetId';
             continue;
           }
-          const _delR = db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(action.targetId + '%');
+          const _delR = memDbFor(action.targetId, project, db).prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(action.targetId + '%');
           receipt.rowsAffected = _delR.changes;
           if (_delR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
           if (receipt.status === 'applied') result.applied++;
@@ -409,7 +439,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need targetId and delta';
             continue;
           }
-          const _boR = db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id LIKE ? AND (locked IS NULL OR locked = 0)')
+          const _boR = memDbFor(action.targetId, project, db).prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id LIKE ? AND (locked IS NULL OR locked = 0)')
             .run(action.delta, action.targetId + '%');
           receipt.rowsAffected = _boR.changes;
           if (_boR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
@@ -424,7 +454,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need targetId and delta';
             continue;
           }
-          const _deR = db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id LIKE ? AND (locked IS NULL OR locked = 0)')
+          const _deR = memDbFor(action.targetId, project, db).prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id LIKE ? AND (locked IS NULL OR locked = 0)')
             .run(action.delta, action.targetId + '%');
           receipt.rowsAffected = _deR.changes;
           if (_deR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
