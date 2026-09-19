@@ -16,6 +16,16 @@ export const CONSOLIDATE_SIMILARITY = (() => {
     const v = parseFloat(process.env.CONSOLIDATE_SIMILARITY || '0.88');
     return Number.isFinite(v) && v > 0 ? v : 0.88;
 })();
+/**
+ * v1.11 结构兜底候选:反思/摘要写出的"报告式"记忆(表头形如 `# User Profile: …`)表头相同、内容各异,
+ * 实测组内向量余弦中位 0.55、词袋重叠 0.06 —— 纯语义预筛(0.88)抓不到,这类"看着像重复"的记忆
+ * 永远进不了 LLM 裁决。这里按 (memType + `# 表头`) 分桶补候选:每桶以最长的一条为锚,最多 N 对,
+ * 判断权仍完全交给 LLM(它可以判"不是重复")。设 0 关闭。
+ */
+export const CONSOLIDATE_BUCKET_PAIRS = (() => {
+    const v = parseInt(process.env.CONSOLIDATE_BUCKET_PAIRS || '3', 10);
+    return Number.isFinite(v) && v >= 0 ? v : 3;
+})();
 /** 候选对数上限,防止相似爆炸 */
 export const CONSOLIDATE_MAX_PAIRS = (() => {
     const v = parseInt(process.env.CONSOLIDATE_MAX_PAIRS || '50', 10);
@@ -27,11 +37,8 @@ export const CONSOLIDATE_MAX_PAIRS = (() => {
  * - vec0 虚拟表禁止 JOIN:先对每条记忆做 KNN 取候选 rowid,再二段过滤 project/locked
  * - 每对去重(不重复 idA/idB、不反向),数量上限 limit 防爆炸
  */
-export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIMILARITY, limit = CONSOLIDATE_MAX_PAIRS) {
-    if (!isEmbedEnabled())
-        return [];
-    const db = DatabaseManager.getInstance(project);
-    const proj = normalizeProject(project);
+/** v1.11.2 单个 memType 库的语义预筛(向量 KNN);候选并入共享 seen/pairs。 */
+function scanVectorPairs(db, proj, threshold, limit, seen, pairs) {
     const mems = db.prepare(`
     SELECT m.rowid, m.id FROM memory m
     WHERE m.is_active = 1 AND m.project = ? AND (m.locked IS NULL OR m.locked = 0)
@@ -39,7 +46,7 @@ export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIM
     LIMIT 500
   `).all(proj);
     if (mems.length < 2)
-        return [];
+        return;
     const rowidList = mems.map(m => Number(m.rowid));
     let vecRows = [];
     try {
@@ -48,10 +55,10 @@ export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIM
     `).all(...rowidList);
     }
     catch {
-        return [];
+        return;
     }
     if (vecRows.length < 2)
-        return [];
+        return;
     const memByRowid = new Map();
     for (const m of mems)
         memByRowid.set(Number(m.rowid), m.id);
@@ -61,10 +68,8 @@ export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIM
         vecByRowid.set(Number(r.rowid), Array.from(new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4)));
     }
     if (vecByRowid.size < 2)
-        return [];
+        return;
     const scanK = Math.min(20, mems.length);
-    const seen = new Set();
-    const pairs = [];
     for (const m of mems) {
         const rowid = Number(m.rowid);
         const vec = vecByRowid.get(rowid);
@@ -102,10 +107,83 @@ export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIM
             seen.add(key);
             pairs.push({ idA: a, idB: b, similarity: Math.round(sim * 1000) / 1000 });
             if (pairs.length >= limit)
-                return pairs;
+                return;
         }
     }
-    return pairs;
+}
+/** v1.11.2 单个 memType 库的结构兜底(同 `# 表头` 分桶);由 findSimilarCandidates 跨库调度。 */
+function scanStructPairs(db, proj, limit, seen, pairs) {
+    // ═══ v1.11 结构兜底:同 `# 表头` + 同 memType 分桶补候选(similarity 记 0 = 结构配对,非语义相似)═══
+    if (CONSOLIDATE_BUCKET_PAIRS > 0 && pairs.length < limit) {
+        let rows2 = [];
+        try {
+            rows2 = db.prepare(`
+        SELECT id, text, mem_type FROM memory
+        WHERE is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
+        ORDER BY created_at DESC LIMIT 500
+      `).all(proj);
+        }
+        catch {
+            rows2 = [];
+        }
+        const buckets = new Map();
+        for (const r of rows2) {
+            const mm = /^\s*#\s*([^:\n·]{2,26})/.exec(String(r.text || ''));
+            if (!mm)
+                continue;
+            const head = mm[1].replace(/\s+/g, ' ').trim();
+            if (!head)
+                continue;
+            const key = String(r.mem_type || 'general') + '\u0000' + head;
+            if (!buckets.has(key))
+                buckets.set(key, []);
+            buckets.get(key).push(r);
+        }
+        for (const [, arr] of buckets) {
+            if (arr.length < 2)
+                continue;
+            const sorted = arr.slice().sort((a, b) => String(b.text || '').length - String(a.text || '').length);
+            let added = 0;
+            for (let i = 1; i < sorted.length && added < CONSOLIDATE_BUCKET_PAIRS; i++) {
+                const a = String(sorted[0].id), b = String(sorted[i].id);
+                if (!a || !b || a === b)
+                    continue;
+                const k = a < b ? `${a}|${b}` : `${b}|${a}`;
+                if (seen.has(k))
+                    continue;
+                seen.add(k);
+                pairs.push({ idA: a, idB: b, similarity: 0 });
+                added++;
+                if (pairs.length >= limit)
+                    return;
+            }
+        }
+    }
+    return;
+}
+export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIMILARITY, limit = CONSOLIDATE_MAX_PAIRS) {
+    if (!isEmbedEnabled())
+        return [];
+    const proj = normalizeProject(project);
+    const seen = new Set();
+    const pairs = [];
+    // v1.11.2 memdir:每个 memType 是**独立 sqlite** —— 旧版只扫 general,user/feedback/project 里的
+    // "报告式"重复(实测 shushu/user 106 条带表头 / lobehub/user 69 条)完全够不到,LLM 也就无从裁决。
+    // 逐库扫描并把候选并起来;两阶段(先全库语义 → 再全库结构)是为了让表头对不挤占语义候选的名额。
+    const dirs = listMemTypeDirs(proj);
+    for (const mt of dirs) {
+        if (pairs.length >= limit)
+            break;
+        scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, limit, seen, pairs);
+    }
+    if (CONSOLIDATE_BUCKET_PAIRS > 0) {
+        for (const mt of dirs) {
+            if (pairs.length >= limit)
+                break;
+            scanStructPairs(DatabaseManager.getInstance(project, mt), proj, limit, seen, pairs);
+        }
+    }
+    return pairs.slice(0, limit);
 }
 export async function consolidate() {
     const now = Date.now();

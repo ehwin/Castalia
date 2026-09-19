@@ -48,22 +48,15 @@ export interface SimilarCandidate {
  * - vec0 虚拟表禁止 JOIN:先对每条记忆做 KNN 取候选 rowid,再二段过滤 project/locked
  * - 每对去重(不重复 idA/idB、不反向),数量上限 limit 防爆炸
  */
-export async function findSimilarCandidates(
-  project?: string,
-  threshold: number = CONSOLIDATE_SIMILARITY,
-  limit: number = CONSOLIDATE_MAX_PAIRS,
-): Promise<SimilarCandidate[]> {
-  if (!isEmbedEnabled()) return [];
-  const db = DatabaseManager.getInstance(project);
-  const proj = normalizeProject(project);
-
+/** v1.11.2 单个 memType 库的语义预筛(向量 KNN);候选并入共享 seen/pairs。 */
+function scanVectorPairs(db: any, proj: string, threshold: number, limit: number, seen: Set<string>, pairs: SimilarCandidate[]): void {
   const mems = db.prepare(`
     SELECT m.rowid, m.id FROM memory m
     WHERE m.is_active = 1 AND m.project = ? AND (m.locked IS NULL OR m.locked = 0)
     ORDER BY m.created_at DESC
     LIMIT 500
   `).all(proj) as any[];
-  if (mems.length < 2) return [];
+  if (mems.length < 2) return;
 
   const rowidList = mems.map(m => Number(m.rowid));
   let vecRows: any[] = [];
@@ -71,8 +64,8 @@ export async function findSimilarCandidates(
     vecRows = db.prepare(`
       SELECT rowid, embedding FROM vec_memory WHERE rowid IN (${rowidList.map(() => '?').join(',')})
     `).all(...rowidList) as any[];
-  } catch { return []; }
-  if (vecRows.length < 2) return [];
+  } catch { return; }
+  if (vecRows.length < 2) return;
 
   const memByRowid = new Map<number, string>();
   for (const m of mems) memByRowid.set(Number(m.rowid), m.id);
@@ -82,11 +75,9 @@ export async function findSimilarCandidates(
     const b = r.embedding;
     vecByRowid.set(Number(r.rowid), Array.from(new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4)));
   }
-  if (vecByRowid.size < 2) return [];
+  if (vecByRowid.size < 2) return;
 
   const scanK = Math.min(20, mems.length);
-  const seen = new Set<string>();
-  const pairs: SimilarCandidate[] = [];
 
   for (const m of mems) {
     const rowid = Number(m.rowid);
@@ -115,10 +106,13 @@ export async function findSimilarCandidates(
       if (seen.has(key)) continue;
       seen.add(key);
       pairs.push({ idA: a, idB: b, similarity: Math.round(sim * 1000) / 1000 });
-      if (pairs.length >= limit) return pairs;
+      if (pairs.length >= limit) return;
     }
   }
+}
 
+/** v1.11.2 单个 memType 库的结构兜底(同 `# 表头` 分桶);由 findSimilarCandidates 跨库调度。 */
+function scanStructPairs(db: any, proj: string, limit: number, seen: Set<string>, pairs: SimilarCandidate[]): void {
   // ═══ v1.11 结构兜底:同 `# 表头` + 同 memType 分桶补候选(similarity 记 0 = 结构配对,非语义相似)═══
   if (CONSOLIDATE_BUCKET_PAIRS > 0 && pairs.length < limit) {
     let rows2: any[] = [];
@@ -151,12 +145,40 @@ export async function findSimilarCandidates(
         seen.add(k);
         pairs.push({ idA: a, idB: b, similarity: 0 });
         added++;
-        if (pairs.length >= limit) return pairs;
+        if (pairs.length >= limit) return;
       }
     }
   }
-  return pairs;
+  return;
 }
+
+export async function findSimilarCandidates(
+  project?: string,
+  threshold: number = CONSOLIDATE_SIMILARITY,
+  limit: number = CONSOLIDATE_MAX_PAIRS,
+): Promise<SimilarCandidate[]> {
+  if (!isEmbedEnabled()) return [];
+  const proj = normalizeProject(project);
+  const seen = new Set<string>();
+  const pairs: SimilarCandidate[] = [];
+
+  // v1.11.2 memdir:每个 memType 是**独立 sqlite** —— 旧版只扫 general,user/feedback/project 里的
+  // "报告式"重复(实测 shushu/user 106 条带表头 / lobehub/user 69 条)完全够不到,LLM 也就无从裁决。
+  // 逐库扫描并把候选并起来;两阶段(先全库语义 → 再全库结构)是为了让表头对不挤占语义候选的名额。
+  const dirs = listMemTypeDirs(proj);
+  for (const mt of dirs) {
+    if (pairs.length >= limit) break;
+    scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, limit, seen, pairs);
+  }
+  if (CONSOLIDATE_BUCKET_PAIRS > 0) {
+    for (const mt of dirs) {
+      if (pairs.length >= limit) break;
+      scanStructPairs(DatabaseManager.getInstance(project, mt), proj, limit, seen, pairs);
+    }
+  }
+  return pairs.slice(0, limit);
+}
+
 
 export interface ConsolidateResult {
   success: boolean;
