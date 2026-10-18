@@ -114,6 +114,11 @@ try {
             process.env.REFLECT_MIN_UNANALYZED = String(ref.minUnanalyzed);
         if (ref.intervalHours != null)
             process.env.REFLECT_INTERVAL_HOURS = String(ref.intervalHours);
+        // v1.12: 提示词文件覆盖(单个实例/项目自己的反思/整合提示词)
+        if (ref.promptFile)
+            process.env.REFLECT_PROMPT_FILE = String(ref.promptFile);
+        if (ref.deepPromptFile)
+            process.env.REFLECT_DEEP_PROMPT_FILE = String(ref.deepPromptFile);
         // v1.11: triage(LLM1 入站分拣)配置 — admin 第三个通道
         const tri = cfg.triage || {};
         if (tri.llm_url)
@@ -137,6 +142,8 @@ try {
             process.env.CONSOLIDATE_SIMILARITY = String(cons.similarity);
         if (cons.autoOnStart != null)
             process.env.CONSOLIDATE_AUTO_ON_START = (cons.autoOnStart === false || cons.autoOnStart === 0 || cons.autoOnStart === '0') ? '0' : '1';
+        if (cons.promptFile)
+            process.env.CONSOLIDATE_PROMPT_FILE = String(cons.promptFile);
         console.error(`[config] loaded ${CONFIG_PATH} (embed=${emb.mode || 'ollama'}, reflect=${ref.model || 'unset'}, facts=${process.env.REFLECT_FACT_EXTRACTION || 'auto'}, consolidate=${process.env.CONSOLIDATE_MIN_MEMORIES || '15'}/${process.env.CONSOLIDATE_SIMILARITY || '0.88'}, triage=${tri.model || 'unset'}, buffer=${process.env.BUFFER_SIZE || '5'}, sessionTtl=${process.env.SESSION_MEMORY_TTL_DAYS || '7'}d)`);
     }
 }

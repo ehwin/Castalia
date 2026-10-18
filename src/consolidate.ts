@@ -163,7 +163,7 @@ export async function findSimilarCandidates(
   const pairs: SimilarCandidate[] = [];
 
   // v1.11.2 memdir:每个 memType 是**独立 sqlite** —— 旧版只扫 general,user/feedback/project 里的
-  // "报告式"重复(实测 custom-project/user 106 条带表头 / lobehub/user 69 条)完全够不到,LLM 也就无从裁决。
+  // "报告式"重复(带 # 表头的成组记录)完全够不到,LLM 也就无从裁决。
   // 逐库扫描并把候选并起来;两阶段(先全库语义 → 再全库结构)是为了让表头对不挤占语义候选的名额。
   const dirs = listMemTypeDirs(proj);
   for (const mt of dirs) {

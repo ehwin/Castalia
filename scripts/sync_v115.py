@@ -1,7 +1,7 @@
 # v1.15 LobeHub 精细化吸收 — 同源仓库锚点同步(ai-memory 全量版)
 # 用法: python scripts/sync_v115.py <target_src_dir>
 # 锚点找不到 → 打印 SKIP,不静默;成功后人工 build 验证
-import sys, io
+import sys, io, os, tempfile
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
@@ -602,6 +602,8 @@ PATCHES = {
 
 def apply(target_dir):
     total_ok = total_skip = 0
+    staged = []
+    errors = []
     for fname, pairs in PATCHES.items():
         path = f'{target_dir}/{fname}'
         try:
@@ -609,16 +611,32 @@ def apply(target_dir):
                 content = f.read()
         except FileNotFoundError:
             print(f'  [MISS] {fname} 不存在')
+            errors.append(f'{fname}: missing file')
             continue
+        original = content
         for i, (old, new) in enumerate(pairs):
+            if new in content:
+                continue
             if old in content:
                 content = content.replace(old, new, 1)
                 total_ok += 1
             else:
                 print(f'  [SKIP] {fname} 锚点#{i+1}: {old[:70].splitlines()[0]}...')
                 total_skip += 1
-        with open(path, 'w', encoding='utf-8', newline='') as f:
-            f.write(content)
+                errors.append(f'{fname}: anchor #{i+1} not found')
+        if content != original:
+            staged.append((path, content))
+    if errors:
+        print('  [ABORT] 未通过补丁预检,没有写入任何文件')
+        return total_skip + len(errors)
+    for path, content in staged:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.sync_v115-', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+                f.write(content); f.flush(); os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
     print(f'  → {target_dir}: {total_ok} 处替换, {total_skip} 处跳过')
     return total_skip
 
@@ -630,3 +648,4 @@ if __name__ == '__main__':
         print(f'⚠️ 有 {skips} 处锚点未命中,需人工处理')
     else:
         print('✅ 全部锚点命中')
+    sys.exit(1 if skips else 0)

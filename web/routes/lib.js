@@ -198,9 +198,7 @@ const AGGREGATE_DIRS = (() => {
     return null;
   };
   const cands = parse(process.env.FEDERATION_DIRS) || parse(process.env.AGGREGATE_DIRS) || [
-    { name: 'Hermes', dir: 'D:\\AI\\castalia\\run\\Castalia\\memory' },
-    { name: 'LobeHub', dir: 'D:\\AI\\lobehub-run\\memory' },
-    { name: 'AIRI', dir: 'D:\\AI\\castalia\\run\\Castalia-Anima\\memory' },
+    { name: '当前实例', dir: DB_DIR },
   ];
   if (DB_DIR && !cands.some(c => c.dir === DB_DIR)) cands.push({ name: '当前实例', dir: DB_DIR });
   const seen = new Set();

@@ -1,6 +1,8 @@
 // v1.15 identity CRUD + 评分 + metadata 行为验证(临时库,不碰真实数据)
 import fs from 'node:fs';
-const TEST_DIR = '/tmp/castalia_test';
+import os from 'node:os';
+import path from 'node:path';
+const TEST_DIR = path.join(os.tmpdir(), 'castalia_test_v115');
 process.env.MEMORY_DB_DIR = TEST_DIR;
 process.env.EMBED_MODE = 'none';
 process.env.CASTALIA_PROJECT = 'testproj';

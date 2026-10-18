@@ -154,7 +154,7 @@
 ### Fixed / Improved
 - **reflect_batch_embed 加 characterId 参数**('any' 不过滤角色):reflect 库(character_id NULL)与跨角色记忆可补嵌入;Anima/主系统保留 charFor(project)
 - **resolveFedLibraries 按目录去重**(ownDir 与 FEDERATION_DIRS 同目录不重复扫描)
-- **reflect_all 支持 REFLECT_DIR env**:统一多实例总库位置(托盘 3345/3346 配 /path/to/run/memory → 所有反思写同一总库,不再分叉);db.ts export initProjectSchema
+- **reflect_all 支持 REFLECT_DIR env**:统一多实例总库位置(所有反思写同一总库,不再分叉);db.ts export initProjectSchema
 - **FEDERATION_DIRS 统一正斜杠**(托盘 viz+桥、unified-proxy):反斜杠 JSON env 传递减半致 JSON.parse 失败静默回退(与误移事故同根因)
 - **anima-run keys.enc 补 embedding.api_key**:AIRI 嵌入通道此前缺 key 走 Ollama 分支 → 硅基 404
 
@@ -167,7 +167,7 @@
 
 ## [v1.12.4] — 2026-08-16 库管理设置页 + reflect_all projects 参数 + 首次人工分拣
 
-> 用户需求:手动调整库归属(清理 AIRI 混杂的 Hermes 记忆、分离助手身份叙事、分别做项目级/总反思)。管理页经 dsh(pro 模型)开发 + Hermes 独立复验。
+> 用户需求:手动调整库归属(分离角色身份叙事、分别做项目级/总反思)。管理页经独立复验。
 
 ### Added(库管理)
 - `web/public/manage.html`:库总览卡片(库名/实例/活跃/总数)→ 库内记忆列表(搜索/类型徽章/时间)→ 勾选/批量移动 → 改 mem_type → 软删,全部 confirm 确认,事件委托防 XSS
@@ -179,7 +179,7 @@
 
 ### Changed(2026-08-16 实际整理)
 - 12 条 Hermes 开发测试记忆(8-08/8-15 测试/架构讨论类,含 session_promoted)从 airi 库移入 hermes 库(facts 外键问题:facts 随迁 + 源副本软删)
-- 4 条助手身份叙事(identity)从 project 类改 general,**保留在 airi 库**(助手身份/感情/人设不迁移)
+- 4 条角色身份叙事(identity)从 project 类改 general,**保留在原库**(身份/感情/人设不迁移)
 - 项目级反思(hermes 12 条→3 条洞察)+ 总反思(7 库 110 条→6 条洞察)写入 reflect 库(现 9 条)
 - 最终:hermes 12 条 / airi 98 条 / reflect 9 条 / 其余库 0
 
@@ -548,7 +548,7 @@
 
 ### Changed
 - **内部名称统一为 Castalia**:package.json / MCP_SERVER_NAME 默认值 / web console / 示例配置 / 文档全部 `ai-memory → castalia`(GitHub 仓库名同步,`github.com/ehwin/Castalia`)
-- **测试脚本路径动态化**:smoke_test / vec_test 不再写死 `/path/...` 本机路径,改为基于脚本位置推导(公共版可在任意 clone 位置运行);node 探测优先 PATH,本机路径仅作 fallback
+- **测试脚本路径动态化**:smoke_test / vec_test 不再写死 `C:\path\...` 本机路径,改为基于脚本位置推导(公共版可在任意 clone 位置运行);node 探测优先 PATH,本机路径仅作 fallback
 - **mcp-config.example.json** 改为通用占位符路径,不再泄露作者机器路径
 
 ### Added

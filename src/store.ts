@@ -75,7 +75,6 @@ export interface MemoryRecord {
 export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   if (!params.text || !params.text.trim()) throw new Error('memory text must not be empty');
   // memdir 路由:按 memType 落对应分类库(memory/<project>/<memType>/memory.sqlite)
-  const db = DatabaseManager.getInstance(params.project, params.memType);
   const now = new Date().toISOString();
   const skipEmbed = params.skipEmbed === true;
   const project = normalizeProject(params.project);
@@ -93,11 +92,12 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     memType = 'general';
   };
   // v1.8: 4 种封闭类型(memType≠general)且 text 非 Markdown 时,自动规范化包装(加标题行+转列表)
+  const db = DatabaseManager.getInstance(project, memType);
   const text = normalizeMarkdown(params.text, memType);
 
   // ═══ 精确去重：完全相同的文本不重复存(仅限同项目) ═══
   const exactDup = db.prepare(`
-    SELECT id FROM memory
+    SELECT * FROM memory
     WHERE is_active = 1 AND project = ? AND LOWER(TRIM(text)) = LOWER(TRIM(?))
     LIMIT 1
   `).get(project, text?.trim() || '') as any;
@@ -105,20 +105,18 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   if (exactDup) {
     db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(exactDup.id);
     return {
-      id: exactDup.id, text, project,
-      sessionId: null,
-      type: params.type ?? 'episodic', memType, category: params.category ?? 'general',
-      subcategory: params.subcategory ?? null, tags: params.tags ?? [],
-      importance: params.importance ?? 0.5,
-      characterId: params.characterId ?? null, source: params.source ?? null,
-      subject: params.subject ?? 'user',
-      tier: params.tier ?? 'standard', expiresAt: null,
-      isActive: true,
-      createdAt: now, updatedAt: now, lastAccessedAt: now, accessedCount: 0,
-      metadata: params.metadata ?? null, title: params.title ?? null, status: params.status ?? null,
-      scoreConfidence: params.scoreConfidence ?? null, scoreImpact: params.scoreImpact ?? null,
-      scorePriority: params.scorePriority ?? null, scoreUrgency: params.scoreUrgency ?? null,
-      identityLocked: params.identityLocked === true,
+      id: exactDup.id, text: exactDup.text, project: exactDup.project,
+      sessionId: exactDup.session_id, type: exactDup.type, memType: exactDup.mem_type,
+      category: exactDup.category, subcategory: exactDup.subcategory,
+      tags: JSON.parse(exactDup.tags || '[]'), importance: exactDup.importance,
+      characterId: exactDup.character_id, source: exactDup.source, subject: exactDup.subject,
+      tier: exactDup.tier, expiresAt: exactDup.expires_at, isActive: !!exactDup.is_active,
+      createdAt: exactDup.created_at, updatedAt: exactDup.updated_at,
+      lastAccessedAt: exactDup.last_accessed_at, accessedCount: exactDup.accessed_count,
+      metadata: exactDup.metadata, title: exactDup.title, status: exactDup.status,
+      scoreConfidence: exactDup.score_confidence, scoreImpact: exactDup.score_impact,
+      scorePriority: exactDup.score_priority, scoreUrgency: exactDup.score_urgency,
+      identityLocked: !!exactDup.identity_locked,
     } as MemoryRecord;
     }
 
@@ -385,7 +383,8 @@ export async function saveConversationTurn(
     moodPrefix += ']\n';
   }
 
-  const text = `用户: ${userMsg}\n助手: ${assistantMsg}`;
+  const assistantName = (process.env.CASTALIA_ASSISTANT_NAME || '助手').trim() || '助手';
+  const text = `用户: ${userMsg}\n${assistantName}: ${assistantMsg}`;
   /* v1.19 分隔带:对话原文审计可见(is_active=0),检索/星图只读 is_active=1 → 不进总图;mood 入 metadata */
   const meta: Record<string, any> = {};
   if (moodValue !== undefined) {

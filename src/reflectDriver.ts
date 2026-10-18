@@ -19,6 +19,7 @@ import { normalizeProject, isEmbedEnabled } from './env.js';
 import { isMemType } from './memType.js';
 import { findSimilarCandidates, SimilarCandidate, CONSOLIDATE_SIMILARITY, CONSOLIDATE_MAX_PAIRS } from './consolidate.js';
 import { getRecentConversations } from './digest.js';
+import { loadPromptOverride } from './promptFile.js';
 
 const FACT_EXTRACTION = (process.env.REFLECT_FACT_EXTRACTION || 'auto').trim().toLowerCase();
 const MAX_FACTS = parseInt(process.env.REFLECT_MAX_FACTS || '15', 10) || 15;
@@ -199,6 +200,10 @@ ${factExtraction === 'off'
 
 /** Daily-reflection prompt builder (digest + extraction, model-neutral) */
 export function buildReflectSystemPrompt(factExtraction: string = FACT_EXTRACTION, maxFacts: number = MAX_FACTS): string {
+  return loadPromptOverride('REFLECT_PROMPT_FILE', builtinReflectSystemPrompt(factExtraction, maxFacts));
+}
+
+function builtinReflectSystemPrompt(factExtraction: string, maxFacts: number): string {
   return `You are a memory organization engine. Each entry has a "date" field (YYYY-MM-DD).
 
 ══════════════════════
@@ -257,6 +262,10 @@ ${outputFormatSpec(factExtraction, maxFacts)}
 
 /** Deep-calibration prompt builder (full-memory analysis) */
 export function buildDeepReflectPrompt(factExtraction: string = FACT_EXTRACTION, maxFacts: number = MAX_FACTS): string {
+  return loadPromptOverride('REFLECT_DEEP_PROMPT_FILE', builtinDeepReflectPrompt(factExtraction, maxFacts));
+}
+
+function builtinDeepReflectPrompt(factExtraction: string, maxFacts: number): string {
   return `你是记忆深度校准引擎。对全部记忆执行长时分析。
 
 ══════════════════════
@@ -321,7 +330,7 @@ function closeBrackets(x: string): string {
   return out;
 }
 
-/** 常见坏 JSON 修补:尾随逗号 / 裸控制字符 / 非法反斜杠转义(LLM 写 Windows 路径 `/path\x` 时必犯) */
+/** 常见坏 JSON 修补:尾随逗号 / 裸控制字符 / 非法反斜杠转义(LLM 写 Windows 路径 `C:\path\x` 时必犯) */
 function repairJson(x: string): string {
   return x
     .replace(/,\s*([}\]])/g, '$1')
@@ -603,6 +612,10 @@ export async function runDeepReflect(charId: string, limit = 500, project?: stri
 // ═══════════════════════════════════════════════════════════════════
 
 export function buildConsolidationPrompt(): string {
+  return loadPromptOverride('CONSOLIDATE_PROMPT_FILE', builtinConsolidationPrompt());
+}
+
+function builtinConsolidationPrompt(): string {
   return `你是记忆整合引擎(Memory Consolidator)。输入:
 1. 候选记忆(带 id/memType/text/createdAt)
 2. 候选相似对(向量预筛结果,可能为空)

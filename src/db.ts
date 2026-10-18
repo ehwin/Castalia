@@ -373,6 +373,33 @@ export class DatabaseManager {
     return db;
   }
 
+  /**
+   * 项目下**实际存在**的分类库(不创建空库)。
+   * 只读工具用它遍历,避免 stats_get/context 在项目目录不存在时凭空造出 5 个 sqlite。
+   */
+  public static existingMemTypes(project?: string): string[] {
+    const proj = normalizeProject(project);
+    if (isLegacyMode()) return ['general'];
+    return listMemTypeDirs(proj).filter((mt) =>
+      fs.existsSync(path.join(memDir(), safeFilePart(proj), memTypeDir(mt), 'memory.sqlite')));
+  }
+
+  /**
+   * 跨分类库查询:对项目下每个已存在的 memType 库执行同一条 SQL,合并结果。
+   * 调用方负责跨库排序/截断(每个库的 LIMIT 各自生效,不能直接当全局 LIMIT)。
+   */
+  public static queryAll<T = any>(project: string | undefined, sql: string, params: any[] = []): T[] {
+    const proj = normalizeProject(project);
+    if (isLegacyMode()) return DatabaseManager.getInstance(proj).prepare(sql).all(...params) as T[];
+    const out: T[] = [];
+    for (const mt of DatabaseManager.existingMemTypes(proj)) {
+      try {
+        out.push(...(DatabaseManager.getInstance(proj, mt).prepare(sql).all(...params) as T[]));
+      } catch { /* 单个分类库损坏不阻断其它库 */ }
+    }
+    return out;
+  }
+
   /** 全局库(global.sqlite):L1/L2 指令 + rule 规则组 + 项目注册表。兼容模式下返回单库。 */
   public static getGlobal(): Database.Database {
     if (isLegacyMode()) return DatabaseManager.getInstance();

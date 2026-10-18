@@ -343,12 +343,14 @@ register(
   { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
   async (args) => {
     try {
-      const db = DatabaseManager.getInstance(args.project);
       const recent = getRecentMemories(CHAR_ID, 5, 24, args.project);
-      const stats = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(normalizeProject(args.project)) as any;
+      // memdir 分库:总数要跨 user/feedback/project/reference/general 聚合
+      const total = DatabaseManager.queryAll<{ c: number }>(args.project,
+        'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?', [normalizeProject(args.project)])
+        .reduce((n, r) => n + (r.c || 0), 0);
       return ok({
         recentMemories: recent.map(m => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
-        stats: { total: stats.c },
+        stats: { total },
       });
     } catch (e: any) { return err(e.message); }
   }
@@ -390,14 +392,13 @@ register(
         related = r.map(m => ({ text: m.text, category: m.category, importance: m.importance, score: m.score, createdAt: m.createdAt }));
       }
 
-      // 3. 认知记录(决策/错误/模式)
-      const cognitiveCats = ['decision', 'mistake'];
-      const cognitives = db.prepare(`
+      // 3. 认知记录(决策/错误/模式)—— 跨分类库聚合
+      const cognitives = DatabaseManager.queryAll<any>(proj, `
         SELECT text, category, importance, created_at FROM memory
         WHERE is_active = 1 AND project = ?
           AND (category IN ('decision','mistake') OR tags LIKE '%pattern%')
         ORDER BY created_at DESC LIMIT 9
-      `).all(proj) as any[];
+      `, [proj]).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 9);
 
       // 4. 关键事实(高置信度)
       const facts = db.prepare(`
@@ -407,14 +408,15 @@ register(
       `).all(proj) as any[];
 
       // 4.5 记忆索引层(4 种封闭类型,轻量摘要 — 对应 Claude Code MEMORY.md,先索引后详情)
-      const indexRows = db.prepare(`
-        SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len
+      //     这 4 类各自独立成库,必须跨库聚合;只读 general 会恒空。
+      const indexRows = DatabaseManager.queryAll<any>(proj, `
+        SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len, updated_at
         FROM memory
         WHERE is_active = 1 AND project = ?
           AND mem_type IN ('user','feedback','project','reference')
         ORDER BY updated_at DESC
         LIMIT 10
-      `).all(proj) as any[];
+      `, [proj]).sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || ''))).slice(0, 10);
       const indexLayer = indexRows.map((row: any) => {
         const s = row.summary || '';
         return {
@@ -428,7 +430,11 @@ register(
       //    path 可选:对带 paths 的指令做 glob 过滤
       const instructions = getInstruction(proj, args.path);
 
-      const stats = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj) as any;
+      // memdir 分库:统计跨全部分类库
+      const total = DatabaseManager.queryAll<{ c: number }>(proj,
+        'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?', [proj])
+        .reduce((n, r) => n + (r.c || 0), 0);
+      const stats = { c: total };
 
       // 5. Ground Truth 提示词组装(指令分节在最前面)
       const sections: string[] = [];
@@ -457,11 +463,13 @@ register(
       sections.push(`【当前记忆上下文】总记忆 ${stats.c} 条。请优先参考以下记忆,它们是之前会话沉淀的事实与经验:`);
 
       // v1.15: 用户偏好段(带触发条件,score_priority 排序,最先展示)
-      const prefs = db.prepare(`
-        SELECT text, metadata, score_priority FROM memory
+      // user 偏好独立成库;跨库聚合后再排序取前 8。
+      const prefs = DatabaseManager.queryAll<any>(proj, `
+        SELECT text, metadata, score_priority, importance FROM memory
         WHERE is_active = 1 AND project = ? AND type = 'preference' AND mem_type = 'user'
         ORDER BY COALESCE(score_priority, 0) DESC, importance DESC LIMIT 8
-      `).all(proj) as any[];
+      `, [proj]).sort((a, b) => (Number(b.score_priority || 0) - Number(a.score_priority || 0))
+        || (Number(b.importance || 0) - Number(a.importance || 0))).slice(0, 8);
       if (prefs.length > 0) {
         sections.push(`\n■ 用户偏好(跨会话行为指令,优先遵守):`);
         prefs.forEach((p: any, i: number) => {
@@ -732,20 +740,20 @@ register(
   },
   async (args) => {
     try {
-      const db = DatabaseManager.getInstance(args.project);
       const proj = normalizeProject(args.project);
       const limit = Math.min(args.limit ?? 20, 100);
       const conds = ['is_active = 1', 'project = ?'];
       const params: any[] = [proj];
       if (args.memType) { conds.push('mem_type = ?'); params.push(args.memType); }
       params.push(limit);
-      const rows = db.prepare(`
+      // 索引层跨 5 个分类库聚合;每库先取 limit,再全局排序截断。
+      const rows = DatabaseManager.queryAll<any>(proj, `
         SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len, updated_at
         FROM memory
         WHERE ${conds.join(' AND ')}
         ORDER BY updated_at DESC
         LIMIT ?
-      `).all(...params) as any[];
+      `, params).sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || ''))).slice(0, limit);
       return ok({
         op: 'index',
         count: rows.length,

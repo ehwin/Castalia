@@ -82,8 +82,9 @@ export function getRecentConversations(characterId: string, hoursBack: number = 
   const proj = normalizeProject(project);
   return db.prepare(`
     SELECT id, text, created_at, importance
-    FROM memory WHERE is_active = 1
-      AND source = 'conversation_log' AND project = ?
+    /* 对话审计带写入时 is_active=0(store.ts saveConversationTurn);
+     * 按 is_active=1 过滤会永远查不到新数据(2026-10-17 修)。 */
+    FROM memory WHERE source = 'conversation_log' AND project = ?
       AND created_at > ?
     ORDER BY created_at DESC LIMIT ?
   `).all(proj, since, limit) as any[];
