@@ -70,18 +70,29 @@ export class SessionMemoryBuffer {
         this.pendingCount = 0;
         this.pendingTokens = 0;
         this.isExtracting = true;
-        const recent = (this.history.length > 0 ? this.history : (messages || [])).slice(-10);
+        const recent = [...(this.history.length > 0 ? this.history : (messages || []))];
         this.history = [];
         // 后台异步执行,绝不 await 阻塞主流程;错误静默捕获
         Promise.resolve().then(async () => {
+            let succeeded = false;
             try {
-                await runIncrementalReflection(this.project, this.sessionId, recent, this.characterId);
+                const result = await runIncrementalReflection(this.project, this.sessionId, recent, this.characterId);
+                succeeded = result.ok && !result.skipped;
             }
             catch (e) {
                 console.error('[buffer] incremental reflection error:', e.message);
             }
             finally {
                 this.isExtracting = false;
+                if (!succeeded) {
+                    this.history.unshift(...recent);
+                    this.pendingCount += 1;
+                    this.pendingTokens += recent.reduce((n, m) => n + Math.ceil((m.content || '').length / 4), 0);
+                }
+                else if (this.history.length > 0) {
+                    // Messages received while extraction was in flight must not wait for another message.
+                    this.flush([]);
+                }
             }
         });
     }

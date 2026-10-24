@@ -13,12 +13,15 @@
  *   POST /memory/reflect/apply   — 应用大模型的重构指令
  */
 import { loadPromptOverride } from './promptFile.js';
-import { DatabaseManager, listMemTypeDirs } from './db.js';
+import { DatabaseManager, listMemTypeDirs, currentMemDir } from './db.js';
 import { saveFacts, saveMemory, batchEmbedPending, updateMemory, applyIdentityActions, findDbByMemoryId } from './store.js';
 import { normalizeProject } from './env.js';
 import { isMemType, MEM_TYPES } from './memType.js';
 import fs from 'node:fs';
 import path from 'node:path';
+import { protectedReflectionProject, reflectionPolicy, wholeRecordBatches, fidelitySystemPrompt } from './reflectionFidelity.js';
+import { getUnanalyzedConversations } from './reflectionSources.js';
+export { getUnanalyzedConversations, markConversationsReflected, deepReflectionCursor } from './reflectionSources.js';
 /**
  * 获取所有记忆（供大模型分析）
  */
@@ -35,6 +38,8 @@ export function listAllMemories(characterId = 'airi', limit = 200, project) {
                subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
         FROM memory
         WHERE is_active = 1 AND project = ?
+          -- v1.23: 冷存与被接管的旧记忆不参加新一轮沉淀（否则深反思会反复处理同一批死记忆）
+          AND COALESCE(status, '') NOT IN ('cold', 'superseded')
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
       `).all(proj, limit);
@@ -82,6 +87,12 @@ export function listAllMemories(characterId = 'airi', limit = 200, project) {
 const VALID_TYPES = new Set(['episodic', 'semantic', 'entity', 'preference']);
 const VALID_MEM_TYPES = new Set(MEM_TYPES); // v1.8: 4 种封闭类型 + general
 const VALID_CATEGORIES = new Set(['conversation', 'milestone', 'identity', 'relationship', 'knowledge', 'preference', 'general']);
+function safeCategory(raw) {
+    if (typeof raw !== 'string')
+        return null;
+    const value = raw.trim();
+    return /^[\p{L}\p{N}_:-]{1,64}$/u.test(value) ? value : null;
+}
 const VALID_RELATIONS = new Set(['caused_by', 'part_of', 'follows', 'related_to', 'same_subject', 'causes', 'leads_to', 'sequence']);
 function safeTags(raw) {
     if (!raw)
@@ -99,14 +110,14 @@ function safeTags(raw) {
  * 顺序:精确 id(store 的 findDbByMemoryId,内部先扫活跃再兜底墓碑)→ 前缀 LIKE(LLM 会给短 ID),先活跃后兜底;
  * 找不到则回退 fallback(默认 general 库),让调用方原本的 "not found" 判断照常生效。
  */
-function resolveReflectTarget(idPrefix, project) {
-    if (!idPrefix || /[%_]/.test(idPrefix))
+function resolveReflectTarget(idPrefix, project, allowInactiveConversation = false) {
+    if (!idPrefix || typeof idPrefix !== 'string')
         return null;
     const matches = [];
     for (const mt of listMemTypeDirs(normalizeProject(project))) {
         const db = DatabaseManager.getInstance(project, mt);
-        const rows = db.prepare('SELECT id FROM memory WHERE project = ? AND is_active = 1 AND id LIKE ?')
-            .all(normalizeProject(project), idPrefix + '%');
+        const rows = db.prepare(`SELECT id FROM memory WHERE project = ? AND (is_active = 1${allowInactiveConversation ? " OR (is_active = 0 AND source = 'conversation_log')" : ''}) AND substr(id, 1, length(?)) = ?`)
+            .all(normalizeProject(project), idPrefix, idPrefix);
         for (const row of rows)
             matches.push({ db, id: row.id });
     }
@@ -118,7 +129,85 @@ function resolveReflectTarget(idPrefix, project) {
 function memDbFor(id, project, fallback) {
     return findDbByMemoryId(id, project)?.db ?? fallback;
 }
-export async function applyReflectActions(actions, characterId = 'airi', project) {
+// ═══ v1.23 反思保真：硬事实覆盖 + 证据附录 ═══════════════════════════════
+// 背景：实测提取只保住 ~75% 的硬事实（路径/端口/版本/日期/数字）。这些是"复核所需"的锚点，
+// 用程序算覆盖率比让模型自觉可靠；不够就把没覆盖到的原句**原样**补进去（纯字符串操作，零额外调用）。
+const HARD_TOKEN_PATTERNS = [
+    /[A-Za-z]:\\[^\s，。；、）)】"'`]+/g,
+    /\b\d{1,3}(?:\.\d{1,3}){3}\b/g,
+    /\b\d{2,5}\s*(?:B|KB|MB|GB|文件|条|帧|事件|个|秒|分钟|小时)\b/g,
+    /\b\d+\.\d+(?:\.\d+)?\b/g,
+    /\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?/g,
+    /\b\d{1,5}\b/g,
+    /[A-Z]{2,}-\d+/g,
+];
+/** 覆盖率闸门：低于该值就补证据附录。 */
+const HARD_COVERAGE_MIN = 0.9;
+function hardTokens(text) {
+    const out = new Set();
+    for (const re of HARD_TOKEN_PATTERNS) {
+        for (const m of String(text || '').match(re) || []) {
+            if (m.length > 3)
+                out.add(m);
+        }
+    }
+    return [...out];
+}
+function splitSentences(text) {
+    return String(text || '')
+        .split(/(?<=[。！？!?；;\n])/)
+        .map(s => s.replace(/^[\s>]+/, '').trim())
+        .filter(s => s.length >= 8);
+}
+function hardCoverage(sourceText, outputText) {
+    const tokens = hardTokens(sourceText);
+    if (!tokens.length)
+        return { total: 0, ratio: 1, missing: [] };
+    const haystack = String(outputText || '');
+    const missing = tokens.filter(t => !haystack.includes(t));
+    return { total: tokens.length, ratio: (tokens.length - missing.length) / tokens.length, missing };
+}
+/**
+ * 提取完成后按来源检查硬事实覆盖：不达标就把"含缺失 token 的原句"追加到该来源第一条 extract 上。
+ * 多主题拆条时按来源汇总判断，避免每条都被误判为低覆盖而重复补。
+ */
+function attachEvidenceAppendix(result, project, warnings) {
+    const actions = Array.isArray(result.actions) ? result.actions : [];
+    const bySource = new Map();
+    for (const a of actions) {
+        if (!a || a.action !== 'extract' || typeof a.sourceId !== 'string')
+            continue;
+        const list = bySource.get(a.sourceId) || [];
+        list.push(a);
+        bySource.set(a.sourceId, list);
+    }
+    for (const [sourceId, list] of bySource) {
+        const target = resolveReflectTarget(sourceId, project, true);
+        if (!target)
+            continue;
+        let sourceText = '';
+        try {
+            sourceText = target.db.prepare('SELECT text FROM memory WHERE id = ?').get(target.id)?.text || '';
+        }
+        catch {
+            continue;
+        }
+        if (!sourceText)
+            continue;
+        const merged = list.map((a) => String(a.newText || '')).join('\n');
+        const { total, ratio, missing } = hardCoverage(sourceText, merged);
+        if (!total || !missing.length || ratio >= HARD_COVERAGE_MIN)
+            continue;
+        const missingSet = new Set(missing);
+        const sentences = [...new Set(splitSentences(sourceText).filter(s => hardTokens(s).some(t => missingSet.has(t))))].slice(0, 12);
+        if (!sentences.length)
+            continue;
+        const appendix = `\n\n【证据附录·原文】\n${sentences.map(s => `> ${s}`).join('\n')}`;
+        list[0].newText = String(list[0].newText || '') + appendix;
+        warnings.push(`证据附录：来源 ${String(sourceId).slice(0, 8)} 硬事实覆盖 ${(ratio * 100).toFixed(0)}%，补 ${sentences.length} 句原文`);
+    }
+}
+export async function applyReflectActions(actions, characterId = 'airi', project, options = {}) {
     const db = DatabaseManager.getInstance(project);
     const result = { applied: 0, errors: [], details: [], receipts: [] };
     for (let action of actions) {
@@ -131,10 +220,24 @@ export async function applyReflectActions(actions, characterId = 'airi', project
         };
         try {
             action = { ...action };
+            // v1.23-fix: 整合模式放行 merge（合并结果落库后再软删源，内容可回查）；其余破坏性动作照旧禁止。
+            const mergeAllowedByConsolidation = options.consolidation === true && action.action === 'merge';
+            if ((protectedReflectionProject(project) || (options.automatic && reflectionPolicy(project) === 'evidence')) &&
+                !mergeAllowedByConsolidation &&
+                (['merge', 'delete', 'split', 'identityUpdate'].includes(action.action) || (action.action === 'reclassify' && action.newText !== undefined))) {
+                throw new Error('preservation policy forbids destructive reflection actions');
+            }
+            if (action.action === 'reclassify') {
+                action.newTypeSingle ??= action.newType;
+                action.newCategorySingle ??= action.newCategory;
+            }
             const ids = action.action === 'merge' ? action.sourceIds :
                 [action.targetId, action.sourceId, action.targetIdRelate].filter((id) => !!id);
             if (ids) {
-                const resolved = ids.map(id => resolveReflectTarget(id, project));
+                if (options.allowedSourceIds && ids.some(id => !options.allowedSourceIds.has(id))) {
+                    throw new Error('target is outside the current reflection input');
+                }
+                const resolved = ids.map(id => resolveReflectTarget(id, project, action.action === 'extract'));
                 if (resolved.some(target => !target))
                     throw new Error('target missing, inactive or ambiguous');
                 if (action.action === 'merge') {
@@ -154,6 +257,8 @@ export async function applyReflectActions(actions, characterId = 'airi', project
             }
             switch (action.action) {
                 case 'merge': {
+                    if (protectedReflectionProject(project))
+                        throw new Error(`merge is disabled for ${reflectionPolicy(project)} projects`);
                     // 合并多个记忆为一个
                     if (!action.sourceIds || action.sourceIds.length < 2 || !action.newText) {
                         result.errors.push('merge: need sourceIds and newText');
@@ -167,7 +272,8 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     let mergeInvalid = null;
                     for (const id of action.sourceIds) {
                         const sdb = memDbFor(id, project, db);
-                        const src = sdb.prepare('SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0').get(id);
+                        // v1.23: critical 不参与合并（否则核心记忆会被"沉淀"掉）
+                        const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical'").get(id);
                         if (!src) {
                             mergeInvalid = `source not found or locked: ${id}`;
                             break;
@@ -215,6 +321,8 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     break;
                 }
                 case 'split': {
+                    if (protectedReflectionProject(project))
+                        throw new Error(`split is disabled for ${reflectionPolicy(project)} projects`);
                     if (!action.targetId || !action.fragments?.length ||
                         action.fragments.some(f => !f.text?.trim())) {
                         throw new Error('split: need targetId and non-empty fragments');
@@ -292,7 +400,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         values.push(action.newTypeSingle);
                     }
                     if (action.newCategorySingle) {
-                        if (!VALID_CATEGORIES.has(action.newCategorySingle)) {
+                        if (!safeCategory(action.newCategorySingle)) {
                             result.errors.push(`reclassify: invalid category "${action.newCategorySingle}", skipped`);
                             receipt.status = 'failed';
                             receipt.reason = `invalid category "${action.newCategorySingle}"`;
@@ -384,15 +492,33 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         continue;
                     }
                     const validType = action.newType && VALID_TYPES.has(action.newType) ? action.newType : 'semantic';
-                    const validCat = action.newCategory && VALID_CATEGORIES.has(action.newCategory) ? action.newCategory : 'general';
+                    const validCat = safeCategory(action.newCategory) || 'general';
                     const validMemType = isMemType(action.newMemType) ? action.newMemType : undefined;
                     const validTags = safeTags(action.newTags) || [];
                     const importance = action.newImportance ?? 0.6;
                     const tier = (action.tier && ['temporary', 'standard', 'critical'].includes(action.tier))
                         ? action.tier : 'standard';
+                    // 源文本：既用于 quotes 子串校验，也用于证据附录的兜底
+                    const sourceTarget = resolveReflectTarget(action.sourceId, project, true);
+                    let sourceText = '';
+                    if (sourceTarget) {
+                        try {
+                            sourceText = sourceTarget.db.prepare('SELECT text FROM memory WHERE id = ?').get(sourceTarget.id)?.text || '';
+                        }
+                        catch { /* 读不到就跳过校验 */ }
+                    }
+                    // Graphiti 式引用校验：只有能在原文里子串命中的引用才保留（防模型编造原话）
+                    const quoteClean = (q) => String(q).replace(/^[「『"']+|[」』"']+$/g, '').trim();
+                    const validQuotes = (Array.isArray(action.quotes) ? action.quotes : [])
+                        .map(quoteClean)
+                        .filter((q) => q.length >= 4 && (!sourceText || sourceText.includes(q)))
+                        .slice(0, 6);
+                    const textWithQuotes = validQuotes.length
+                        ? `${String(action.newText).trimEnd()}\n\n【原文引用】\n${validQuotes.map((q) => `> ${q}`).join('\n')}`
+                        : String(action.newText);
                     const { saveMemory } = await import('./store.js');
-                    await saveMemory({
-                        text: action.newText,
+                    const extracted = await saveMemory({
+                        text: textWithQuotes,
                         type: validType,
                         memType: validMemType,
                         category: validCat,
@@ -402,12 +528,82 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         characterId,
                         project,
                         source: 'reflect_extract',
+                        metadata: JSON.stringify({ reflection: { sourceIds: [action.sourceId], project: normalizeProject(project), role: 'leaf', quotes: validQuotes.length } }),
                     });
+                    // Exact duplicate extraction can point to several source records.
+                    const extractedDb = findDbByMemoryId(extracted.id, project)?.db;
+                    if (extractedDb) {
+                        const row = extractedDb.prepare('SELECT metadata FROM memory WHERE id = ?').get(extracted.id);
+                        let meta = {};
+                        try {
+                            meta = JSON.parse(row?.metadata || '{}');
+                        }
+                        catch { /* older free-form metadata */ }
+                        meta.reflection = { ...meta.reflection, sourceIds: [...new Set([...(Array.isArray(meta.reflection?.sourceIds) ? meta.reflection.sourceIds : []), action.sourceId])], project: normalizeProject(project) };
+                        extractedDb.prepare('UPDATE memory SET metadata = ? WHERE id = ?').run(JSON.stringify(meta), extracted.id);
+                        // Parent-Child：leaf 指回对话原文，检索时按 parent_id 回捞整段（llama_index ParentDocumentRetriever）
+                        try {
+                            extractedDb.prepare('UPDATE memory SET parent_id = ? WHERE id = ?').run(action.sourceId, extracted.id);
+                        }
+                        catch { /* 旧库未迁移 */ }
+                    }
+                    // hardFacts 直接进 facts 表（带证据与时间有效性）。这一步替代"把事实写进散文"。
+                    if (Array.isArray(action.hardFacts) && action.hardFacts.length) {
+                        try {
+                            const { saveFacts } = await import('./store.js');
+                            // facts 表与 general 库同一 sqlite；extract 若落到 project/user 等分类库，
+                            // source_memory_id 跨库会触发 FOREIGN KEY（与 Anima 同一坑）。跨库时不挂来源。
+                            const factOwnerMemType = findDbByMemoryId(extracted.id, project)?.memType;
+                            const factSourceId = factOwnerMemType === 'general' ? extracted.id : null;
+                            const facts = action.hardFacts
+                                .filter((f) => f && typeof f === 'object' && f.subject && f.predicate && f.object)
+                                .slice(0, 15)
+                                .map((f) => ({
+                                subject: String(f.subject).trim(),
+                                predicate: String(f.predicate).trim(),
+                                object: String(f.object).trim(),
+                                confidence: Number.isFinite(Number(f.confidence)) ? Math.min(1, Math.max(0, Number(f.confidence))) : 0.7,
+                                evidence: typeof f.evidence === 'string' ? f.evidence : undefined,
+                                validFrom: typeof f.validFrom === 'string' ? f.validFrom : undefined,
+                                validTo: typeof f.validTo === 'string' ? f.validTo : undefined,
+                            }));
+                            if (facts.length)
+                                await saveFacts(facts, factSourceId, characterId, project);
+                        }
+                        catch (e) {
+                            // 事实是"提取之外的富化"：失败只记在回执里，绝不能把整批打回重跑。
+                            console.error('[reflect] hardFacts skipped:', e.message);
+                            receipt.reason = `facts: ${e.message}`;
+                        }
+                    }
+                    // 同主题/接续：只建链接、不覆盖旧记忆（mem0 linked_memory_ids 思路）
+                    for (const linkedId of (Array.isArray(action.linkedMemoryIds) ? action.linkedMemoryIds : []).slice(0, 10)) {
+                        if (typeof linkedId !== 'string' || linkedId === action.sourceId)
+                            continue;
+                        const target = resolveReflectTarget(linkedId, project, false);
+                        if (!target)
+                            continue;
+                        try {
+                            const row = target.db.prepare('SELECT metadata, locked, tier FROM memory WHERE id = ?').get(target.id);
+                            if (!row || row.locked || row.tier === 'critical')
+                                continue;
+                            let meta = {};
+                            try {
+                                meta = JSON.parse(row.metadata || '{}');
+                            }
+                            catch { /* ignore */ }
+                            meta.supersededBy = [...new Set([...(Array.isArray(meta.supersededBy) ? meta.supersededBy : []), extracted.id])];
+                            target.db.prepare("UPDATE memory SET metadata = ?, status = 'superseded' WHERE id = ?").run(JSON.stringify(meta), target.id);
+                        }
+                        catch { /* 链接失败不影响提取 */ }
+                    }
                     // 给源记忆 +reference_count（v5.1: LIKE 匹配短ID）
-                    memDbFor(action.sourceId, project, db).prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(action.sourceId);
+                    const sourceDb = sourceTarget?.db || memDbFor(action.sourceId, project, db);
+                    sourceDb.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(action.sourceId);
                     if (receipt.status === 'applied')
                         result.applied++;
-                    result.details.push(`extract: from ${action.sourceId} → ${validType}/${validCat} (${tier})`);
+                    receipt.rowsAffected = 1;
+                    result.details.push(`extract: from ${action.sourceId} → ${validType}/${validCat} (${tier}) quotes=${validQuotes.length}`);
                     break;
                 }
                 case 'identityUpdate': {
@@ -432,6 +628,8 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     break;
                 }
                 case 'delete': {
+                    if (protectedReflectionProject(project))
+                        throw new Error(`delete is disabled for ${reflectionPolicy(project)} projects`);
                     if (!action.targetId) {
                         result.errors.push('delete: need targetId');
                         receipt.status = 'failed';
@@ -439,7 +637,8 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         result.receipts.push(receipt);
                         continue;
                     }
-                    const _delR = memDbFor(action.targetId, project, db).prepare('UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0').run(action.targetId);
+                    // v1.23: critical 是"核心记忆"，除手动操作外不得被自动反思删除（Letta read_only 语义）
+                    const _delR = memDbFor(action.targetId, project, db).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical'").run(action.targetId);
                     receipt.rowsAffected = _delR.changes;
                     if (_delR.changes === 0) {
                         receipt.status = 'failed';
@@ -512,12 +711,16 @@ export async function applyReflectActions(actions, characterId = 'airi', project
         if (batchResult.embedded > 0) {
             result.details.push(`batch embedded ${batchResult.embedded} pending memories`);
         }
-        if (batchResult.errors.length > 0) {
-            result.errors.push(...batchResult.errors);
+        // Embedding is optional; an unavailable embedder must not turn a successfully
+        // persisted reflection into a failed run (which would block the cursor).
+        if (batchResult.errors.length > 0 && batchResult.errors.some(e => !e.includes('embedding disabled'))) {
+            console.error('[reflect] batch embed (optional):', batchResult.errors.join('; '));
+            result.details.push('batch embed warnings: ' + batchResult.errors.join('; '));
         }
     }
     catch (e) {
-        result.errors.push(`batch embed: ${e.message}`);
+        console.error('[reflect] batch embed (optional):', e.message);
+        result.details.push('batch embed failed: ' + e.message);
     }
     return result;
 }
@@ -595,33 +798,6 @@ const BUILTIN_REFLECT_SYSTEM_PROMPT = `你是记忆反思引擎。你的任务�
 - 不需要操作时 actions 为空数组 []`;
 export const REFLECT_SYSTEM_PROMPT = loadPromptOverride('REFLECT_PROMPT_FILE', BUILTIN_REFLECT_SYSTEM_PROMPT);
 /**
- * 获取待反思的未分析对话
- */
-export function getUnanalyzedConversations(characterId = 'airi', since, // ISO datetime，不传则取上次 reflect 之后
-limit = 30, project) {
-    const db = DatabaseManager.getInstance(project);
-    const proj = normalizeProject(project);
-    // 找到上次反思时间（最近一次 source='reflect_summary' 的创建时间）
-    if (!since) {
-        const lastReflect = db.prepare(`
-      SELECT created_at FROM memory
-      WHERE source = 'reflect_summary' AND project = ?
-      ORDER BY created_at DESC LIMIT 1
-    `).get(proj);
-        since = lastReflect?.created_at || new Date(0).toISOString();
-    }
-    return db.prepare(`
-    SELECT id, text, created_at
-    FROM memory
-    WHERE is_active = 0
-      AND source = 'conversation_log'
-      AND project = ?
-      AND created_at > ?
-    ORDER BY created_at ASC
-    LIMIT ?
-  `).all(proj, since, limit);
-}
-/**
  * 应用大模型反思结果
  *
  * 一次性处理：
@@ -630,7 +806,7 @@ limit = 30, project) {
  *   3. insights → 存入 memory（source='reflect_insight'）
  *   4. actions → 调用 applyReflectActions()
  */
-export async function applyReflectResult(result, characterId = 'airi', project) {
+export async function applyReflectResult(result, characterId = 'airi', project, options = {}) {
     const out = {
         summaryId: null,
         factsInserted: 0,
@@ -639,9 +815,42 @@ export async function applyReflectResult(result, characterId = 'airi', project) 
         actionsApplied: 0,
         applied: 0,
         errors: [],
+        warnings: [],
         receipts: [],
     };
+    // Apply extraction first. A failed extraction must not produce a misleading
+    // successful summary, and the driver will leave its sources pending for retry.
+    // v1.23: 落库前先按来源算硬事实覆盖，不达标就把缺失的原句补成"证据附录"。
+    attachEvidenceAppendix(result, project, out.warnings);
+    const actions = result.actions || [];
+    if (actions.length) {
+        const ar = await applyReflectActions(actions, characterId, project, options);
+        out.actionsApplied = ar.applied;
+        out.errors.push(...ar.errors);
+        out.receipts = ar.receipts;
+        try {
+            const dir = process.env.REFLECT_RECEIPT_DIR || path.join(currentMemDir(), 'receipts');
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, `reflect-receipt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`), JSON.stringify({
+                ts: new Date().toISOString(), characterId, project: normalizeProject(project),
+                inputIds: options.allowedSourceIds ? [...options.allowedSourceIds] : undefined,
+                actionCount: actions.length, applied: ar.applied,
+                failed: ar.receipts.filter(r => r.status !== 'applied').length,
+                actions, receipts: ar.receipts, errors: ar.errors,
+            }, null, 2), 'utf8');
+        }
+        catch (e) {
+            // 回执写盘失败只影响审计副本,不能把已成功应用的动作当成整轮失败(否则游标不推进)。
+            console.error('[reflect] receipt write (optional):', e.message);
+        }
+        if (out.errors.length)
+            return out;
+    }
     // 1. 存 summary
+    // 注意：以下 1~3 都是**提取成功之后的富化**。提取已落库并写了回执，
+    // 富化失败若升级成 error，驱动会在 markConversationsReflected 之前 break，
+    // 同一批来源永远重跑（2026-10-23 事故：facts 形状不符 → NOT NULL → 无限重复提取）。
+    // 所以富化失败只记 warning，绝不阻断游标推进。
     if (result.summary) {
         try {
             const mem = await saveMemory({
@@ -654,22 +863,26 @@ export async function applyReflectResult(result, characterId = 'airi', project) 
                 project,
                 source: 'reflect_summary',
                 subject: 'user',
+                metadata: JSON.stringify({ reflection: { sourceIds: [...(options.allowedSourceIds || [])], project: normalizeProject(project), role: 'navigation' } }),
             });
             out.summaryId = mem.id;
         }
         catch (e) {
-            out.errors.push(`summary: ${e.message}`);
+            out.warnings.push(`summary: ${e.message}`);
         }
     }
     // 2. 存 facts（自动去重，confidence 取 MAX）
-    if (result.facts && result.facts.length > 0) {
+    // facts 表是 SPO 三元组；模型偶尔给字符串或 {sourceId,text}，saveFacts 不接受。
+    // 驱动侧已过滤，这里再做一次兜底，保证非法条目进不来。
+    const facts = (result.facts || []).filter((f) => f && typeof f === 'object' && f.subject && f.predicate && f.object);
+    if (facts.length > 0) {
         try {
-            const fr = await saveFacts(result.facts, out.summaryId, characterId, project);
+            const fr = await saveFacts(facts, out.summaryId, characterId, project);
             out.factsInserted = fr.inserted;
             out.factsUpdated = fr.updated;
         }
         catch (e) {
-            out.errors.push(`facts: ${e.message}`);
+            out.warnings.push(`facts: ${e.message}`);
         }
     }
     // 3. 存 insights
@@ -689,39 +902,8 @@ export async function applyReflectResult(result, characterId = 'airi', project) 
                 out.insightsCount++;
             }
             catch (e) {
-                out.errors.push(`insight: ${e.message}`);
+                out.warnings.push(`insight: ${e.message}`);
             }
-        }
-    }
-    // 4. 应用记忆整理 actions + 逐动作回执落盘
-    if (result.actions && result.actions.length > 0) {
-        try {
-            const ar = await applyReflectActions(result.actions, characterId, project);
-            out.actionsApplied = ar.applied;
-            out.errors.push(...ar.errors);
-            out.receipts = ar.receipts;
-            // ═══ v1.3: 回执落盘 — 失败动作原文存档,事后可人工修正 ═══
-            try {
-                const dir = process.env.REFLECT_RECEIPT_DIR || path.join(process.cwd(), 'memory', 'receipts');
-                fs.mkdirSync(dir, { recursive: true });
-                const ts = new Date().toISOString().replace(/[:.]/g, '-');
-                fs.writeFileSync(path.join(dir, `reflect-receipt-${ts}.json`), JSON.stringify({
-                    ts: new Date().toISOString(),
-                    characterId,
-                    actionCount: result.actions.length,
-                    applied: ar.applied,
-                    failed: ar.receipts.filter(r => r.status !== 'applied').length,
-                    actions: result.actions,
-                    receipts: ar.receipts,
-                    errors: ar.errors,
-                }, null, 2), 'utf-8');
-            }
-            catch (e) {
-                out.errors.push(`receipt write: ${e.message}`);
-            }
-        }
-        catch (e) {
-            out.errors.push(`actions: ${e.message}`);
         }
     }
     return out;
@@ -734,11 +916,12 @@ export async function reflect(action, params = {}) {
         case 'unanalyzed': {
             // 获取待反思的未分析对话 + prompt
             const conversations = getUnanalyzedConversations(params.characterId || 'airi', params.since, params.limit || 30, params.project);
-            const prompt = conversations.map(c => c.text).join('\n---\n');
+            const batches = wholeRecordBatches(conversations);
             return {
                 conversationCount: conversations.length,
-                systemPrompt: REFLECT_SYSTEM_PROMPT,
-                userPrompt: `请分析以下对话，输出反思JSON：\n\n${prompt.substring(0, 30000)}`,
+                systemPrompt: reflectionPolicy(params.project) === 'standard' ? REFLECT_SYSTEM_PROMPT : fidelitySystemPrompt(params.project),
+                userPrompt: `请分析以下对话，输出反思JSON：\n\n${JSON.stringify(conversations)}`,
+                batches,
                 conversationIds: conversations.map(c => c.id),
             };
         }

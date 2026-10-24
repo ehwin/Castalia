@@ -21,13 +21,24 @@ export const CONSOLIDATE_SIMILARITY = (() => {
 
 /**
  * v1.11 结构兜底候选:反思/摘要写出的"报告式"记忆(表头形如 `# User Profile: …`)表头相同、内容各异,
- * 实测组内向量余弦中位 0.55、词袋重叠 0.06 —— 纯语义预筛(0.88)抓不到,这类"看着像重复"的记忆
- * 永远进不了 LLM 裁决。这里按 (memType + `# 表头`) 分桶补候选:每桶以最长的一条为锚,最多 N 对,
- * 判断权仍完全交给 LLM(它可以判"不是重复")。设 0 关闭。
+ * 实测组内向量余弦中位只有 0.55(远低于 0.88 阈值)、词袋重叠 0.06 —— 纯语义预筛抓不到它们,
+ * 于是这类"看着像重复"的记忆永远进不了 LLM 裁决。这里按 (memType + `# 表头`) 分桶补候选:
+ * 每桶以"最长的一条"为锚,最多补 N 对,判断权仍完全交给 LLM(它完全可以判"不是重复")。
+ * 设 0 即关闭该兜底。
  */
 export const CONSOLIDATE_BUCKET_PAIRS = (() => {
   const v = parseInt(process.env.CONSOLIDATE_BUCKET_PAIRS || '3', 10);
   return Number.isFinite(v) && v >= 0 ? v : 3;
+})();
+
+/**
+ * v1.23-fix: 给"结构兜底候选"预留的名额。原实现先跑语义预筛、再跑结构兜底，
+ * 语义候选一旦占满 limit（现网长期 50/50），同表头的报告式重复永远进不了裁决
+ * （实测 269 条 `# Project Context:` 结构对 = 0）。预留一小段名额即可让两类都上桌。
+ */
+export const CONSOLIDATE_BUCKET_RESERVE = (() => {
+  const v = parseInt(process.env.CONSOLIDATE_BUCKET_RESERVE || '15', 10);
+  return Number.isFinite(v) && v >= 0 ? v : 15;
 })();
 
 /** 候选对数上限,防止相似爆炸 */
@@ -53,6 +64,8 @@ function scanVectorPairs(db: any, proj: string, threshold: number, limit: number
   const mems = db.prepare(`
     SELECT m.rowid, m.id FROM memory m
     WHERE m.is_active = 1 AND m.project = ? AND (m.locked IS NULL OR m.locked = 0)
+      AND COALESCE(m.tier, 'standard') <> 'critical'
+      AND COALESCE(m.status, '') NOT IN ('cold', 'superseded')
     ORDER BY m.created_at DESC
     LIMIT 500
   `).all(proj) as any[];
@@ -113,13 +126,15 @@ function scanVectorPairs(db: any, proj: string, threshold: number, limit: number
 
 /** v1.11.2 单个 memType 库的结构兜底(同 `# 表头` 分桶);由 findSimilarCandidates 跨库调度。 */
 function scanStructPairs(db: any, proj: string, limit: number, seen: Set<string>, pairs: SimilarCandidate[]): void {
-  // ═══ v1.11 结构兜底:同 `# 表头` + 同 memType 分桶补候选(similarity 记 0 = 结构配对,非语义相似)═══
+  // ═══ v1.11 结构兜底:同 `# 表头` + 同 memType 分桶补候选(相似度记 0,表示"结构配对"而非语义相似)═══
   if (CONSOLIDATE_BUCKET_PAIRS > 0 && pairs.length < limit) {
     let rows2: any[] = [];
     try {
       rows2 = db.prepare(`
         SELECT id, text, mem_type FROM memory
         WHERE is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
+          AND COALESCE(tier, 'standard') <> 'critical'
+          AND COALESCE(status, '') NOT IN ('cold', 'superseded')
         ORDER BY created_at DESC LIMIT 500
       `).all(proj) as any[];
     } catch { rows2 = []; }
@@ -135,6 +150,7 @@ function scanStructPairs(db: any, proj: string, limit: number, seen: Set<string>
     }
     for (const [, arr] of buckets) {
       if (arr.length < 2) continue;
+      // 锚 = 最长的一条(信息量最大),其余各与锚配一对
       const sorted = arr.slice().sort((a, b) => String(b.text || '').length - String(a.text || '').length);
       let added = 0;
       for (let i = 1; i < sorted.length && added < CONSOLIDATE_BUCKET_PAIRS; i++) {
@@ -166,9 +182,12 @@ export async function findSimilarCandidates(
   // "报告式"重复(带 # 表头的成组记录)完全够不到,LLM 也就无从裁决。
   // 逐库扫描并把候选并起来;两阶段(先全库语义 → 再全库结构)是为了让表头对不挤占语义候选的名额。
   const dirs = listMemTypeDirs(proj);
+  // 语义预筛给结构兜底预留名额，避免语义候选占满 50 对后结构对永远轮不到
+  const structReserve = Math.min(CONSOLIDATE_BUCKET_RESERVE, limit);
+  const vecLimit = Math.max(1, limit - structReserve);
   for (const mt of dirs) {
-    if (pairs.length >= limit) break;
-    scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, limit, seen, pairs);
+    if (pairs.length >= vecLimit) break;
+    scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, vecLimit, seen, pairs);
   }
   if (CONSOLIDATE_BUCKET_PAIRS > 0) {
     for (const mt of dirs) {
@@ -187,15 +206,40 @@ export interface ConsolidateResult {
   consolidated: number;
 }
 
-export async function consolidate(): Promise<ConsolidateResult> {
+// ═══ 衰减/升华参数(config.json 的 consolidate.* → env,均可在部署侧自定义)═══
+// 默认值即原行为:sigmoid 衰减(0.04 陡度 / 90 天中点),重要度 <0.15 且年龄 >60 天剪枝;
+// 引用数 >2 升华 +0.1,上限 0.95。调大 midpointDays = 衰减更慢;调小 = 更快被剪。
+const _pnum = (v: string | undefined, d: number): number => {
+  const n = parseFloat(v || '');
+  return Number.isFinite(n) && n > 0 ? n : d;
+};
+const DECAY_STEEPNESS = _pnum(process.env.CONSOLIDATE_DECAY_STEEPNESS, 0.04);
+const DECAY_MIDPOINT_DAYS = _pnum(process.env.CONSOLIDATE_DECAY_MIDPOINT_DAYS, 90);
+const DECAY_MIN_IMPORTANCE = _pnum(process.env.CONSOLIDATE_DECAY_MIN_IMPORTANCE, ACTIVATION_THRESHOLD);
+const DECAY_MIN_AGE_DAYS = _pnum(process.env.CONSOLIDATE_DECAY_MIN_AGE_DAYS, 60);
+const PROMOTE_REF_COUNT = _pnum(process.env.CONSOLIDATE_PROMOTE_REF_COUNT, 2);
+const PROMOTE_BOOST = _pnum(process.env.CONSOLIDATE_PROMOTE_BOOST, 0.1);
+const PROMOTE_CAP = _pnum(process.env.CONSOLIDATE_PROMOTE_CAP, 0.95);
+
+export async function consolidate(project?: string): Promise<ConsolidateResult> {
   const now = Date.now();
   let prunedCount = 0;
   let updatedCount = 0;
   let consolidateCount = 0;
 
-  // memdir:遍历默认项目全部分类库(时间衰减/升华不只作用 general)
-  const proj = normalizeProject(undefined);
-  for (const mt of listMemTypeDirs(proj)) {
+  // ═══ 衰减范围(分级口径,与检索侧的 decayFor 对齐)═══
+  // 检索侧:critical→永不衰减 / 时效类→10天半衰 / 其余→30天半衰。
+  // 存储侧沿用同一原则:只让 general(流水/未分类)参与衰减+升华;
+  // 四个语义分类库 user(画像)/feedback(纠偏)/project(项目)/reference(资料)**永不衰减**。
+  // 覆盖方式:env CONSOLIDATE_DECAY_MEMTYPES(逗号分隔;"all" = 全部分类库),
+  //          或 memory/config.json 的 consolidate.decayMemTypes。
+  const proj = normalizeProject(project);
+  const decayTypes = (process.env.CONSOLIDATE_DECAY_MEMTYPES || 'general')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const decayAll = decayTypes.includes('all');
+  const decayDirs = listMemTypeDirs(proj)
+    .filter(mt => decayAll || decayTypes.includes(mt.toLowerCase()));
+  for (const mt of decayDirs) {
     const db = DatabaseManager.getInstance(proj, mt);
 
     // ═══ Phase 1: sigmoid 时间衰减 ═══
@@ -210,10 +254,10 @@ export async function consolidate(): Promise<ConsolidateResult> {
         if (!Number.isFinite(ts)) continue;  // 非法时间戳跳过,避免 importance 被写成 NaN
         const hoursSince = (now - ts) / 3600000;
         const daysSince = hoursSince / 24;
-        const decay = 1.0 / (1.0 + Math.exp(0.04 * (daysSince - 90)));
+        const decay = 1.0 / (1.0 + Math.exp(DECAY_STEEPNESS * (daysSince - DECAY_MIDPOINT_DAYS)));
         const newImportance = Math.round(mem.importance * decay * 1000) / 1000;
 
-        if (newImportance < ACTIVATION_THRESHOLD && daysSince > 60) {
+        if (newImportance < DECAY_MIN_IMPORTANCE && daysSince > DECAY_MIN_AGE_DAYS) {
           db.prepare('UPDATE memory SET is_active = 0, importance = ? WHERE id = ?')
             .run(newImportance, mem.id);
           prunedCount++;
@@ -228,12 +272,12 @@ export async function consolidate(): Promise<ConsolidateResult> {
 
     // ═══ Phase 2: reference_count 升华 ═══
     const dupes = db.prepare(
-      'SELECT id FROM memory WHERE is_active = 1 AND reference_count > 2 LIMIT 20'
+      `SELECT id FROM memory WHERE is_active = 1 AND reference_count > ${PROMOTE_REF_COUNT} LIMIT 20`
     ).all() as any[];
 
     for (const dup of dupes) {
       db.prepare(
-        'UPDATE memory SET reference_count = 0, importance = MIN(0.95, importance + 0.1) WHERE id = ?'
+        `UPDATE memory SET reference_count = 0, importance = MIN(${PROMOTE_CAP}, importance + ${PROMOTE_BOOST}) WHERE id = ?`
       ).run(dup.id);
       consolidateCount++;
     }

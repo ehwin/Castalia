@@ -34,7 +34,7 @@ export function normalizeMemType(v) {
  * 规则:
  *   1. 已是 Markdown 结构(含 # 标题行)→ 原样返回,不重复包装
  *   2. 标题行:`# <Label>: <标题>`,标题取首行(剥掉列表符号),超 40 字截断
- *   3. 每条非空原行转 `- ` 列表项(原本就是列表的保留)
+ *   3. 正文原样保留，包括代码缩进、空行、引用和表格
  *   保持原文本内容不变,只加结构。
  */
 export function normalizeMarkdown(text, memType) {
@@ -52,8 +52,7 @@ export function normalizeMarkdown(text, memType) {
     if (title.length > 40)
         title = title.slice(0, 40) + '…';
     const header = title ? `# ${label}: ${title}` : `# ${label}`;
-    const items = lines.map(l => /^[-*+]\s/.test(l) || /^\d+[.、)]\s/.test(l) ? l : `- ${l}`);
-    return [header, ...items].join('\n');
+    return `${header}\n\n${text}`;
 }
 /** 索引摘要:截取 150 字(索引层不拉全文) */
 export function summarizeForIndex(text, maxLen = 150) {

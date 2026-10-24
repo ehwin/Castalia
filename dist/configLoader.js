@@ -112,13 +112,13 @@ try {
             process.env.REFLECT_MIN_GAP_HOURS = String(ref.minGapHours);
         if (ref.minUnanalyzed != null)
             process.env.REFLECT_MIN_UNANALYZED = String(ref.minUnanalyzed);
-        if (ref.intervalHours != null)
-            process.env.REFLECT_INTERVAL_HOURS = String(ref.intervalHours);
         // v1.12: 提示词文件覆盖(单个实例/项目自己的反思/整合提示词)
         if (ref.promptFile)
             process.env.REFLECT_PROMPT_FILE = String(ref.promptFile);
         if (ref.deepPromptFile)
             process.env.REFLECT_DEEP_PROMPT_FILE = String(ref.deepPromptFile);
+        if (ref.intervalHours != null)
+            process.env.REFLECT_INTERVAL_HOURS = String(ref.intervalHours);
         // v1.11: triage(LLM1 入站分拣)配置 — admin 第三个通道
         const tri = cfg.triage || {};
         if (tri.llm_url)
@@ -144,6 +144,26 @@ try {
             process.env.CONSOLIDATE_AUTO_ON_START = (cons.autoOnStart === false || cons.autoOnStart === 0 || cons.autoOnStart === '0') ? '0' : '1';
         if (cons.promptFile)
             process.env.CONSOLIDATE_PROMPT_FILE = String(cons.promptFile);
+        // 衰减范围(哪些分类库参与衰减/升华):默认只 general,四个语义分类库永不衰减
+        if (cons.decayMemTypes != null) {
+            const dm = cons.decayMemTypes;
+            process.env.CONSOLIDATE_DECAY_MEMTYPES = Array.isArray(dm) ? dm.join(',') : String(dm);
+        }
+        // 衰减/升华参数(可自定义;详见 consolidate.ts 顶部默认值)
+        const DECAY_MAP = {
+            decaySteepness: 'CONSOLIDATE_DECAY_STEEPNESS',
+            decayMidpointDays: 'CONSOLIDATE_DECAY_MIDPOINT_DAYS',
+            decayMinImportance: 'CONSOLIDATE_DECAY_MIN_IMPORTANCE',
+            decayMinAgeDays: 'CONSOLIDATE_DECAY_MIN_AGE_DAYS',
+            promoteRefCount: 'CONSOLIDATE_PROMOTE_REF_COUNT',
+            promoteBoost: 'CONSOLIDATE_PROMOTE_BOOST',
+            promoteCap: 'CONSOLIDATE_PROMOTE_CAP',
+        };
+        for (const [k, envName] of Object.entries(DECAY_MAP)) {
+            const v = cons[k];
+            if (v != null)
+                process.env[envName] = String(v);
+        }
         console.error(`[config] loaded ${CONFIG_PATH} (embed=${emb.mode || 'ollama'}, reflect=${ref.model || 'unset'}, facts=${process.env.REFLECT_FACT_EXTRACTION || 'auto'}, consolidate=${process.env.CONSOLIDATE_MIN_MEMORIES || '15'}/${process.env.CONSOLIDATE_SIMILARITY || '0.88'}, triage=${tri.model || 'unset'}, buffer=${process.env.BUFFER_SIZE || '5'}, sessionTtl=${process.env.SESSION_MEMORY_TTL_DAYS || '7'}d)`);
     }
 }

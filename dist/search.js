@@ -7,7 +7,7 @@
  *
  * 权重全部可经环境变量调整，适用于通用 agent 记忆场景。
  */
-import { DatabaseManager, listMemTypeDirs } from './db.js';
+import { DatabaseManager, listProjectNames, listMemTypeDirs } from './db.js';
 import { embed } from './ollama.js';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { normalizeMemType } from './memType.js';
@@ -33,8 +33,8 @@ const EPHEMERAL_HALF_LIFE_HOURS = parseFloat(process.env.EPHEMERAL_HALF_LIFE_HOU
 const EPHEMERAL_CATEGORIES = new Set((process.env.EPHEMERAL_CATEGORIES || 'conversation,session,context').split(',').map(s => s.trim()).filter(Boolean));
 /**
  * 分级时间衰减:
- * - critical 权威结论/身份/里程碑 → 时间不衰减(永葆可检索)
- * - 时效类(对话/会话记录)→ 短半衰期,自然沉底(可配 EPHEMERAL_CATEGORIES)
+ * - critical 权威结论/身份/里程碑→ 时间不衰减(ban 时间,永葆权威)
+ * - 时效类(对话/会话记录)→ 短半衰期,自然沉底(可用 EPHEMERAL_CATEGORIES 配置)
  * - 其余(standard 画像等)→ 默认 30 天半衰期
  */
 function decayFor(row, hoursSinceCreated) {
@@ -144,6 +144,35 @@ async function searchInDb(db, options) {
  * 互通规则由上层决定(接口先行)。结果按 score 降序,每行 project 标注来源库。
  * projects=['*'] 或 ['all'] → 本实例全部库(扫描 memory 目录)。
  */
+export async function searchMemoryAcross(options) {
+    const raw = (options.projects ?? []).map(x => (x ?? '').trim()).filter(Boolean);
+    const targetProjects = raw.length === 0
+        ? [normalizeProject(options.project)]
+        : raw.some(x => x === '*' || x === 'all')
+            ? listProjectNames()
+            : raw.map(normalizeProject);
+    const perProject = Math.max(3, Math.ceil((options.topK ?? 10) * 1.5));
+    const all = [];
+    for (const proj of targetProjects) {
+        try {
+            const r = await searchMemory({ ...options, project: proj, topK: perProject });
+            all.push(...r);
+        }
+        catch {
+            // 单个库失败不影响其他库
+        }
+    }
+    all.sort((a, b) => b.score - a.score);
+    const seen = new Set();
+    const unique = [];
+    for (const r of all) {
+        if (seen.has(r.id))
+            continue;
+        seen.add(r.id);
+        unique.push(r);
+    }
+    return unique.slice(0, options.topK ?? 10);
+}
 // ═══════════════════════════════════════════════════════════════════
 // 标签搜索 — 从 query 提取关键词，SQL tag LIKE 匹配
 // ═══════════════════════════════════════════════════════════════════
@@ -167,7 +196,8 @@ function tagSearch(db, options) {
     const tagParams = keywords.map(k => `%"${k}"%`);
     const looseCond = keywords.map(() => `m.tags LIKE ?`).join(' OR ');
     const looseParams = keywords.map(k => `%${k}%`);
-    const conditions = ['m.is_active = 1', 'm.project = ?'];
+    // v1.23-fix: superseded 在三条检索路径上一致排除（此前只有向量路径过滤，标签/文本路径仍会返回被接管的旧记忆）
+    const conditions = ['m.is_active = 1', 'm.project = ?', "COALESCE(m.status, '') <> 'superseded'"];
     const params = [project];
     conditions.push(`((${tagCond}) OR (${looseCond}))`);
     params.push(...tagParams, ...looseParams);
@@ -194,7 +224,7 @@ function tagSearch(db, options) {
     const rows = db.prepare(`
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.importance, m.character_id, m.source,
-      m.subject, m.tier,
+      m.subject, m.tier, m.parent_id,
       m.created_at, m.last_accessed_at, m.accessed_count
     FROM memory m
     WHERE ${conditions.join(' AND ')}
@@ -215,6 +245,7 @@ function tagSearch(db, options) {
             importance: row.importance,
             characterId: row.character_id, source: row.source,
             subject: row.subject || 'user', tier: row.tier || 'standard',
+            parentId: row.parent_id || null,
             score: computeScore(tagScore, row), similarity: Math.round(tagScore * 1000) / 1000,
             createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
             accessedCount: row.accessed_count,
@@ -244,7 +275,9 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
         rowidMap.set(Number(r.rowid), r.distance);
     const rowidPlaceholders = knnRows.map(() => '?').join(',');
     const rowidParams = knnRows.map(r => Number(r.rowid));
-    const conditions = [`m.rowid IN (${rowidPlaceholders})`, 'm.is_active = 1', 'm.project = ?'];
+    const conditions = [`m.rowid IN (${rowidPlaceholders})`, 'm.is_active = 1', 'm.project = ?',
+        // v1.23: 被新记忆接管的旧记忆默认不出现在检索结果里（仍可按 id 展开）
+        "COALESCE(m.status, '') <> 'superseded'"];
     const params = [...rowidParams, project];
     if (options.type) {
         conditions.push('m.type = ?');
@@ -265,7 +298,7 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
     const rows = db.prepare(`
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.importance, m.character_id, m.source,
-      m.subject, m.tier,
+      m.subject, m.tier, m.parent_id,
       m.created_at, m.last_accessed_at, m.accessed_count, m.rowid
     FROM memory m WHERE ${conditions.join(' AND ')}
   `).all(...params);
@@ -283,6 +316,7 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
                 importance: row.importance,
                 characterId: row.character_id, source: row.source,
                 subject: row.subject || 'user', tier: row.tier || 'standard',
+                parentId: row.parent_id || null,
                 score, similarity: Math.round(similarity * 1000) / 1000,
                 createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
                 accessedCount: row.accessed_count,
@@ -299,7 +333,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
     const project = normalizeProject(options.project);
     const likeConditions = terms.map(() => 'm.text LIKE ?').join(' OR ');
     const likeParams = terms.map(t => `%${t}%`);
-    const conds = [`m.is_active = 1`, `m.project = ?`, `(${likeConditions})`];
+    const conds = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `(${likeConditions})`];
     const params = [project, ...likeParams];
     if (options.memType) {
         conds.push('m.mem_type = ?');
@@ -324,7 +358,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
     const rows = db.prepare(`
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.importance, m.character_id, m.source,
-      m.subject, m.tier,
+      m.subject, m.tier, m.parent_id,
       m.created_at, m.last_accessed_at, m.accessed_count
     FROM memory m
     WHERE ${conds.join(' AND ')}
@@ -338,6 +372,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
         importance: row.importance,
         characterId: row.character_id, source: row.source,
         subject: row.subject || 'user', tier: row.tier || 'standard',
+        parentId: row.parent_id || null,
         score: computeScore(0.3, row), similarity: 0.3,
         createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
         accessedCount: row.accessed_count,
@@ -348,7 +383,9 @@ function updateAccessed(db, results) {
     if (results.length === 0)
         return;
     try {
-        const stmt = db.prepare('UPDATE memory SET accessed_count = accessed_count + 1, last_accessed_at = ? WHERE id = ?');
+        // v1.23 冷存回温：被检索命中即回到工作集（清掉 status='cold'）。
+        // 否则"冷"会变成永久标记——经常被用的记忆反而永远被排除在新沉淀之外。
+        const stmt = db.prepare("UPDATE memory SET accessed_count = accessed_count + 1, last_accessed_at = ?, status = CASE WHEN status = 'cold' THEN NULL ELSE status END WHERE id = ?");
         const now = new Date().toISOString();
         const tx = db.transaction((ids) => { for (const id of ids)
             stmt.run(now, id); });
@@ -369,7 +406,7 @@ export function getRecentMemories(characterId, limit = 5, hoursBack = 24, projec
     for (const mt of dirs) {
         try {
             const db = DatabaseManager.getInstance(proj, mt);
-            const conds = ['is_active = 1', 'character_id = ?', 'project = ?', 'created_at > ?'];
+            const conds = ['is_active = 1', 'character_id = ?', 'project = ?', 'created_at > ?', "COALESCE(status, '') <> 'superseded'"];
             const params = [characterId, proj, since];
             if (memType) {
                 conds.push('mem_type = ?');
@@ -435,7 +472,8 @@ export async function searchFacts(query, options = {}) {
     for (const r of knnRows) {
         rowidMap.set(Number(r.rowid), r.distance);
     }
-    const conditions = ['f.is_active = 1', 'f.project = ?', `f.rowid IN (${knnRows.map(() => '?').join(',')})`];
+    // v1.23-fix: 已失效（valid_to 有值）的旧事实不进检索结果
+    const conditions = ['f.is_active = 1', 'f.project = ?', "(f.valid_to IS NULL OR f.valid_to = '')", `f.rowid IN (${knnRows.map(() => '?').join(',')})`];
     const params = [proj, ...knnRows.map(r => Number(r.rowid))];
     if (options.subject) {
         conditions.push('f.subject = ?');

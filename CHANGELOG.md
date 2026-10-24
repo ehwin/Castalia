@@ -3,6 +3,16 @@
 > 本文件记录每次功能/架构变更,供 AIRI 主系统(`主系统`)吸收改进时快速对账。
 > 格式:Keep a Changelog 简化版(Added / Changed / Fixed / Removed)。
 
+## [v1.23.1] — 2026-10-24 引擎由 Full 同版本导出
+
+> 从本版起 Lite 引擎不再手工维护：`Castalia-Full/scripts/export_public.py` 把 Full 的核心源码
+> 导出到本仓（只排除 federation / reflectAll 两个 Full 专属模块），版本号读同一个 `VERSION`。
+> 因此本仓自动获得 Full 的整合修复、facts 时间有效性、冷存、回捞、失败退避等全部核心修复。
+
+### Changed
+- 工具数 27 → 30；版本号统一 1.23.1（`VERSION` → `src/version.ts`）
+- 实例变体统一为 full / anima（lite、max 名称退役）
+
 ## [v1.16.0] — 2026-09-11 cosmograph-org 宇宙图(星图在 Full)
 
 > Lite 本仓无联邦星图。宇宙视图落在 **Castalia-Full**:顶栏「星系 / 宇宙」,嵌入 PCA 铺点,细丝连线。方案:`docs/吸收方案-Cosmograph.md`。

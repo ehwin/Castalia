@@ -9,6 +9,7 @@ import type Database from 'better-sqlite3';
 import { embed, getEmbeddingCached } from './ollama.js';
 import { PROJECT_ID, CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
 import { isMemType,  MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
+import { reflectionPolicy } from './reflectionFidelity.js';
 
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
@@ -19,6 +20,7 @@ export interface StoreParams {
   sessionId?: string;  // v1.11: 会话标识 — 落 session_id 列(会话级记忆,暂不参与检索)
   type?: 'episodic' | 'semantic' | 'entity' | 'preference';
   memType?: MemType;  // v1.8: 用途维度(user/feedback/project/reference/general),默认 general
+  autoClassify?: boolean;  // v1.19: memType 未传时走 triage LLM 分拣(A3 接线)
   category?: string;
   subcategory?: string;
   tags?: string[];
@@ -78,27 +80,26 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   const now = new Date().toISOString();
   const skipEmbed = params.skipEmbed === true;
   const project = normalizeProject(params.project);
-  /* v1.19 A3:autoClassify — memType 未传时走 triage 分拣 */
+  const preserve = reflectionPolicy(project) !== 'standard';
   let memType: MemType;
   if (params.memType && isMemType(params.memType)) {
     memType = normalizeMemType(params.memType);
-  } else if ((params as any).autoClassify === true && params.text) {
+  } else if ((params as any).autoClassify === true) {
     try {
       const { classifyMemTypeLLM } = await import('./triage.js');
-      const r = await classifyMemTypeLLM(params.text, params.project);
-      memType = r.memType || 'general';
+      memType = (await classifyMemTypeLLM(params.text, params.project)).memType;
     } catch { memType = 'general'; }
   } else {
     memType = 'general';
-  };
-  // v1.8: 4 种封闭类型(memType≠general)且 text 非 Markdown 时,自动规范化包装(加标题行+转列表)
+  }
   const db = DatabaseManager.getInstance(project, memType);
+  // v1.8: 4 种封闭类型(memType≠general)且 text 非 Markdown 时,自动规范化包装(加标题行+转列表)
   const text = normalizeMarkdown(params.text, memType);
 
   // ═══ 精确去重：完全相同的文本不重复存(仅限同项目) ═══
   const exactDup = db.prepare(`
     SELECT * FROM memory
-    WHERE is_active = 1 AND project = ? AND LOWER(TRIM(text)) = LOWER(TRIM(?))
+    WHERE is_active = 1 AND project = ? AND ${preserve ? 'TRIM(text) = TRIM(?)' : 'LOWER(TRIM(text)) = LOWER(TRIM(?))'}
     LIMIT 1
   `).get(project, text?.trim() || '') as any;
 
@@ -134,7 +135,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
         WHERE embedding MATCH ? ORDER BY distance LIMIT 10
       `).all(floatVec) as any[];
 
-      if (knn.length > 0 && knn[0].distance < 0.05) {
+      if (!preserve && knn.length > 0 && knn[0].distance < 0.05) {
         // v1.5: 项目隔离 — 仅当最近邻属于同项目才算重复
         const dupRow = db.prepare('SELECT id FROM memory WHERE rowid = ? AND project = ?').get(Number(knn[0].rowid), project) as any;
         if (dupRow) {
@@ -212,7 +213,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     saveCount = 0;
     try {
       const { consolidate } = await import('./consolidate.js');
-      consolidate().catch(() => {});
+      consolidate(project).catch(() => {});
     } catch {}
   }
 
@@ -376,16 +377,11 @@ export async function saveConversationTurn(
   const id = generateId();
   const proj = normalizeProject(project);
 
-  let moodPrefix = '';
-  if (moodValue !== undefined) {
-    moodPrefix = `[mood: ${moodValue}`;
-    if (moodReason) moodPrefix += `, "${moodReason}"`;
-    moodPrefix += ']\n';
-  }
 
   const assistantName = (process.env.CASTALIA_ASSISTANT_NAME || '助手').trim() || '助手';
   const text = `用户: ${userMsg}\n${assistantName}: ${assistantMsg}`;
-  /* v1.19 分隔带:对话原文审计可见(is_active=0),检索/星图只读 is_active=1 → 不进总图;mood 入 metadata */
+  /* v1.19 分隔带:对话原文审计可见(is_active=0)——检索/星图/readDigest 只读 is_active=1,自动不进总图;
+     mood 前缀剥离入 metadata,正文纯净 */
   const meta: Record<string, any> = {};
   if (moodValue !== undefined) {
     meta.mood = moodValue;
@@ -406,6 +402,38 @@ export async function saveConversationTurn(
 // ═══ v1.3: 热度升格 — 常被访问的记忆自动变强(UPSP 热度思想) ═══
 // 访问次数 ≥ HEAT_PROMOTE_THRESHOLD 的 temporary 记忆自动升 standard(免清理)
 const HEAT_PROMOTE_THRESHOLD = parseInt(process.env.HEAT_PROMOTE_THRESHOLD || '5', 10);
+
+// ═══ v1.23 冷存分层：长期不用的低价值记忆退出"新沉淀"，但不删除、仍可检索 ═══
+// 判定：非 critical / 非 locked / 非 superseded，importance < 0.6，无引用，且
+//       last_accessed_at（没有则 created_at）超过 N 天（默认 60）。
+const COLD_AFTER_DAYS = (() => { const v = parseFloat(process.env.COLD_AFTER_DAYS || '60'); return Number.isFinite(v) && v > 0 ? v : 60; })();
+const COLD_MAX_IMPORTANCE = (() => { const v = parseFloat(process.env.COLD_MAX_IMPORTANCE || '0.6'); return Number.isFinite(v) && v > 0 ? v : 0.6; })();
+
+export function markColdMemories(project?: string): number {
+  const proj = normalizeProject(project);
+  const cutoff = new Date(Date.now() - COLD_AFTER_DAYS * 86400000).toISOString();
+  let marked = 0;
+  for (const mt of listMemTypeDirs(proj)) {
+    try {
+      const db = DatabaseManager.getInstance(proj, mt);
+      const r = db.prepare(`
+        UPDATE memory SET status = 'cold'
+        WHERE project = ? AND is_active = 1
+          AND COALESCE(status, '') NOT IN ('cold', 'superseded')
+          AND COALESCE(tier, 'standard') = 'standard'
+          AND (locked IS NULL OR locked = 0)
+          AND importance < ?
+          AND COALESCE(reference_count, 0) = 0
+          -- v1.23-fix: created_at 混着 SQLite "YYYY-MM-DD HH:MM:SS" 与 JS ISO "…T…Z" 两种格式，
+          -- 直接字符串比较会把边界差出一天；统一用 datetime() 归一化后再比。
+          AND datetime(COALESCE(last_accessed_at, created_at)) < datetime(?)
+      `).run(proj, COLD_MAX_IMPORTANCE, cutoff);
+      marked += r.changes;
+    } catch { /* 单库失败不影响其它库 */ }
+  }
+  if (marked > 0) console.error(`[cold] ${marked} 条记忆转为冷存（>${COLD_AFTER_DAYS} 天未访问且 importance<${COLD_MAX_IMPORTANCE}）`);
+  return marked;
+}
 
 export function promoteByAccess(project?: string): number {
   const proj = normalizeProject(project);
@@ -446,13 +474,16 @@ export function cleanupExpiredMemories(project?: string): number {
  * v5.0: 重新向量化单条记忆 — reflect 后调用
  * 删旧向量 + embed 新文本 + 插入新向量
  */
-export async function reEmbedMemory(id: string): Promise<boolean> {
-  const db = DatabaseManager.getInstance();
+export async function reEmbedMemory(id: string, project?: string): Promise<boolean> {
+  const found = findDbByMemoryId(id, project);
+  if (!found) return false;
+  const db = found.db;
+  const proj = normalizeProject(project);
   const mem = db.prepare('SELECT rowid, text FROM memory WHERE id = ? AND is_active = 1').get(id) as any;
   if (!mem) return false;
 
   try {
-    const vec = new Float32Array(await embed(mem.text));
+    const vec = new Float32Array(await embed(mem.text, proj));
     db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(BigInt(mem.rowid));
     db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(mem.rowid), vec);
     return true;
@@ -559,7 +590,7 @@ export interface FactRecord {
  *   - 不同 S-P-O → 正常插入
  */
 export async function saveFacts(
-  facts: { subject: string; predicate: string; object: string; confidence: number }[],
+  facts: { subject: string; predicate: string; object: string; confidence: number; evidence?: string; validFrom?: string; validTo?: string }[],
   sourceMemoryId: string | null = null,
   characterId: string = 'airi',
   project?: string,  // v1.5: 项目隔离
@@ -573,12 +604,17 @@ export async function saveFacts(
   let updated = 0;
 
   const upsert = db.prepare(`
-    INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id, character_id, is_active, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id, character_id, is_active, created_at, updated_at, evidence, valid_from, valid_to)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
     ON CONFLICT(subject, predicate, object, project) DO UPDATE SET
       confidence = MAX(confidence, excluded.confidence),
       updated_at = excluded.updated_at,
       is_active = 1,
+      evidence = COALESCE(NULLIF(excluded.evidence, ''), facts.evidence),
+      valid_from = COALESCE(excluded.valid_from, facts.valid_from),
+      -- v1.23-fix: 同一 SPO 被再次明确写入 = 重新断言该值，必须清掉历史的 valid_to（显式 validTo 除外）。
+      -- 否则"张三被改成李四、又改回张三"之后，张三会永久处于失效状态，检索/裁决都看不到它。
+      valid_to = excluded.valid_to,
       accessed_count = facts.accessed_count
   `);
 
@@ -588,7 +624,10 @@ export async function saveFacts(
       'SELECT id, confidence FROM facts WHERE subject=? AND predicate=? AND object=? AND project=?'
     ).get(f.subject, f.predicate, f.object, proj) as any;
 
-    upsert.run(id, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now);
+    upsert.run(
+      id, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now,
+      f.evidence ?? null, f.validFrom ?? null, f.validTo ?? null,
+    );
 
     if (before) {
       updated++;
@@ -596,6 +635,40 @@ export async function saveFacts(
       inserted++;
     }
   }
+
+  // v1.23 冲突失效（Graphiti 式）：功能性关系（一个主体只能有一个值）出现新值时，
+  // 旧事实只打 valid_to 保留，不删除 —— 历史版本可查，当前值以最新为准。
+  // v1.23-fix: 必须排除"本批一起写入的对象"。原实现逐条 UPDATE object <> 自己，
+  // 同一批出现 姓名=张三 + 姓名=李四 时两条会互相打 valid_to，两个值一起消失。
+  const FUNCTIONAL_PREDICATES = new Set([
+    '姓名', '名字', '年龄', '职业', '居住地', '工作单位', '生日', '称呼', '昵称',
+    'name', 'age', 'job', 'occupation', 'residence', 'birthday',
+  ]);
+  try {
+    const functionalBatch = new Map<string, Set<string>>(); // subject\u0001predicate -> 本批 objects
+    for (const f of facts) {
+      const predicate = String(f.predicate || '').trim();
+      if (!FUNCTIONAL_PREDICATES.has(predicate)) continue;
+      const subject = String(f.subject || '').trim();
+      const key = `${subject}\u0001${predicate}`;
+      const set = functionalBatch.get(key) || new Set<string>();
+      set.add(String(f.object || '').trim());
+      functionalBatch.set(key, set);
+    }
+    for (const [key, objects] of functionalBatch) {
+      const [subject, predicate] = key.split('\u0001');
+      const batchObjects = [...objects].filter(Boolean);
+      if (batchObjects.length >= 2) {
+        console.error(`[facts] 同批出现互斥值 ${subject}/${predicate}=${batchObjects.join(' | ')}，保留全部待裁决`);
+      }
+      const placeholders = batchObjects.length ? batchObjects.map(() => '?').join(',') : null;
+      const sql = `UPDATE facts SET valid_to = ?, updated_at = ?
+        WHERE project = ? AND subject = ? AND predicate = ?
+          AND is_active = 1 AND (valid_to IS NULL OR valid_to = '')
+          ${placeholders ? `AND object NOT IN (${placeholders})` : ''}`;
+      db.prepare(sql).run(now, now, proj, subject, predicate, ...batchObjects);
+    }
+  } catch { /* 列未迁移时静默跳过 */ }
 
   // 为新增 / 更新的事实生成 embedding 并写入 vec_facts
   if (!isEmbedEnabled()) return { inserted, updated };
@@ -627,7 +700,8 @@ export async function saveFacts(
 export function getFactsBySubject(subject: string, characterId?: string, project?: string): FactRecord[] {
   const db = DatabaseManager.getInstance(project);
   const proj = normalizeProject(project);
-  let query = 'SELECT * FROM facts WHERE subject = ? AND is_active = 1 AND project = ?';
+  // v1.23-fix: 默认只返回当前有效事实；历史版本留在表里（valid_to 有值）供按需追溯。
+  let query = "SELECT * FROM facts WHERE subject = ? AND is_active = 1 AND project = ? AND (valid_to IS NULL OR valid_to = '')";
   const params: any[] = [subject, proj];
   if (characterId) {
     query += ' AND character_id = ?';
@@ -704,6 +778,7 @@ export function promoteToProject(
 ): string[] {
   const cid = characterId || CHAR_ID;
   const proj = normalizeProject(project);
+  const preserve = reflectionPolicy(proj) !== 'standard';
   const now = new Date().toISOString();
   const ids: string[] = [];
   const gateRejected: Record<string, string[]> = { tooloong: [], noInfo: [], foreign: [], delta: [] };
@@ -713,9 +788,11 @@ export function promoteToProject(
     const text = typeof item.text === 'string' ? item.text.trim() : '';
     if (!mt || !text) continue;
     /* ── v1.19 promote 三闸(Claude 写前语义回流) ── */
-    if (text.length > 240) { gateRejected.tooloong.push(text.slice(0, 40)); continue; }
+    // 闸1 密度:>240 字或结构词密度过低(信息/字符比)拒
+    if (!preserve && text.length > 240) { gateRejected.tooloong.push(text.slice(0, 40)); continue; }
     const infoWords = (text.match(/[\u4e00-\u9fa5A-Za-z0-9]{2,}/g) || []).join('');
-    if (infoWords.length === 0) { gateRejected.noInfo.push(text.slice(0, 40)); continue; }
+    if (infoWords.replace(/[\u4e00-\u9fa5A-Za-z0-9]/g, '').length === text.length) { gateRejected.noInfo.push(text.slice(0, 40)); continue; }
+    // 闸2 归属:跨项目专名(本库外的软件名/系统名)拒——防跨盘串库(AIRI 内容经 lobehub 通道入库事件)
     // 跨库污染闸门:promote 时若文本提到"属于其它库的名字"则拒绝(避免跨库串味)。
     // 名单按实例配置,公共版不预设任何本地库名 —— 默认不拦:
     //   CASTALIA_FOREIGN_NAMES="Name1,Name2"      其它库名总表(兜底)
@@ -727,16 +804,18 @@ export function promoteToProject(
     const ban = new Set([...(homeNames[proj] || foreignNames)].filter(x => x && x.toLowerCase() !== proj.toLowerCase()));
     const hitForeign = [...ban].find(n => text.includes(n));
     if (hitForeign && !(proj === 'default')) { gateRejected.foreign.push(`${hitForeign}:${text.slice(0, 30)}`); continue; }
+    // memdir 路由按 memType 落对应分类库
     const db = DatabaseManager.getInstance(proj, mt);
     const md = normalizeMarkdown(text, mt);
-    {
+    // 闸3 delta:与库存项目级同 memType 记忆 bigram Jaccard>0.72 视为无增量(旧闻重复入库)
+    if (!preserve) {
       const existRows = db.prepare(`
         SELECT text FROM memory
         WHERE is_active = 1 AND project = ? AND session_id IS NULL AND mem_type = ?
         ORDER BY updated_at DESC LIMIT 200
       `).all(proj, mt) as any[];
-      const norm = (x: string) => (x || '').toLowerCase().replace(/[^\u4e00-\u9fa5a-z0-9]+/g, '');
-      const bigrams = (x: string) => { const n = norm(x); const out = new Set<string>(); for (let q = 0; q + 2 <= n.length; q++) out.add(n.slice(q, q + 2)); return out; };
+      const norm = (s: string) => (s || '').toLowerCase().replace(/[^\u4e00-\u9fa5a-z0-9]+/g, '');
+      const bigrams = (s: string) => { const n = norm(s); const out = new Set<string>(); for (let q = 0; q + 2 <= n.length; q++) out.add(n.slice(q, q + 2)); return out; };
       const bg = bigrams(md);
       if (bg.size >= 6) {
         let dupByDelta = false;
@@ -753,7 +832,7 @@ export function promoteToProject(
     }
     const dup = db.prepare(`
       SELECT id FROM memory
-      WHERE is_active = 1 AND project = ? AND session_id IS NULL AND LOWER(TRIM(text)) = LOWER(TRIM(?))
+      WHERE is_active = 1 AND project = ? AND session_id IS NULL AND ${preserve ? 'TRIM(text) = TRIM(?)' : 'LOWER(TRIM(text)) = LOWER(TRIM(?))'}
       LIMIT 1
     `).get(proj, md) as any;
     if (dup) { ids.push(dup.id); continue; }

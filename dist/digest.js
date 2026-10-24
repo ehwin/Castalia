@@ -15,7 +15,7 @@ import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { cleanupExpiredMemories } from './store.js';
 import { normalizeProject } from './env.js';
 const MIN_DIGEST_GAP_MS = 60 * 1000;
-/* v1.19 B6:digest 热闸 per-project */
+/* v1.19 B6:digest 热闸 per-project —— 原单变量让多库共享消化节奏互相错乱 */
 const lastDigestTimeByProject = new Map();
 export async function runDigest(characterId = 'default', project) {
     const result = {
@@ -26,21 +26,8 @@ export async function runDigest(characterId = 'default', project) {
     };
     // 1. 清理过期临时记忆(memdir:遍历项目全部分类库)
     result.cleaned = cleanupExpiredMemories(project);
-    // 2. 恢复被误标记的 critical 记忆(memdir:遍历项目全部分类库)
-    const proj = normalizeProject(project);
-    for (const mt of listMemTypeDirs(proj)) {
-        try {
-            const db = DatabaseManager.getInstance(proj, mt);
-            const lostCritical = db.prepare(`
-        UPDATE memory SET is_active = 1
-        WHERE tier = 'critical' AND is_active = 0
-      `).run();
-            result.restored += lostCritical.changes;
-        }
-        catch (e) {
-            result.errors.push('restore critical: ' + e.message);
-        }
-    }
+    // 2. critical 记忆不再无条件复活：inactive 可能代表人工删除、合并删除或跨 memType 迁移墓碑。
+    // 只有显式人工恢复接口才能恢复，避免同一 ID 在多个分类库同时 active。
     return result;
 }
 export function maybeDigest(characterId = 'default', project) {
@@ -49,12 +36,18 @@ export function maybeDigest(characterId = 'default', project) {
     const last = lastDigestTimeByProject.get(proj) || 0;
     if (now - last < MIN_DIGEST_GAP_MS)
         return null;
-    const db = DatabaseManager.getInstance(project);
-    const unanalyzed = db.prepare(`
-    SELECT COUNT(*) as c FROM memory
-    WHERE is_active = 0 AND source = 'conversation_log'  /* v1.19 分隔带 */
-      AND last_accessed_at = created_at
-  `).get()?.c || 0;
+    let unanalyzed = 0;
+    for (const mt of listMemTypeDirs(proj)) {
+        try {
+            const db = DatabaseManager.getInstance(proj, mt);
+            unanalyzed += db.prepare(`
+        SELECT COUNT(*) as c FROM memory
+        WHERE is_active = 0 AND source = 'conversation_log'
+          AND last_accessed_at = created_at
+      `).get()?.c || 0;
+        }
+        catch { /* 单分类库失败不阻断其它库 */ }
+    }
     if (unanalyzed === 0)
         return null;
     lastDigestTimeByProject.set(proj, now);
