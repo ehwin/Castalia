@@ -501,7 +501,13 @@ export async function searchFacts(
     return []; // 纯本地模式:facts 无向量可查
   }
 
-  const queryVector = await embed(query, options.project);
+  // v1.23.2-fix: 嵌入不可用时返回空结果，而不是让 fact_search 整个工具抛错
+  let queryVector: number[];
+  try {
+    queryVector = await embed(query, options.project);
+  } catch {
+    return [];
+  }
   const floatQuery = new Float32Array(queryVector);
 
   const knnLimit = Math.min(topK * 8, 60);
@@ -574,5 +580,6 @@ export async function searchFacts(
     } catch {}
   }
 
-  return results;
+  // v1.23.2-fix: 按 topK 截断（此前会把 knnLimit 内的 60 条全返回并全部记访问）
+  return results.slice(0, topK);
 }
