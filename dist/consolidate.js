@@ -237,9 +237,13 @@ export async function consolidate(project) {
     for (const mt of decayDirs) {
         const db = DatabaseManager.getInstance(proj, mt);
         // ═══ Phase 1: sigmoid 时间衰减 ═══
+        // v1.23.1-fix: 从 base_importance 基线算，避免“已衰减值再乘一次”导致衰减取决于运行次数。
+        // identity_locked 是 forgetMemory 的同款保护位，不能在这里被自动剪枝。
         const activeRecords = db.prepare(`
-      SELECT id, importance, last_accessed_at
-      FROM memory WHERE is_active = 1 AND COALESCE(source, '') != 'manual_lore' AND tier != 'critical' AND (locked IS NULL OR locked = 0)
+      SELECT id, importance, COALESCE(base_importance, importance) AS base_importance, last_accessed_at
+      FROM memory WHERE is_active = 1 AND COALESCE(source, '') != 'manual_lore'
+        AND COALESCE(tier, 'standard') != 'critical' AND (locked IS NULL OR locked = 0)
+        AND COALESCE(identity_locked, 0) = 0
     `).all();
         const decayTx = db.transaction(() => {
             for (const mem of activeRecords) {
@@ -249,15 +253,16 @@ export async function consolidate(project) {
                 const hoursSince = (now - ts) / 3600000;
                 const daysSince = hoursSince / 24;
                 const decay = 1.0 / (1.0 + Math.exp(DECAY_STEEPNESS * (daysSince - DECAY_MIDPOINT_DAYS)));
-                const newImportance = Math.round(mem.importance * decay * 1000) / 1000;
+                const base = Number(mem.base_importance ?? mem.importance) || 0;
+                const newImportance = Math.round(base * decay * 1000) / 1000;
                 if (newImportance < DECAY_MIN_IMPORTANCE && daysSince > DECAY_MIN_AGE_DAYS) {
                     db.prepare('UPDATE memory SET is_active = 0, importance = ? WHERE id = ?')
                         .run(newImportance, mem.id);
                     prunedCount++;
                 }
                 else {
-                    db.prepare('UPDATE memory SET importance = ? WHERE id = ?')
-                        .run(newImportance, mem.id);
+                    db.prepare('UPDATE memory SET importance = ?, base_importance = ? WHERE id = ?')
+                        .run(newImportance, base, mem.id);
                     updatedCount++;
                 }
             }
@@ -266,7 +271,10 @@ export async function consolidate(project) {
         // ═══ Phase 2: reference_count 升华 ═══
         const dupes = db.prepare(`SELECT id FROM memory WHERE is_active = 1 AND reference_count > ${PROMOTE_REF_COUNT} LIMIT 20`).all();
         for (const dup of dupes) {
-            db.prepare(`UPDATE memory SET reference_count = 0, importance = MIN(${PROMOTE_CAP}, importance + ${PROMOTE_BOOST}) WHERE id = ?`).run(dup.id);
+            db.prepare(`UPDATE memory SET reference_count = 0,
+           importance = MIN(${PROMOTE_CAP}, COALESCE(base_importance, importance) + ${PROMOTE_BOOST}),
+           base_importance = MIN(${PROMOTE_CAP}, COALESCE(base_importance, importance) + ${PROMOTE_BOOST})
+         WHERE id = ?`).run(dup.id);
             consolidateCount++;
         }
     }

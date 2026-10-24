@@ -70,35 +70,41 @@ loadEncryptedSecrets();
 try {
     if (fs.existsSync(CONFIG_PATH)) {
         const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
-        // 记忆库目录配置:config.json 的 db_dir 字段(若有)覆盖环境变量
-        if (cfg.db_dir && typeof cfg.db_dir === 'string' && cfg.db_dir.trim()) {
+        // v1.23.1-fix: 与文件头/web 端一致 —— 显式环境变量优先，config.json 只填充未设置的项。
+        // 旧实现无条件覆盖 MEMORY_DB_DIR/EMBED_MODE 等，会造成“引擎读 B 库、控制台显示 A 库”的串库。
+        if (!process.env.MEMORY_DB_DIR && cfg.db_dir && typeof cfg.db_dir === 'string' && cfg.db_dir.trim()) {
             process.env.MEMORY_DB_DIR = cfg.db_dir.trim();
         }
         // 嵌入模型配置
         const emb = cfg.embedding || {};
-        if (emb.mode)
-            process.env.EMBED_MODE = String(emb.mode).toLowerCase();
-        if (emb.mode === 'api') {
-            if (emb.api_url)
+        const embMode = emb.mode ? String(emb.mode).toLowerCase().trim() : '';
+        if (embMode && !process.env.EMBED_MODE) {
+            if (['none', 'ollama', 'api'].includes(embMode))
+                process.env.EMBED_MODE = embMode;
+            else
+                console.error(`[config] 未知 embedding.mode=${embMode}，忽略`);
+        }
+        if (embMode === 'api') {
+            if (emb.api_url && !process.env.OLLAMA_URL)
                 process.env.OLLAMA_URL = emb.api_url.replace(/\/+$/, '');
-            if (emb.api_model)
+            if (emb.api_model && !process.env.EMBEDDING_MODEL)
                 process.env.EMBEDDING_MODEL = emb.api_model;
             if (emb.api_key && !process.env.EMBEDDING_API_KEY)
                 process.env.EMBEDDING_API_KEY = emb.api_key;
         }
-        else if (emb.mode !== 'none') {
-            if (emb.ollama_url)
+        else if (embMode && embMode !== 'none') {
+            if (emb.ollama_url && !process.env.OLLAMA_URL)
                 process.env.OLLAMA_URL = emb.ollama_url.replace(/\/+$/, '');
-            if (emb.model)
+            if (emb.model && !process.env.EMBEDDING_MODEL)
                 process.env.EMBEDDING_MODEL = emb.model;
         }
         // 反思 LLM 配置
         const ref = cfg.reflect || {};
-        if (ref.llm_url)
+        if (ref.llm_url && !process.env.REFLECT_LLM_URL)
             process.env.REFLECT_LLM_URL = ref.llm_url.replace(/\/+$/, '');
         if (ref.api_key && !process.env.REFLECT_LLM_API_KEY)
             process.env.REFLECT_LLM_API_KEY = ref.api_key;
-        if (ref.model)
+        if (ref.model && !process.env.REFLECT_LLM_MODEL)
             process.env.REFLECT_LLM_MODEL = ref.model;
         if (ref.factExtraction)
             process.env.REFLECT_FACT_EXTRACTION = String(ref.factExtraction);
@@ -121,11 +127,11 @@ try {
             process.env.REFLECT_INTERVAL_HOURS = String(ref.intervalHours);
         // v1.11: triage(LLM1 入站分拣)配置 — admin 第三个通道
         const tri = cfg.triage || {};
-        if (tri.llm_url)
+        if (tri.llm_url && !process.env.TRIAGE_LLM_URL)
             process.env.TRIAGE_LLM_URL = tri.llm_url.replace(/\/+$/, '');
         if (tri.api_key && !process.env.TRIAGE_LLM_API_KEY)
             process.env.TRIAGE_LLM_API_KEY = tri.api_key;
-        if (tri.model)
+        if (tri.model && !process.env.TRIAGE_LLM_MODEL)
             process.env.TRIAGE_LLM_MODEL = tri.model;
         // v1.11 Part2: 渐进式临时反思配置(admin 留路;缺省用 env/默认值)
         if (tri.bufferSize != null)

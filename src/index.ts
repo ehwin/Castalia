@@ -85,7 +85,10 @@ const TOOL_GROUPS: Record<string, string[]> = {
 };
 
 function resolveTools(input: string | undefined): Set<string> | null {
-  if (!input || input === 'all') return null; // null = 注册全部
+  // v1.23.1-fix: 未设置 MCP_TOOLS 时按文档默认 'agent'（最小暴露面），而不是注册全部。
+  // 想要全部请显式 MCP_TOOLS=all。
+  if (!input || !input.trim()) return new Set(TOOL_GROUPS.agent);
+  if (input.trim() === 'all') return null; // null = 注册全部
   const result = new Set<string>();
   for (const token of input.split(',').map(t => t.trim())) {
     if (token === 'all') return null;
@@ -383,9 +386,14 @@ register(
   async (args) => {
     try {
       const db = DatabaseManager.getInstance(args.project);
-      const hoursBack = args.hoursBack ?? 48;
-      const recentLimit = args.recentLimit ?? 5;
-      const relatedLimit = args.relatedLimit ?? 5;
+      // v1.23.1-fix: 限幅（负数 LIMIT 在 SQLite 里等于无上限，会把整库灌进 prompt）
+      const clampInt = (v: any, def: number, min: number, max: number) => {
+        const n = Math.floor(Number(v));
+        return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def;
+      };
+      const hoursBack = clampInt(args.hoursBack ?? 48, 48, 1, 8760);
+      const recentLimit = clampInt(args.recentLimit ?? 5, 5, 1, 50);
+      const relatedLimit = clampInt(args.relatedLimit ?? 5, 5, 1, 50);
       const proj = normalizeProject(args.project);
 
       // 1. 近期重要记忆
@@ -396,6 +404,9 @@ register(
       if (args.query) {
         const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: CHAR_ID, project: proj });
         related = r.map(m => ({ id: m.id, text: m.text, category: m.category, importance: m.importance, score: m.score, createdAt: m.createdAt, parentId: (m as any).parentId || null }));
+        // 去重：近期段已经出现过的记忆不再重复注入
+        const recentIds = new Set(recent.map((m: any) => m.id));
+        related = related.filter((m: any) => !recentIds.has(m.id));
       }
 
       // 2.5 v1.23 Parent-Child 回捞：命中的是提炼记忆(leaf)，按 parent_id 取对话原文。
@@ -607,8 +618,15 @@ register(
 
       sections.push(`\n【要求】以上记忆来自用户的真实历史,与当前任务相关时请直接使用,不要重新询问用户已知信息。`);
 
+      // v1.23.1-fix: 总预算封顶，避免任意调用方把整库灌进 prompt
+      const PROMPT_BUDGET = 24000;
+      let promptText = sections.join('\n');
+      if (promptText.length > PROMPT_BUDGET) {
+        promptText = promptText.slice(0, PROMPT_BUDGET) + `\n…（已截断，原始 ${sections.join('\n').length} 字，必要时用 memory_get/memory_search 精确取）`;
+      }
+
       const bundle = {
-        prompt: sections.join('\n'),
+        prompt: promptText,
         instructions,
         recent: recent.map(m => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
         related,
@@ -1180,7 +1198,7 @@ async function main() {
 
   // Event-driven digest check every 1 minute
   setInterval(() => {
-    maybeDigest(CHAR_ID)?.catch((e: any) => console.error('digest error:', e));
+    try { maybeDigest(CHAR_ID)?.catch((e: any) => console.error('digest error:', e)); } catch (e: any) { console.error('digest error:', e); }
   }, 60 * 1000);
 
   // WAL checkpoint every 30 minutes
@@ -1193,8 +1211,10 @@ async function main() {
 
   // Cleanup expired every 30 minutes
   setInterval(() => {
-    const cleaned = cleanupExpiredMemories();
-    if (cleaned > 0) console.error(`[castalia] cleaned ${cleaned} expired temporary memories`);
+    try {
+      const cleaned = cleanupExpiredMemories();
+      if (cleaned > 0) console.error(`[castalia] cleaned ${cleaned} expired temporary memories`);
+    } catch (e: any) { console.error('[castalia] cleanup error:', e.message); }
   }, 30 * 60 * 1000);
 
   // Auto-reflect every N hours (REFLECT_INTERVAL_HOURS > 0 enables)

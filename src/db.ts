@@ -44,7 +44,10 @@ function legacyDbPath(): string | undefined {
 
 /** 项目名 → 文件名安全片段:禁止路径分隔符/危险字符(避免 ../ 逃逸 memory 目录) */
 export function safeFilePart(name: string): string {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '_') || 'default';
+  const cleaned = String(name || '').replace(/[^a-zA-Z0-9._-]/g, '_');
+  // v1.23.1-fix: '.' / '..' 能通过原白名单并让 path.join 上跳一级（memory/../…）。
+  if (!cleaned || cleaned === '.' || cleaned === '..' || /^\.+$/.test(cleaned)) return 'default';
+  return cleaned;
 }
 
 let warnedLegacy = false;
@@ -306,9 +309,29 @@ export function initProjectSchema(db: Database.Database) {
   try { db.exec(`ALTER TABLE facts ADD COLUMN valid_to DATETIME`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE facts ADD COLUMN evidence TEXT`); } catch (_e) { /* already exists */ }
 
+  // v1.23.1: 衰减基线。importance 会被 consolidate 按年龄衰减；如果每次都在“已衰减值”上再乘一次，
+  // 衰减速度就取决于 consolidate 跑了几次而不是记忆多老（实测 61 天 0.9 分 7 次运行后跌破阈值被删）。
+  // base_importance 保存原始值，衰减永远从基线算；触发器覆盖所有 INSERT 路径。
+  try { db.exec(`ALTER TABLE memory ADD COLUMN base_importance REAL`); } catch (_e) { /* already exists */ }
+  try { db.exec(`UPDATE memory SET base_importance = importance WHERE base_importance IS NULL`); } catch (_e) {}
+  try {
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_memory_base_importance AFTER INSERT ON memory
+             WHEN NEW.base_importance IS NULL
+             BEGIN UPDATE memory SET base_importance = NEW.importance WHERE id = NEW.id; END`);
+  } catch (_e) { /* trigger 已存在或旧库不支持 */ }
+
   // Unique index for fact dedup (per-project: same SPO allowed across projects)
-  try { db.exec(`DROP INDEX IF EXISTS idx_facts_spo`); } catch (_e) {}
-  try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_spo ON facts(subject, predicate, object, project)`); } catch (_e) {}
+  // v1.23.1-fix: 不再每次启动 DROP。旧实现 DROP 成功、CREATE 因历史重复失败且被吞掉，
+  // 此后 saveFacts 的 ON CONFLICT 目标消失 → 每次 prepare 直接抛错，facts 静默断流。
+  // 现在只补建缺失索引；建不起来只告警（saveFacts 已改为显式 update/insert，不再依赖该索引）。
+  try {
+    const idx = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_facts_spo'").get() as any;
+    if (!idx) {
+      db.exec(`CREATE UNIQUE INDEX idx_facts_spo ON facts(subject, predicate, object, project)`);
+    }
+  } catch (e: any) {
+    console.error(`[db] facts 唯一索引未建立（存在重复 SPO 或旧库）: ${e.message}`);
+  }
   try { db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject, is_active)`); } catch (_e) {}
 
   // 指令表(保持原 schema:项目库也建;三层指令路由在 instructions.ts 决定)

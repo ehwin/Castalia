@@ -118,9 +118,9 @@ export async function saveMemory(params) {
     };
     const storeTx = db.transaction(() => {
         db.prepare(`
-      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, metadata, title, status, score_confidence, score_impact, score_priority, score_urgency, identity_locked)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory, JSON.stringify(record.tags), record.importance, record.characterId, record.source, record.subject, record.tier, record.expiresAt, 1, record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0, 0, record.metadata, record.title, record.status, record.scoreConfidence, record.scoreImpact, record.scorePriority, record.scoreUrgency, record.identityLocked ? 1 : 0);
+      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, metadata, title, status, score_confidence, score_impact, score_priority, score_urgency, identity_locked)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory, JSON.stringify(record.tags), record.importance, record.importance, record.characterId, record.source, record.subject, record.tier, record.expiresAt, 1, record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0, 0, record.metadata, record.title, record.status, record.scoreConfidence, record.scoreImpact, record.scorePriority, record.scoreUrgency, record.identityLocked ? 1 : 0);
         // v5.0: 仅在非 skipEmbed 时写入向量
         if (!skipEmbed && vector) {
             const info = db.prepare('SELECT rowid FROM memory WHERE id = ?').get(record.id);
@@ -243,8 +243,9 @@ export async function updateMemory(id, updates) {
         values.push(JSON.stringify(updates.tags));
     }
     if (updates.importance !== undefined) {
-        fields.push('importance = ?');
-        values.push(updates.importance);
+        // 显式改重要性 = 重新设基线，避免下一次衰减从旧基线把它拉回去
+        fields.push('importance = ?, base_importance = ?');
+        values.push(updates.importance, updates.importance);
     }
     // v1.15: LobeHub 精细化吸收
     if (updates.metadata !== undefined) {
@@ -502,50 +503,54 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = 'air
     const proj = normalizeProject(project);
     let inserted = 0;
     let updated = 0;
-    const upsert = db.prepare(`
+    // v1.23.1-fix: 不再依赖 ON CONFLICT 目标（旧实现每次启动 DROP 唯一索引再重建，
+    // 一旦重建失败，ON CONFLICT 在 prepare 阶段就抛错 → facts 永久断流）。
+    // 这里显式 find→update/insert，并把整批写入 + 互斥失效放进同一个事务。
+    const findStmt = db.prepare('SELECT id FROM facts WHERE subject=? AND predicate=? AND object=? AND project=?');
+    const insertStmt = db.prepare(`
     INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id, character_id, is_active, created_at, updated_at, evidence, valid_from, valid_to)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-    ON CONFLICT(subject, predicate, object, project) DO UPDATE SET
-      confidence = MAX(confidence, excluded.confidence),
-      updated_at = excluded.updated_at,
-      is_active = 1,
-      evidence = COALESCE(NULLIF(excluded.evidence, ''), facts.evidence),
-      valid_from = COALESCE(excluded.valid_from, facts.valid_from),
-      -- v1.23-fix: 同一 SPO 被再次明确写入 = 重新断言该值，必须清掉历史的 valid_to（显式 validTo 除外）。
-      -- 否则"张三被改成李四、又改回张三"之后，张三会永久处于失效状态，检索/裁决都看不到它。
-      valid_to = excluded.valid_to,
-      accessed_count = facts.accessed_count
   `);
-    for (const f of facts) {
-        const id = generateId();
-        const before = db.prepare('SELECT id, confidence FROM facts WHERE subject=? AND predicate=? AND object=? AND project=?').get(f.subject, f.predicate, f.object, proj);
-        upsert.run(id, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now, f.evidence ?? null, f.validFrom ?? null, f.validTo ?? null);
-        if (before) {
-            updated++;
-        }
-        else {
-            inserted++;
-        }
-    }
+    const updateStmt = db.prepare(`
+    UPDATE facts SET
+      confidence = MAX(confidence, ?),
+      updated_at = ?,
+      is_active = 1,
+      evidence = COALESCE(NULLIF(?, ''), evidence),
+      valid_from = COALESCE(?, valid_from),
+      valid_to = ?,
+      source_memory_id = COALESCE(?, source_memory_id)
+    WHERE id = ?
+  `);
     // v1.23 冲突失效（Graphiti 式）：功能性关系（一个主体只能有一个值）出现新值时，
     // 旧事实只打 valid_to 保留，不删除 —— 历史版本可查，当前值以最新为准。
-    // v1.23-fix: 必须排除"本批一起写入的对象"。原实现逐条 UPDATE object <> 自己，
-    // 同一批出现 姓名=张三 + 姓名=李四 时两条会互相打 valid_to，两个值一起消失。
+    // v1.23-fix: 必须排除"本批一起写入的对象"，否则同批 姓名=张三 + 姓名=李四 会互相失效。
     const FUNCTIONAL_PREDICATES = new Set([
         '姓名', '名字', '年龄', '职业', '居住地', '工作单位', '生日', '称呼', '昵称',
         'name', 'age', 'job', 'occupation', 'residence', 'birthday',
     ]);
-    try {
-        const functionalBatch = new Map(); // subject\u0001predicate -> 本批 objects
+    const functionalBatch = new Map(); // subject\u0001predicate -> 本批 objects
+    for (const f of facts) {
+        const predicate = String(f.predicate || '').trim();
+        if (!FUNCTIONAL_PREDICATES.has(predicate))
+            continue;
+        const subject = String(f.subject || '').trim();
+        const key = `${subject}\u0001${predicate}`;
+        const set = functionalBatch.get(key) || new Set();
+        set.add(String(f.object || '').trim());
+        functionalBatch.set(key, set);
+    }
+    const applyTx = db.transaction(() => {
         for (const f of facts) {
-            const predicate = String(f.predicate || '').trim();
-            if (!FUNCTIONAL_PREDICATES.has(predicate))
-                continue;
-            const subject = String(f.subject || '').trim();
-            const key = `${subject}\u0001${predicate}`;
-            const set = functionalBatch.get(key) || new Set();
-            set.add(String(f.object || '').trim());
-            functionalBatch.set(key, set);
+            const before = findStmt.get(f.subject, f.predicate, f.object, proj);
+            if (before) {
+                updateStmt.run(f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null, sourceMemoryId, before.id);
+                updated++;
+            }
+            else {
+                insertStmt.run(generateId(), f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now, f.evidence ?? null, f.validFrom ?? null, f.validTo ?? null);
+                inserted++;
+            }
         }
         for (const [key, objects] of functionalBatch) {
             const [subject, predicate] = key.split('\u0001');
@@ -560,8 +565,14 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = 'air
           ${placeholders ? `AND object NOT IN (${placeholders})` : ''}`;
             db.prepare(sql).run(now, now, proj, subject, predicate, ...batchObjects);
         }
+    });
+    try {
+        applyTx();
     }
-    catch { /* 列未迁移时静默跳过 */ }
+    catch (e) {
+        console.error('[facts] 批量写入失败（整批回滚）:', e.message);
+        throw e;
+    }
     // 为新增 / 更新的事实生成 embedding 并写入 vec_facts
     if (!isEmbedEnabled())
         return { inserted, updated };

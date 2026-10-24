@@ -110,7 +110,9 @@ export function matchPaths(paths, path) {
     if (path === undefined || path === null || path === '')
         return true;
     const p = path.replace(/\\/g, '/');
-    let allowed = false;
+    // 只有取反规则时按 gitignore 语义：默认放行，命中 ! 才排除
+    const hasPositive = paths.some(raw => !raw.startsWith('!'));
+    let allowed = !hasPositive;
     for (const raw of paths) {
         if (raw.startsWith('!')) {
             if (getMatcher(raw.slice(1))(p))
@@ -156,15 +158,27 @@ export function getRuleGroup(name) {
  * @param seen    当前展开链上的规则组名(环路检测)
  * @param path    调用方传入的路径(可选);规则组自身 paths 非空时不匹配则整组跳过
  */
-export function expandInstruction(content, depth = 0, seen = new Set(), path) {
+/** v1.23.1: include 展开的总预算（字符数 + 引用次数），防止宽扇出指数膨胀。 */
+export const MAX_INCLUDE_CHARS = 100_000;
+export const MAX_INCLUDE_REFS = 200;
+export function expandInstruction(content, depth = 0, seen = new Set(), path, budget = { chars: 0, refs: 0 }) {
     const out = [];
+    if (budget.chars >= MAX_INCLUDE_CHARS || budget.refs >= MAX_INCLUDE_REFS) {
+        return `⚠️ [include] 展开超过预算（${MAX_INCLUDE_CHARS} 字 / ${MAX_INCLUDE_REFS} 次），已截断`;
+    }
     for (const line of content.split('\n')) {
         const m = line.match(INCLUDE_LINE_RE);
         if (!m) {
             out.push(line);
+            budget.chars += line.length + 1;
             continue;
         }
         for (const ref of parseIncludeRefs(m[1])) {
+            if (budget.chars >= MAX_INCLUDE_CHARS || budget.refs >= MAX_INCLUDE_REFS) {
+                out.push(`⚠️ [include] 展开超过预算（${MAX_INCLUDE_CHARS} 字 / ${MAX_INCLUDE_REFS} 次），后续引用已截断`);
+                break;
+            }
+            budget.refs++;
             if (!ref.startsWith('rule:')) {
                 out.push(`⚠️ [include] 未知引用类型:${ref}(仅支持 rule:<组名>)`);
                 continue;
@@ -190,8 +204,12 @@ export function expandInstruction(content, depth = 0, seen = new Set(), path) {
                 continue;
             const nextSeen = new Set(seen);
             nextSeen.add(name);
-            out.push(`[规则组 ${name}]`);
-            out.push(expandInstruction(rule.content, depth + 1, nextSeen, path));
+            const header = `[规则组 ${name}]`;
+            out.push(header);
+            budget.chars += header.length + 1;
+            const body = expandInstruction(rule.content, depth + 1, nextSeen, path, budget);
+            out.push(body);
+            budget.chars += body.length + 1;
         }
     }
     return out.join('\n');
