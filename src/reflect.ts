@@ -312,11 +312,15 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
       const ids = action.action === 'merge' ? action.sourceIds :
         [action.targetId, action.sourceId, action.targetIdRelate].filter((id): id is string => !!id);
       if (ids) {
-        if (options.allowedSourceIds && ids.some(id => !options.allowedSourceIds!.has(id))) {
+        // v1.23.2-fix: 先解析（支持模型给的短 ID/前缀），再拿规范 ID 查允许名单。
+        // 旧实现先用完整 ID 校验，模型把 UUID 缩成 8 位时整批被判“超出输入”。
+        // 同时放行 is_active=0 的 conversation_log：日常反思的输入本来就是未激活的对话行，
+        // merge/relate 作用其上不应直接失败（否则批次永不推进、重复提取）。
+        const resolved = ids.map(id => resolveReflectTarget(id, project, true));
+        if (resolved.some(target => !target)) throw new Error('target missing or ambiguous');
+        if (options.allowedSourceIds && resolved.some(target => !options.allowedSourceIds!.has(target!.id))) {
           throw new Error('target is outside the current reflection input');
         }
-        const resolved = ids.map(id => resolveReflectTarget(id, project, action.action === 'extract'));
-        if (resolved.some(target => !target)) throw new Error('target missing, inactive or ambiguous');
         if (action.action === 'merge') {
           action.sourceIds = resolved.map(target => target!.id);
           if (new Set(action.sourceIds).size !== action.sourceIds.length) throw new Error('duplicate merge sources');
@@ -343,7 +347,8 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           for (const id of action.sourceIds!) {
             const sdb = memDbFor(id, project, db);
             // v1.23: critical 不参与合并（否则核心记忆会被"沉淀"掉）
-            const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical'").get(id) as any;
+            // v1.23.2: conversation_log 源天然是 is_active=0，merge 也必须能合并它们
+            const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND (is_active = 1 OR (is_active = 0 AND source = 'conversation_log')) AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical'").get(id) as any;
             if (!src) { mergeInvalid = `source not found or locked: ${id}`; break; }
             mergeSources.push({ db: sdb, id: src.id });
           }
@@ -582,24 +587,32 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           }
 
           // hardFacts 直接进 facts 表（带证据与时间有效性）。这一步替代"把事实写进散文"。
-          if (Array.isArray(action.hardFacts) && action.hardFacts.length) {
+          if (Array.isArray(action.hardFacts) && action.hardFacts.length && String(process.env.REFLECT_FACT_EXTRACTION || '').toLowerCase() !== 'off') {
             try {
               const { saveFacts } = await import('./store.js');
+              const iso = (v: any) => {
+                if (typeof v !== 'string' || !v.trim()) return undefined;
+                const t = Date.parse(v);
+                return Number.isFinite(t) ? new Date(t).toISOString() : undefined;
+              };
+              const str = (v: any) => (typeof v === 'string' && v.trim() ? v.trim() : '');
               // facts 表与 general 库同一 sqlite；extract 若落到 project/user 等分类库，
               // source_memory_id 跨库会触发 FOREIGN KEY（与 Anima 同一坑）。跨库时不挂来源。
               const factOwnerMemType = findDbByMemoryId(extracted.id, project)?.memType;
               const factSourceId = factOwnerMemType === 'general' ? extracted.id : null;
               const facts = action.hardFacts
-                .filter((f: any) => f && typeof f === 'object' && f.subject && f.predicate && f.object)
+                .filter((f: any) => f && typeof f === 'object' && str(f.subject) && str(f.predicate) && str(f.object))
                 .slice(0, 15)
                 .map((f: any) => ({
-                  subject: String(f.subject).trim(),
-                  predicate: String(f.predicate).trim(),
-                  object: String(f.object).trim(),
+                  subject: str(f.subject),
+                  predicate: str(f.predicate),
+                  object: str(f.object),
                   confidence: Number.isFinite(Number(f.confidence)) ? Math.min(1, Math.max(0, Number(f.confidence))) : 0.7,
-                  evidence: typeof f.evidence === 'string' ? f.evidence : undefined,
-                  validFrom: typeof f.validFrom === 'string' ? f.validFrom : undefined,
-                  validTo: typeof f.validTo === 'string' ? f.validTo : undefined,
+                  // 证据必须是原文子串（同 quotes），否则丢弃——防止模型编造出处
+                  evidence: typeof f.evidence === 'string' && f.evidence.trim() && (!sourceText || sourceText.includes(f.evidence.trim()))
+                    ? f.evidence.trim() : undefined,
+                  validFrom: iso(f.validFrom),
+                  validTo: iso(f.validTo),
                 }));
               if (facts.length) await saveFacts(facts, factSourceId, characterId, project);
             } catch (e: any) {

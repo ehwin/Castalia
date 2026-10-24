@@ -167,7 +167,10 @@ export async function callLlm(systemPrompt: string, userPrompt: string, channel?
   const attempts = Math.max(1, Number(process.env.REFLECT_LLM_RETRIES || 3));
   for (let i = 1; i <= attempts; i++) {
     const startedAt = Date.now();
+    const timeoutMs = Math.max(10_000, Number(process.env.REFLECT_LLM_TIMEOUT_MS || 180_000) || 180_000);
     try {
+      // v1.23.2-fix: 无超时的 fetch 遇到半开连接会永远挂起（退避/游标都走不到），
+      // 超时按可重试错误走 attempts。
       const resp = await fetch(`${ch.url}/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${ch.apiKey}` },
@@ -180,6 +183,7 @@ export async function callLlm(systemPrompt: string, userPrompt: string, channel?
           max_tokens: maxTokens,
           stream: false,
         }),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       if (!resp.ok) throw new Error(`LLM ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
       const data = await resp.json() as any;
