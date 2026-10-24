@@ -4,7 +4,7 @@
  * v5.0: skipEmbed 参数 — digest 暂不向量化，reflect 后统一 embed
  * v4.0: 去重不再丢弃，SQLite 持久化 embedding 缓存
  */
-import { DatabaseManager, generateId } from './db.js';
+import { DatabaseManager, generateId, listMemTypeDirs } from './db.js';
 import { embed, getEmbeddingCached } from './ollama.js';
 import { CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
 import { isMemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
@@ -39,6 +39,20 @@ export async function saveMemory(params) {
     // v1.8: 4 种封闭类型(memType≠general)且 text 非 Markdown 时,自动规范化包装(加标题行+转列表)
     const text = normalizeMarkdown(params.text, memType);
     // ═══ 精确去重：完全相同的文本不重复存(仅限同项目) ═══
+    const recordOf = (row) => ({
+        id: row.id, text: row.text, project: row.project,
+        sessionId: row.session_id, type: row.type, memType: row.mem_type,
+        category: row.category, subcategory: row.subcategory,
+        tags: JSON.parse(row.tags || '[]'), importance: row.importance,
+        characterId: row.character_id, source: row.source, subject: row.subject,
+        tier: row.tier, expiresAt: row.expires_at, isActive: !!row.is_active,
+        createdAt: row.created_at, updatedAt: row.updated_at,
+        lastAccessedAt: row.last_accessed_at, accessedCount: row.accessed_count,
+        metadata: row.metadata, title: row.title, status: row.status,
+        scoreConfidence: row.score_confidence, scoreImpact: row.score_impact,
+        scorePriority: row.score_priority, scoreUrgency: row.score_urgency,
+        identityLocked: !!row.identity_locked,
+    });
     const exactDup = db.prepare(`
     SELECT * FROM memory
     WHERE is_active = 1 AND project = ? AND ${preserve ? 'TRIM(text) = TRIM(?)' : 'LOWER(TRIM(text)) = LOWER(TRIM(?))'}
@@ -46,20 +60,24 @@ export async function saveMemory(params) {
   `).get(project, text?.trim() || '');
     if (exactDup) {
         db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(exactDup.id);
-        return {
-            id: exactDup.id, text: exactDup.text, project: exactDup.project,
-            sessionId: exactDup.session_id, type: exactDup.type, memType: exactDup.mem_type,
-            category: exactDup.category, subcategory: exactDup.subcategory,
-            tags: JSON.parse(exactDup.tags || '[]'), importance: exactDup.importance,
-            characterId: exactDup.character_id, source: exactDup.source, subject: exactDup.subject,
-            tier: exactDup.tier, expiresAt: exactDup.expires_at, isActive: !!exactDup.is_active,
-            createdAt: exactDup.created_at, updatedAt: exactDup.updated_at,
-            lastAccessedAt: exactDup.last_accessed_at, accessedCount: exactDup.accessed_count,
-            metadata: exactDup.metadata, title: exactDup.title, status: exactDup.status,
-            scoreConfidence: exactDup.score_confidence, scoreImpact: exactDup.score_impact,
-            scorePriority: exactDup.score_priority, scoreUrgency: exactDup.score_urgency,
-            identityLocked: !!exactDup.identity_locked,
-        };
+        return recordOf(exactDup);
+    }
+    // ═══ v1.23.2: 反思提取的归一化去重 ═══
+    // 同一段摘要常被反复提取，只差空白/大小写；exact 比较漏掉后，星图上就出现
+    // "同一段文字两个点"。这里按 大小写+空白归一化 在项目的所有 memType 库里找，
+    // 命中就只加引用计数（跨 memType 也不再复制一份）。
+    if (params.source === 'reflect_extract') {
+        const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const targetNorm = norm(text);
+        for (const mt of listMemTypeDirs(project)) {
+            const d = DatabaseManager.getInstance(project, mt);
+            const rows = d.prepare('SELECT * FROM memory WHERE is_active = 1 AND project = ?').all(project);
+            const hit = rows.find((r) => norm(r.text) === targetNorm);
+            if (hit) {
+                d.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(hit.id);
+                return recordOf(hit);
+            }
+        }
     }
     // ═══ 向量去重：仅当不跳过 embed 且嵌入可用时执行(仅限同项目) ═══
     let vector = null;
