@@ -115,14 +115,18 @@ function computeScore(similarity: number, row: any): number {
 export async function searchMemory(options: SearchOptions): Promise<SearchResult[]> {
   const proj = normalizeProject(options.project);
   const topK = options.topK ?? 10;
-  // memdir:memType 指定 → 单分类库;未指定 → 聚合项目全部分类库
+  // memdir:memType 指定 → 单分类库;未指定 → 聚合项目**已存在**的分类库
+  // v1.23.2-fix: 读路径不能懒建库（拼错 project 会在磁盘造 5 个空库）
+  const existing = DatabaseManager.existingMemTypes(proj);
   const mtFilter = options.memType ? normalizeMemType(options.memType) : null;
-  const dirs = mtFilter ? [mtFilter] : listMemTypeDirs(proj);
+  const dirs = mtFilter ? existing.filter(mt => mt === mtFilter) : existing;
   const all: SearchResult[] = [];
+  const perDb: { db: Database.Database; results: SearchResult[] }[] = [];
   for (const mt of dirs) {
     try {
       const db = DatabaseManager.getInstance(proj, mt);
       const r = await searchInDb(db, { ...options, project: proj });
+      perDb.push({ db, results: r });
       all.push(...r);
     } catch { /* 单分类库失败不影响其他 */ }
   }
@@ -132,6 +136,12 @@ export async function searchMemory(options: SearchOptions): Promise<SearchResult
   for (const r of all) {
     if (!seen.has(r.id)) { seen.add(r.id); unique.push(r); }
     if (unique.length >= topK) break;
+  }
+  // v1.23.2-fix: 只在全局 topK 选定后记账（旧实现每个库各自记 5×topK 条）
+  const chosen = new Set(unique.map(r => r.id));
+  for (const p of perDb) {
+    const rows = p.results.filter(r => chosen.has(r.id));
+    if (rows.length) updateAccessed(p.db, rows);
   }
   return unique.slice(0, topK);
 }
@@ -145,9 +155,8 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
   // ═══ Phase 1: 标签搜索(0 次向量调用) ═══
   const tagResults = tagSearch(db, options);
 
-  // 标签结果足够好 → 直接返回
+  // 标签结果足够好 → 直接返回（访问记账统一在 searchMemory 里做）
   if (tagResults.length >= topK && tagResults[0].score >= 0.5) {
-    updateAccessed(db, tagResults.slice(0, topK));
     return tagResults.slice(0, topK);
   }
 
@@ -180,7 +189,6 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
     if (unique.length >= topK) break;
   }
 
-  updateAccessed(db, unique.slice(0, topK));
   return unique.slice(0, topK);
 }
 
@@ -427,8 +435,9 @@ function updateAccessed(db: any, results: SearchResult[]) {
  */
 export function getRecentMemories(characterId: string, limit: number = 5, hoursBack: number = 24, project?: string, memType?: MemType): SearchResult[] {
   const proj = normalizeProject(project);
-  // memdir:memType 指定 → 单分类库;未指定 → 聚合项目全部分类库
-  const dirs = memType ? [normalizeMemType(memType)] : listMemTypeDirs(proj);
+  // memdir:memType 指定 → 单分类库;未指定 → 已存在的分类库（读路径不建库）
+  const existing = DatabaseManager.existingMemTypes(proj);
+  const dirs = memType ? existing.filter(mt => mt === normalizeMemType(memType)) : existing;
   const all: SearchResult[] = [];
   const since = new Date(Date.now() - hoursBack * 3600000).toISOString();
   for (const mt of dirs) {
@@ -492,6 +501,8 @@ export async function searchFacts(
     minConfidence?: number;
   } = {},
 ): Promise<FactSearchResult[]> {
+  // v1.23.2-fix: facts 只在 general 库；库不存在时返回空，而不是懒建一个空库
+  if (!DatabaseManager.existingMemTypes(normalizeProject(options.project)).includes('general')) return [];
   const db = DatabaseManager.getInstance(options.project);
   const topK = options.topK ?? 10;
   const minConfidence = options.minConfidence ?? 0.3;

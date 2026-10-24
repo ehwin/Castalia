@@ -4,7 +4,7 @@
  * v5.0: skipEmbed 参数 — digest 暂不向量化，reflect 后统一 embed
  * v4.0: 去重不再丢弃，SQLite 持久化 embedding 缓存
  */
-import { DatabaseManager, generateId, listMemTypeDirs } from './db.js';
+import { DatabaseManager, generateId } from './db.js';
 import { embed, getEmbeddingCached } from './ollama.js';
 import { CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
 import { isMemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
@@ -144,7 +144,7 @@ export async function saveMemory(params) {
 /** 按 id 定位记忆所在分类库(memdir 遍历),返回库连接+分类;找不到返回 null */
 export function findDbByMemoryId(id, project) {
     const proj = normalizeProject(project);
-    const dirs = listMemTypeDirs(proj);
+    const dirs = DatabaseManager.existingMemTypes(proj);
     /* v1.21:先找**活跃**行。跨 memType 搬家会在源库留 is_active=0 墓碑;旧实现按目录顺序取第一个命中,
      * 会命中墓碑 → update/forget/restore 打在死行上、真活跃副本留在原地(实测出现"同一 id 两个库同时活跃")。*/
     for (const mt of dirs) {
@@ -192,15 +192,29 @@ export async function updateMemory(id, updates) {
         const text = updates.text !== undefined ? normalizeMarkdown(updates.text, newMt) : existing.text;
         const tags = updates.tags !== undefined ? JSON.stringify(updates.tags) : (existing.tags ?? '[]');
         const now = new Date().toISOString();
-        newDb.prepare(`
-      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, metadata, title, status, score_confidence, score_impact, score_priority, score_urgency, identity_locked)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, text, proj, existing.session_id, updates.type !== undefined ? updates.type : existing.type, newMt, updates.category !== undefined ? updates.category : existing.category, updates.subcategory !== undefined ? updates.subcategory : existing.subcategory, tags, updates.importance !== undefined ? updates.importance : existing.importance, updates.characterId !== undefined ? updates.characterId : existing.character_id, updates.source !== undefined ? updates.source : existing.source, updates.subject !== undefined ? updates.subject : existing.subject, updates.tier !== undefined ? updates.tier : existing.tier, existing.expires_at ?? null, existing.created_at, now, now, existing.accessed_count, existing.reference_count ?? 0, existing.locked ?? 0, updates.metadata !== undefined ? updates.metadata : (existing.metadata ?? null), updates.title !== undefined ? updates.title : (existing.title ?? null), updates.status !== undefined ? updates.status : (existing.status ?? null), updates.scoreConfidence !== undefined ? updates.scoreConfidence : (existing.score_confidence ?? null), updates.scoreImpact !== undefined ? updates.scoreImpact : (existing.score_impact ?? null), updates.scorePriority !== undefined ? updates.scorePriority : (existing.score_priority ?? null), updates.scoreUrgency !== undefined ? updates.scoreUrgency : (existing.score_urgency ?? null), updates.identityLocked !== undefined ? (updates.identityLocked ? 1 : 0) : (existing.identity_locked ?? 0));
-        // 向量一并搬移(若有)
+        // v1.23.2-fix: 搬家保留 parent_id/base_importance；先清目标库同 id 的旧向量，
+        // 否则 INSERT OR REPLACE 换 rowid 后旧向量成为孤儿（KNN 白占名额，rowid 复用还会算错记忆）。
+        const srcVec = (() => {
+            try {
+                return db.prepare('SELECT embedding FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id = ?)').get(id);
+            }
+            catch {
+                return null;
+            }
+        })();
         try {
-            const srcVec = db.prepare('SELECT embedding FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id = ?)').get(id);
+            const oldTarget = newDb.prepare('SELECT rowid FROM memory WHERE id = ?').get(id);
+            if (oldTarget)
+                newDb.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(oldTarget.rowid);
+        }
+        catch { /* 目标库无 vec 表时忽略 */ }
+        newDb.prepare(`
+      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, metadata, title, status, score_confidence, score_impact, score_priority, score_urgency, identity_locked, parent_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, text, proj, existing.session_id, updates.type !== undefined ? updates.type : existing.type, newMt, updates.category !== undefined ? updates.category : existing.category, updates.subcategory !== undefined ? updates.subcategory : existing.subcategory, tags, updates.importance !== undefined ? updates.importance : existing.importance, updates.importance !== undefined ? updates.importance : (existing.base_importance ?? existing.importance), updates.characterId !== undefined ? updates.characterId : existing.character_id, updates.source !== undefined ? updates.source : existing.source, updates.subject !== undefined ? updates.subject : existing.subject, updates.tier !== undefined ? updates.tier : existing.tier, existing.expires_at ?? null, existing.created_at, now, now, existing.accessed_count, existing.reference_count ?? 0, existing.locked ?? 0, updates.metadata !== undefined ? updates.metadata : (existing.metadata ?? null), updates.title !== undefined ? updates.title : (existing.title ?? null), updates.status !== undefined ? updates.status : (existing.status ?? null), updates.scoreConfidence !== undefined ? updates.scoreConfidence : (existing.score_confidence ?? null), updates.scoreImpact !== undefined ? updates.scoreImpact : (existing.score_impact ?? null), updates.scorePriority !== undefined ? updates.scorePriority : (existing.score_priority ?? null), updates.scoreUrgency !== undefined ? updates.scoreUrgency : (existing.score_urgency ?? null), updates.identityLocked !== undefined ? (updates.identityLocked ? 1 : 0) : (existing.identity_locked ?? 0), existing.parent_id ?? null);
+        // 向量一并搬移(若有)：写在目标行的新 rowid 上
+        try {
             if (srcVec) {
-                newDb.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id = ?)').run(id);
                 const rowInfo = newDb.prepare('SELECT rowid FROM memory WHERE id = ?').get(id);
                 newDb.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(rowInfo.rowid), srcVec.embedding);
             }
@@ -335,7 +349,7 @@ export function markColdMemories(project) {
     const proj = normalizeProject(project);
     const cutoff = new Date(Date.now() - COLD_AFTER_DAYS * 86400000).toISOString();
     let marked = 0;
-    for (const mt of listMemTypeDirs(proj)) {
+    for (const mt of DatabaseManager.existingMemTypes(proj)) {
         try {
             const db = DatabaseManager.getInstance(proj, mt);
             const r = db.prepare(`
@@ -363,7 +377,7 @@ export function promoteByAccess(project) {
     const now = new Date().toISOString();
     let total = 0;
     // memdir:遍历项目全部分类库(临时记忆可能落在任意 memType 分类库)
-    for (const mt of listMemTypeDirs(proj)) {
+    for (const mt of DatabaseManager.existingMemTypes(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
         const r = db.prepare(`
       UPDATE memory SET tier = 'standard', updated_at = ?
@@ -382,7 +396,7 @@ export function cleanupExpiredMemories(project) {
     promoteByAccess(project);
     let total = 0;
     // memdir:遍历项目全部分类库清理过期 temporary(避免只清 general 漏掉 user/feedback/project/reference)
-    for (const mt of listMemTypeDirs(proj)) {
+    for (const mt of DatabaseManager.existingMemTypes(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
         const result = db.prepare(`
       UPDATE memory SET is_active = 0, updated_at = ?
@@ -429,13 +443,14 @@ export async function batchEmbedPending(characterId = 'airi', project) {
     let embeddedFacts = 0;
     const errors = [];
     // memdir:遍历项目全部分类库补嵌入
-    for (const mt of listMemTypeDirs(proj)) {
+    for (const mt of DatabaseManager.existingMemTypes(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
         // 找所有有记忆但无向量的记录(source 为 NULL 也算,修复 NULL != 'x' 恒假的坑)
         // characterId='any' 时不按角色过滤(跨库产物如 reflect 库 character_id 为 NULL 也能补嵌入)
         const conditions = [
             'm.is_active = 1',
             'm.rowid NOT IN (SELECT rowid FROM vec_memory)',
+            'COALESCE(m.embed_fail_count, 0) < 3',
         ];
         const params = [];
         if (characterId !== 'any') {
@@ -450,16 +465,22 @@ export async function batchEmbedPending(characterId = 'airi', project) {
         const pending = db.prepare(`
     SELECT m.id, m.text, m.rowid FROM memory m
     WHERE ${conditions.join(' AND ')}
-    ORDER BY m.created_at ASC
+    ORDER BY COALESCE(m.embed_fail_count, 0) ASC, m.created_at ASC
     LIMIT 200
   `).all(...params);
         for (const row of pending) {
             try {
                 const vec = new Float32Array(await embed(row.text, project));
                 db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(row.rowid), vec);
+                db.prepare('UPDATE memory SET embed_fail_count = 0 WHERE rowid = ?').run(row.rowid);
                 embedded++;
             }
             catch (e) {
+                // 失败重试 3 次后跳过，避免坏记录永久堵住窗口
+                try {
+                    db.prepare('UPDATE memory SET embed_fail_count = COALESCE(embed_fail_count, 0) + 1 WHERE rowid = ?').run(row.rowid);
+                }
+                catch { /* 旧库无列 */ }
                 errors.push(`${row.id}: ${e.message}`);
             }
         }
@@ -770,11 +791,35 @@ export function promoteToProject(project, items, characterId) {
 export function deleteSessionFragments(project, sessionId) {
     const db = DatabaseManager.getInstance(project);
     const proj = normalizeProject(project);
-    const r = db.prepare(`
-    DELETE FROM memory
-    WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1
-  `).run(proj, sessionId);
-    return r.changes;
+    // v1.23.2-fix: 与 sweep 一致，硬删前清掉向量与边
+    try {
+        const rows = db.prepare(`
+      SELECT rowid, id FROM memory
+      WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1
+    `).all(proj, sessionId);
+        const tx = db.transaction(() => {
+            const delVec = db.prepare('DELETE FROM vec_memory WHERE rowid = ?');
+            const delEdge = db.prepare('DELETE FROM edges WHERE source_id = ? OR target_id = ?');
+            for (const row of rows) {
+                try {
+                    delVec.run(row.rowid);
+                }
+                catch { /* 无 vec 表 */ }
+                try {
+                    delEdge.run(row.id, row.id);
+                }
+                catch { /* 无 edges 表 */ }
+            }
+            return db.prepare(`
+        DELETE FROM memory
+        WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1
+      `).run(proj, sessionId).changes;
+        });
+        return tx();
+    }
+    catch {
+        return 0;
+    }
 }
 export async function applyIdentityActions(actions, project) {
     const rejected = [];

@@ -655,7 +655,7 @@ register(
       const byCategory: Record<string, number> = {};
       const bySource: Record<string, number> = {};
       const byMemType: Record<string, number> = {};
-      for (const mt of listMemTypeDirs(proj)) {
+      for (const mt of DatabaseManager.existingMemTypes(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
         total += (db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj) as any).c;
         for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY category').all(proj) as any[]) {
@@ -735,7 +735,7 @@ register(
       const proj = normalizeProject(args.project);
       let db: any = null;
       let row: any = null;
-      for (const mt of listMemTypeDirs(proj)) {
+      for (const mt of DatabaseManager.existingMemTypes(proj)) {
         const d = DatabaseManager.getInstance(proj, mt);
         const r = d.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(args.id) as any;
         if (r) { db = d; row = r; break; }
@@ -1063,7 +1063,7 @@ register(
           // memdir:聚合项目全部分类库统计
           let mem = 0;
           let facts = 0;
-          for (const mt of listMemTypeDirs(name)) {
+          for (const mt of DatabaseManager.existingMemTypes(name)) {
             const db = DatabaseManager.getInstance(name, mt);
             mem += (db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1').get() as any).c;
             try { facts += (db.prepare('SELECT COUNT(*) as c FROM facts WHERE is_active=1').get() as any).c; } catch {}

@@ -13,7 +13,7 @@
  *   POST /memory/reflect/apply   — 应用大模型的重构指令
  */
 import { loadPromptOverride } from './promptFile.js';
-import { DatabaseManager, listMemTypeDirs, currentMemDir } from './db.js';
+import { DatabaseManager, currentMemDir } from './db.js';
 import { saveFacts, saveMemory, batchEmbedPending, updateMemory, applyIdentityActions, findDbByMemoryId } from './store.js';
 import { normalizeProject } from './env.js';
 import { isMemType, MEM_TYPES } from './memType.js';
@@ -27,8 +27,8 @@ export { getUnanalyzedConversations, markConversationsReflected, deepReflectionC
  */
 export function listAllMemories(characterId = 'airi', limit = 200, project) {
     const proj = normalizeProject(project);
-    // memdir:聚合项目全部分类库
-    const dirs = listMemTypeDirs(proj);
+    // memdir:聚合项目**已存在**的分类库（读路径不懒建库）
+    const dirs = DatabaseManager.existingMemTypes(proj);
     const all = [];
     for (const mt of dirs) {
         try {
@@ -114,7 +114,7 @@ function resolveReflectTarget(idPrefix, project, allowInactiveConversation = fal
     if (!idPrefix || typeof idPrefix !== 'string')
         return null;
     const matches = [];
-    for (const mt of listMemTypeDirs(normalizeProject(project))) {
+    for (const mt of DatabaseManager.existingMemTypes(normalizeProject(project))) {
         const db = DatabaseManager.getInstance(project, mt);
         const rows = db.prepare(`SELECT id FROM memory WHERE project = ? AND (is_active = 1${allowInactiveConversation ? " OR (is_active = 0 AND source = 'conversation_log')" : ''}) AND substr(id, 1, length(?)) = ?`)
             .all(normalizeProject(project), idPrefix, idPrefix);

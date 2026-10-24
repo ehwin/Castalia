@@ -7,7 +7,7 @@
  *
  * 权重全部可经环境变量调整，适用于通用 agent 记忆场景。
  */
-import { DatabaseManager, listProjectNames, listMemTypeDirs } from './db.js';
+import { DatabaseManager, listProjectNames } from './db.js';
 import { embed } from './ollama.js';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { normalizeMemType } from './memType.js';
@@ -67,14 +67,18 @@ function computeScore(similarity, row) {
 export async function searchMemory(options) {
     const proj = normalizeProject(options.project);
     const topK = options.topK ?? 10;
-    // memdir:memType 指定 → 单分类库;未指定 → 聚合项目全部分类库
+    // memdir:memType 指定 → 单分类库;未指定 → 聚合项目**已存在**的分类库
+    // v1.23.2-fix: 读路径不能懒建库（拼错 project 会在磁盘造 5 个空库）
+    const existing = DatabaseManager.existingMemTypes(proj);
     const mtFilter = options.memType ? normalizeMemType(options.memType) : null;
-    const dirs = mtFilter ? [mtFilter] : listMemTypeDirs(proj);
+    const dirs = mtFilter ? existing.filter(mt => mt === mtFilter) : existing;
     const all = [];
+    const perDb = [];
     for (const mt of dirs) {
         try {
             const db = DatabaseManager.getInstance(proj, mt);
             const r = await searchInDb(db, { ...options, project: proj });
+            perDb.push({ db, results: r });
             all.push(...r);
         }
         catch { /* 单分类库失败不影响其他 */ }
@@ -90,6 +94,13 @@ export async function searchMemory(options) {
         if (unique.length >= topK)
             break;
     }
+    // v1.23.2-fix: 只在全局 topK 选定后记账（旧实现每个库各自记 5×topK 条）
+    const chosen = new Set(unique.map(r => r.id));
+    for (const p of perDb) {
+        const rows = p.results.filter(r => chosen.has(r.id));
+        if (rows.length)
+            updateAccessed(p.db, rows);
+    }
     return unique.slice(0, topK);
 }
 /** 单库搜索主体(标签 → 向量 KNN → 文本回退),按分类库调用 */
@@ -99,9 +110,8 @@ async function searchInDb(db, options) {
     const minScore = options.minScore ?? profile?.minScore ?? 0;
     // ═══ Phase 1: 标签搜索(0 次向量调用) ═══
     const tagResults = tagSearch(db, options);
-    // 标签结果足够好 → 直接返回
+    // 标签结果足够好 → 直接返回（访问记账统一在 searchMemory 里做）
     if (tagResults.length >= topK && tagResults[0].score >= 0.5) {
-        updateAccessed(db, tagResults.slice(0, topK));
         return tagResults.slice(0, topK);
     }
     // ═══ Phase 2: 标签不够 → 向量 KNN 补充(EMBED_MODE=none 时跳过,纯文本回退) ═══
@@ -135,7 +145,6 @@ async function searchInDb(db, options) {
         if (unique.length >= topK)
             break;
     }
-    updateAccessed(db, unique.slice(0, topK));
     return unique.slice(0, topK);
 }
 /**
@@ -399,8 +408,9 @@ function updateAccessed(db, results) {
  */
 export function getRecentMemories(characterId, limit = 5, hoursBack = 24, project, memType) {
     const proj = normalizeProject(project);
-    // memdir:memType 指定 → 单分类库;未指定 → 聚合项目全部分类库
-    const dirs = memType ? [normalizeMemType(memType)] : listMemTypeDirs(proj);
+    // memdir:memType 指定 → 单分类库;未指定 → 已存在的分类库（读路径不建库）
+    const existing = DatabaseManager.existingMemTypes(proj);
+    const dirs = memType ? existing.filter(mt => mt === normalizeMemType(memType)) : existing;
     const all = [];
     const since = new Date(Date.now() - hoursBack * 3600000).toISOString();
     for (const mt of dirs) {
@@ -443,6 +453,9 @@ export function getRecentMemories(characterId, limit = 5, hoursBack = 24, projec
  * 将查询文本做 embedding，在 vec_facts 中 KNN 搜索。
  */
 export async function searchFacts(query, options = {}) {
+    // v1.23.2-fix: facts 只在 general 库；库不存在时返回空，而不是懒建一个空库
+    if (!DatabaseManager.existingMemTypes(normalizeProject(options.project)).includes('general'))
+        return [];
     const db = DatabaseManager.getInstance(options.project);
     const topK = options.topK ?? 10;
     const minConfidence = options.minConfidence ?? 0.3;

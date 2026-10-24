@@ -15,7 +15,7 @@ import { z } from 'zod';
 import { searchMemory, searchFacts, getRecentMemories, searchMemoryAcross } from './search.js';
 import { saveMemory, forgetMemory, updateMemory, saveConversationTurn, cleanupExpiredMemories, batchEmbedPending, markColdMemories } from './store.js';
 import { consolidate } from './consolidate.js';
-import { DatabaseManager, listProjectNames, listMemTypeDirs, safeFilePart, sweepExpiredSessionMemories } from './db.js';
+import { DatabaseManager, listProjectNames, safeFilePart, sweepExpiredSessionMemories } from './db.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
 import { flushAllBuffers } from './buffer.js';
 import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnanalyzedConversations } from './reflect.js';
@@ -602,7 +602,7 @@ register('stats_get', 'admin', 'Get memory system statistics: total count, by ca
         const byCategory = {};
         const bySource = {};
         const byMemType = {};
-        for (const mt of listMemTypeDirs(proj)) {
+        for (const mt of DatabaseManager.existingMemTypes(proj)) {
             const db = DatabaseManager.getInstance(proj, mt);
             total += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj).c;
             for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY category').all(proj)) {
@@ -677,7 +677,7 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
         const proj = normalizeProject(args.project);
         let db = null;
         let row = null;
-        for (const mt of listMemTypeDirs(proj)) {
+        for (const mt of DatabaseManager.existingMemTypes(proj)) {
             const d = DatabaseManager.getInstance(proj, mt);
             const r = d.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(args.id);
             if (r) {
@@ -976,7 +976,7 @@ register('project_list', 'admin', 'List all project namespaces and their memory/
                 // memdir:聚合项目全部分类库统计
                 let mem = 0;
                 let facts = 0;
-                for (const mt of listMemTypeDirs(name)) {
+                for (const mt of DatabaseManager.existingMemTypes(name)) {
                     const db = DatabaseManager.getInstance(name, mt);
                     mem += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1').get().c;
                     try {

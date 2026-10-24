@@ -39,7 +39,7 @@ export class SessionMemoryBuffer {
   public pendingCount = 0;
   public pendingTokens = 0;
   public isExtracting = false;
-
+  private pendingFlush = false;
   private history: BufferMessage[] = [];
 
   constructor(project: string, sessionId: string, characterId: string = CHAR_ID, threshold: number = DEFAULT_BUFFER_SIZE, tokenThreshold: number = DEFAULT_BUFFER_TOKENS) {
@@ -52,6 +52,11 @@ export class SessionMemoryBuffer {
 
   onNewMessage(messages: BufferMessage[]): void {
     if (Array.isArray(messages)) this.history.push(...messages);
+    // v1.23.2-fix: 提取持续失败时 history 会无界增长；保留最近 400 条（可 env 调整）
+    const maxHistory = Math.max(50, parseInt(process.env.BUFFER_MAX_HISTORY || '400', 10) || 400);
+    if (this.history.length > maxHistory) {
+      this.history = this.history.slice(-maxHistory);
+    }
     this.pendingCount++;
     // Token 增量估算(照搬原厂 字符数/4):累计本轮所有新消息(不止最后一条,否则超长 user 消息漏计)
     if (Array.isArray(messages)) {
@@ -78,7 +83,8 @@ export class SessionMemoryBuffer {
   }
 
   flush(messages: BufferMessage[]): void {
-    if (this.isExtracting) return; // 互斥锁:后台已有提取任务,本次放弃(下轮再触发)
+    // v1.23.2-fix: 提取进行中不再静默丢弃 flush；记下来，等当前提取结束后立刻补跑
+    if (this.isExtracting) { this.pendingFlush = true; return; }
     this.pendingCount = 0;
     this.pendingTokens = 0;
     this.isExtracting = true;
@@ -94,13 +100,17 @@ export class SessionMemoryBuffer {
         console.error('[buffer] incremental reflection error:', e.message);
       } finally {
         this.isExtracting = false;
-        if (!succeeded) {
+        if (!succeeded && recent.length > 0) {
           this.history.unshift(...recent);
           this.pendingCount += 1;
           this.pendingTokens += recent.reduce((n, m) => n + Math.ceil((m.content || '').length / 4), 0);
         } else if (this.history.length > 0) {
           // Messages received while extraction was in flight must not wait for another message.
           this.flush([]);
+        }
+        if (this.pendingFlush) {
+          this.pendingFlush = false;
+          if (this.history.length > 0) this.flush([]);
         }
       }
     });

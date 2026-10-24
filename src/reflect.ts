@@ -107,8 +107,8 @@ export interface ReflectApplyOptions {
  */
 export function listAllMemories(characterId: string = 'airi', limit: number = 200, project?: string): ReflectMemory[] {
   const proj = normalizeProject(project);
-  // memdir:聚合项目全部分类库
-  const dirs = listMemTypeDirs(proj);
+  // memdir:聚合项目**已存在**的分类库（读路径不懒建库）
+  const dirs = DatabaseManager.existingMemTypes(proj);
   const all: any[] = [];
   for (const mt of dirs) {
     try {
@@ -190,7 +190,7 @@ function safeTags(raw: any): string[] | null {
 function resolveReflectTarget(idPrefix: string, project?: string, allowInactiveConversation = false): { db: any; id: string } | null {
   if (!idPrefix || typeof idPrefix !== 'string') return null;
   const matches: { db: any; id: string }[] = [];
-  for (const mt of listMemTypeDirs(normalizeProject(project))) {
+  for (const mt of DatabaseManager.existingMemTypes(normalizeProject(project))) {
     const db = DatabaseManager.getInstance(project, mt);
     const rows = db.prepare(`SELECT id FROM memory WHERE project = ? AND (is_active = 1${allowInactiveConversation ? " OR (is_active = 0 AND source = 'conversation_log')" : ''}) AND substr(id, 1, length(?)) = ?`)
       .all(normalizeProject(project), idPrefix, idPrefix) as { id: string }[];

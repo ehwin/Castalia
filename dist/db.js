@@ -410,6 +410,11 @@ export function initProjectSchema(db) {
         db.exec(`ALTER TABLE memory ADD COLUMN base_importance REAL`);
     }
     catch (_e) { /* already exists */ }
+    // v1.23.2: 向量化失败计数，避免连续失败的头部记录永久占满 batchEmbedPending 的 200 条窗口
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN embed_fail_count INTEGER DEFAULT 0`);
+    }
+    catch (_e) { /* already exists */ }
     try {
         db.exec(`UPDATE memory SET base_importance = importance WHERE base_importance IS NULL`);
     }
@@ -617,12 +622,38 @@ export function sweepExpiredSessionMemories(project) {
     // memdir:会话滚动记忆也可能落在任意 memType 分类库,逐库清扫
     for (const mt of listMemTypeDirs(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
-        const r = db.prepare(`
-      DELETE FROM memory
-      WHERE source = 'session_memory' AND session_id IS NOT NULL AND is_active = 1
-        AND updated_at < ?
-    `).run(cutoff);
-        total += r.changes;
+        // v1.23.2-fix: 硬删必须同时清 vec_memory / edges，否则孤儿向量会被 KNN 命中，
+        // rowid 复用时还会撞 vec0 主键让下一次 saveMemory 整笔回滚。
+        try {
+            const rows = db.prepare(`
+        SELECT rowid, id FROM memory
+        WHERE source = 'session_memory' AND session_id IS NOT NULL AND is_active = 1
+          AND updated_at < ?
+      `).all(cutoff);
+            if (rows.length) {
+                const tx = db.transaction(() => {
+                    const delVec = db.prepare('DELETE FROM vec_memory WHERE rowid = ?');
+                    const delEdge = db.prepare('DELETE FROM edges WHERE source_id = ? OR target_id = ?');
+                    for (const row of rows) {
+                        try {
+                            delVec.run(row.rowid);
+                        }
+                        catch { /* 无 vec 表 */ }
+                        try {
+                            delEdge.run(row.id, row.id);
+                        }
+                        catch { /* 无 edges 表 */ }
+                    }
+                    return db.prepare(`
+            DELETE FROM memory
+            WHERE source = 'session_memory' AND session_id IS NOT NULL AND is_active = 1
+              AND updated_at < ?
+          `).run(cutoff).changes;
+                });
+                total += tx();
+            }
+        }
+        catch { /* 单库失败不影响其它库 */ }
     }
     return total;
 }
