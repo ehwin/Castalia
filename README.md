@@ -8,7 +8,7 @@ Designed after studying Claude Code's memory architecture (closed memory types, 
 
 > **Lite edition (this repo):** single-instance memory — no federation / cross-library reflection. If you need the full edition (cross-library `reflect_all` + federation search over `FEDERATION_DIRS`), see **[Castalia-Full](https://github.com/ehwin/Castalia-Full)**. For the emotional variant (agent state / bias layer / emotion-weighted search), see **[Castalia-Anima](https://github.com/ehwin/Castalia-Anima)**.
 >
-> 引擎代码由 `Castalia-Full` 同版本导出（`scripts/export_public.py`，Lite 仅去掉联邦/跨库反思两个模块），不再手工维护；本仓保留 README / CHANGELOG / LICENSE / web / 发布脚本。
+> 架构：**本仓是引擎核心**（Lite）；`Castalia-Full` 是**联邦/跨库总线**（核心 + federation / reflect_all / 聚合星图），`Castalia-Anima` 是情感变体。三者版本由同一个 `VERSION` 统一，核心文件从本仓同步到 Full（`sync_core.py`）。
 
 > 📖 详细技术设计见 [docs/TECHNICAL.md](docs/TECHNICAL.md)(架构/数据模型/管线/决策记录)。
 

@@ -3,15 +3,16 @@
 > 本文件记录每次功能/架构变更,供 AIRI 主系统(`主系统`)吸收改进时快速对账。
 > 格式:Keep a Changelog 简化版(Added / Changed / Fixed / Removed)。
 
-## [v1.23.1] — 2026-10-24 引擎由 Full 同版本导出
+## [v1.23.1] — 2026-10-24 三个版本统一（本仓 = 引擎核心）
 
-> 从本版起 Lite 引擎不再手工维护：`Castalia-Full/scripts/export_public.py` 把 Full 的核心源码
-> 导出到本仓（只排除 federation / reflectAll 两个 Full 专属模块），版本号读同一个 `VERSION`。
-> 因此本仓自动获得 Full 的整合修复、facts 时间有效性、冷存、回捞、失败退避等全部核心修复。
+> 架构澄清：**Castalia（本仓）= 引擎核心**；Castalia-Full = 核心 + 联邦/跨库总线；
+> Castalia-Anima = 核心 + 情感层。三者版本由同一个 `VERSION` 统一（1.23.1）。
+> 核心文件从本仓同步到 Full（`Castalia-Full/scripts/sync_core.py`），Full 只额外维护总线模块。
 
 ### Changed
 - 工具数 27 → 30；版本号统一 1.23.1（`VERSION` → `src/version.ts`）
 - 实例变体统一为 full / anima（lite、max 名称退役）
+- 核心修复全部进入本仓：整合退化、facts 时间有效性、冷存/回温、Parent-Child 回捞、失败退避
 
 ## [v1.16.0] — 2026-09-11 cosmograph-org 宇宙图(星图在 Full)
 
