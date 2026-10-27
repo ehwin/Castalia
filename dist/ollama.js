@@ -10,12 +10,21 @@
  * - 重启不丢失，重复文本 0ms 返回
  * - 暴露 getEmbeddingCached() 供 store.ts 使用
  */
-import { DatabaseManager, VEC_DIM } from './db.js';
+import { DatabaseManager, vecDim, embedSpaceHash } from './db.js';
 import { isEmbedEnabled } from './env.js';
 import crypto from 'node:crypto';
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434'; // Ollama embed server (standard port)
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'yuan-embedding-2.0-zh'; // 1024 dim
 const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY || ''; // set → OpenAI-compatible /embeddings mode
+/**
+ * 当前嵌入模型名(惰性读取)。
+ *
+ * 2026-10-27 修复(E4):原来是 import 时求值的 const,configLoader 在本模块 import
+ * 之后才注入 EMBEDDING_MODEL 时会被忽略,而且嵌入空间指纹必须跟着模型名走,
+ * 所以统一改成惰性函数(与 db.ts 的 embedModelName() 同源)。
+ */
+function embedModel() {
+    return (process.env.EMBEDDING_MODEL || 'yuan-embedding-2.0-zh').trim();
+}
 // 嵌入服务超时(秒):防止嵌入服务挂起导致 saveMemory/search 永久阻塞
 const EMBED_TIMEOUT_MS = (() => {
     const v = parseInt(process.env.EMBED_TIMEOUT_MS || '30000', 10);
@@ -24,26 +33,38 @@ const EMBED_TIMEOUT_MS = (() => {
 // 内存级 LRU 缓存（热数据，<1ms）
 const memCache = new Map();
 const MEM_CACHE_MAX = 200;
-function hashText(text) {
-    return crypto.createHash('sha256').update(text).digest('hex');
+/**
+ * 嵌入缓存键(2026-10-27 修复 E4):必须把"文本"和"嵌入空间(model|dim)"一起哈希。
+ *
+ * 旧实现只哈希文本 —— 换一个**同维度**的模型后,旧向量被无限期静默复用
+ * (缓存命中 + vec_memory 行仍在,而 batchEmbedPending 只看"有没有 vec 行",
+ * 陈旧向量永远不会重算)。实测后果:同一文本自相似度 1.000 → 0.000,
+ * 毫不相关的文本反而 1.000。键里绑定空间指纹后,旧空间的行自然不再命中。
+ */
+export function embedCacheKey(text) {
+    return crypto.createHash('sha256').update(`${embedSpaceHash()}\u0000${text}`).digest('hex');
+}
+/** 进程内 LRU 缓存键:同样必须绑定嵌入空间 */
+function memKey(text) {
+    return `${embedSpaceHash()}\u0000${text}`;
 }
 export async function embed(text, project) {
     // EMBED_MODE=none → 禁用嵌入(调用方应已降级;这里兜底抛错避免静默外部调用)
     if (!isEmbedEnabled()) {
         throw new Error('embedding disabled: EMBED_MODE=none');
     }
-    // 1. 内存缓存(全局 LRU,跨项目共享文本→向量)
-    const memCached = memCache.get(text);
+    // 1. 内存缓存(全局 LRU,跨项目共享"文本+嵌入空间"→向量)
+    const memCached = memCache.get(memKey(text));
     if (memCached)
         return memCached;
     // 2. SQLite 缓存(project 为空 → 默认项目库;embedding_cache 按项目隔离)
     const db = DatabaseManager.getInstance(project);
-    const hash = hashText(text);
+    const hash = embedCacheKey(text);
     try {
         const row = db.prepare('SELECT embedding FROM embedding_cache WHERE text_hash = ?').get(hash);
         if (row) {
             const vec = Array.from(new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4));
-            setMemCache(text, vec);
+            setMemCache(memKey(text), vec);
             return vec;
         }
     }
@@ -55,7 +76,7 @@ export async function embed(text, project) {
         const resp = await fetch(`${OLLAMA_URL}/embeddings`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${EMBEDDING_API_KEY}` },
-            body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
+            body: JSON.stringify({ model: embedModel(), input: text }),
             signal,
         });
         if (!resp.ok) {
@@ -74,7 +95,7 @@ export async function embed(text, project) {
         const resp = await fetch(`${OLLAMA_URL}/api/embed`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
+            body: JSON.stringify({ model: embedModel(), input: text }),
             signal,
         });
         if (!resp.ok) {
@@ -89,12 +110,14 @@ export async function embed(text, project) {
         }
         vector = vec;
     }
-    // 维度护栏:向量维度与 vec 表(VEC_DIM)不符时给出清晰报错,而非后续 sqlite-vec 隐式失败
-    if (vector.length !== VEC_DIM) {
-        throw new Error(`Embedding dimension mismatch: got ${vector.length}, expected ${VEC_DIM}`);
+    // 维度护栏:向量维度与 vec 表维度不符时给出清晰报错,而非后续 sqlite-vec 隐式失败
+    // (v1.25: 维度取自 config.json 的 embedding.dim / env EMBEDDING_DIM,不再是常量)
+    const want = vecDim();
+    if (vector.length !== want) {
+        throw new Error(`Embedding dimension mismatch: got ${vector.length}, expected ${want}. 若刚换了嵌入模型,请把 ${want} 改成新模型的维度(bank 的 config.json → embedding.dim,或环境变量 EMBEDDING_DIM)。`);
     }
     // 写入缓存
-    setMemCache(text, vector);
+    setMemCache(memKey(text), vector);
     try {
         const floatArr = new Float32Array(vector);
         db.prepare('INSERT OR IGNORE INTO embedding_cache (text_hash, embedding) VALUES (?, ?)').run(hash, floatArr);

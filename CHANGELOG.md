@@ -3,6 +3,17 @@
 > 本文件记录每次功能/架构变更,供 AIRI 主系统(`主系统`)吸收改进时快速对账。
 > 格式:Keep a Changelog 简化版(Added / Changed / Fixed / Removed)。
 
+## [v1.25.0] — 2026-10-26 模型与维度可配(换嵌入模型不再改源码) + 配置 BOM 容错
+
+### Added
+- **向量维度可配**:新增 `embedding.dim`(bank 的 `config.json`)与 `EMBEDDING_DIM` 环境变量;`db.ts` 导出 `vecDim()` 惰性读取,保留 `VEC_DIM = 1024` 常量做兼容。`vec0` 表建表、`ollama.ts` 维度护栏全部改用 `vecDim()`
+- **维度自动对齐**:`reconcileVecDim()` 在开库时比较 `vec_memory` / `vec_facts` 的实际维度(`float[N]`)与配置,不一致就重建这两张 vec 表并清空 `embedding_cache`;**`memory` / `facts` 正文与关系不动**,缺向量的行按需重新嵌入(`EMBED_MODE=none` 时保持待嵌)
+- **Web 控制台维度输入**:「🧬 嵌入模型」卡片新增「维度 dim」,写回 `embedding.dim`;`web/routes/lib.js` 建 vec 表改读该配置(新建库不再写死 1024)
+- `scripts/regression_embed_dim.mjs`(17 项子进程回归:维度生效 / 重建 / 正文不丢 / 缓存清空 / 默认 1024 / config.json 端到端)
+
+### Fixed
+- **config.json 的 UTF-8 BOM 容错**:Windows 编辑器与 PowerShell(`Set-Content`/`Out-File -Encoding utf8`)会写入 BOM,旧版 `JSON.parse` 直接抛 `Unexpected token '\uFEFF'`,导致**整份配置被静默忽略**;现按 `/^\uFEFF+/` 剥离开头所有 BOM
+
 ## [v1.23.1] — 2026-10-24 三个版本统一（本仓 = 引擎核心）
 
 > 架构澄清：**Castalia（本仓）= 引擎核心**；Castalia-Full = 核心 + 联邦/跨库总线；

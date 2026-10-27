@@ -17,6 +17,7 @@ import { DatabaseManager, currentMemDir } from './db.js';
 import { saveFacts, saveMemory, batchEmbedPending, updateMemory, applyIdentityActions, findDbByMemoryId } from './store.js';
 import { normalizeProject } from './env.js';
 import { isMemType, MEM_TYPES } from './memType.js';
+import { parseTagsSafe, serializeTags } from './tags.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { protectedReflectionProject, reflectionPolicy, wholeRecordBatches, fidelitySystemPrompt } from './reflectionFidelity.js';
@@ -50,14 +51,7 @@ export function listAllMemories(characterId = 'airi', limit = 200, project) {
     all.sort((a, b) => (b.importance - a.importance) || String(b.created_at || '').localeCompare(String(a.created_at || '')));
     const rows = all.slice(0, limit);
     return rows.map(r => {
-        let tags = [];
-        try {
-            const parsed = JSON.parse(r.tags || '[]');
-            tags = Array.isArray(parsed) ? parsed : [];
-        }
-        catch {
-            tags = [];
-        }
+        const tags = parseTagsSafe(r.tags);
         return {
             id: r.id,
             text: r.text,
@@ -425,7 +419,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                             continue;
                         }
                         updates.push('tags = ?');
-                        values.push(JSON.stringify(valid));
+                        values.push(serializeTags(valid));
                     }
                     if (action.newMemType) {
                         if (!isMemType(action.newMemType)) {
@@ -462,7 +456,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         const names = { type: 'type', category: 'category', tags: 'tags', mem_type: 'memType', text: 'text' };
                         updates.forEach((field, i) => {
                             const key = field.split(' = ')[0];
-                            patch[names[key]] = key === 'tags' ? JSON.parse(values[i]) : values[i];
+                            patch[names[key]] = key === 'tags' ? parseTagsSafe(values[i]) : values[i];
                         });
                         const updated = await updateMemory(tid, patch);
                         const _recR = { changes: updated ? 1 : 0 };

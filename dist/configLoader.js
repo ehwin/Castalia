@@ -69,7 +69,8 @@ function loadEncryptedSecrets() {
 loadEncryptedSecrets();
 try {
     if (fs.existsSync(CONFIG_PATH)) {
-        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+        // 容忍 Windows 编辑器/PowerShell 写入的 UTF-8 BOM(否则 JSON.parse 直接失败,整份配置被忽略)
+        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8').replace(/^\uFEFF+/, ''));
         // v1.23.1-fix: 与文件头/web 端一致 —— 显式环境变量优先，config.json 只填充未设置的项。
         // 旧实现无条件覆盖 MEMORY_DB_DIR/EMBED_MODE 等，会造成“引擎读 B 库、控制台显示 A 库”的串库。
         if (!process.env.MEMORY_DB_DIR && cfg.db_dir && typeof cfg.db_dir === 'string' && cfg.db_dir.trim()) {
@@ -77,6 +78,19 @@ try {
         }
         // 嵌入模型配置
         const emb = cfg.embedding || {};
+        // v1.25: 向量维度可配 —— 换嵌入模型(不同维度)不再需要改源码;
+        // db.ts 的 vecDim() 惰性读取本值,首开库时按需重建 vec 表并标记重嵌。
+        if (emb.dim != null && String(emb.dim).trim()) {
+            // 2026-10-27 修复(E1):本段上方刚声明"显式环境变量优先",这里却无条件覆盖 ——
+            // 于是 `EMBEDDING_DIM=4096` 的运行环境会被 config.json 里的 dim 压回 1024,
+            // 触发 reconcileVecDim 静默降维清库(与控制台 E2 是同一后果的两个入口)。
+            if (process.env.EMBEDDING_DIM || process.env.VEC_DIM) {
+                console.warn(`[config] 已显式设置 EMBEDDING_DIM/VEC_DIM，忽略 config.json 的 embedding.dim=${emb.dim}（显式环境变量优先）`);
+            }
+            else {
+                process.env.EMBEDDING_DIM = String(emb.dim).trim();
+            }
+        }
         const embMode = emb.mode ? String(emb.mode).toLowerCase().trim() : '';
         if (embMode && !process.env.EMBED_MODE) {
             if (['none', 'ollama', 'api'].includes(embMode))

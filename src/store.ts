@@ -9,7 +9,8 @@ import type Database from 'better-sqlite3';
 import { embed, getEmbeddingCached } from './ollama.js';
 import { PROJECT_ID, CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
 import { isMemType,  MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
-import { reflectionPolicy } from './reflectionFidelity.js';
+import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
+import { reflectionPolicy, reflectionPolicySafe } from './reflectionFidelity.js';
 
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
@@ -80,7 +81,8 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   const now = new Date().toISOString();
   const skipEmbed = params.skipEmbed === true;
   const project = normalizeProject(params.project);
-  const preserve = reflectionPolicy(project) !== 'standard';
+  // 2026-10-27 修复(NF-1):写路径必须用 Safe 版 —— 坏 config.json 不能让 memory_save 失效
+  const preserve = reflectionPolicySafe(project) !== 'standard';
   let memType: MemType;
   if (params.memType && isMemType(params.memType)) {
     memType = normalizeMemType(params.memType);
@@ -101,7 +103,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     id: row.id, text: row.text, project: row.project,
     sessionId: row.session_id, type: row.type, memType: row.mem_type,
     category: row.category, subcategory: row.subcategory,
-    tags: JSON.parse(row.tags || '[]'), importance: row.importance,
+    tags: parseTagsSafe(row.tags), importance: row.importance,
     characterId: row.character_id, source: row.source, subject: row.subject,
     tier: row.tier, expiresAt: row.expires_at, isActive: !!row.is_active,
     createdAt: row.created_at, updatedAt: row.updated_at,
@@ -187,7 +189,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     memType,
     category: params.category ?? 'general',
     subcategory: params.subcategory ?? null,
-    tags: params.tags ?? [],
+    tags: normalizeTagsForWrite(params.tags),
     importance: params.importance ?? 0.5,
     characterId: params.characterId ?? null,
     source: params.source ?? null,
@@ -208,7 +210,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory,
-      JSON.stringify(record.tags), record.importance, record.importance,
+      serializeTags(record.tags), record.importance, record.importance,
       record.characterId, record.source, record.subject,
       record.tier, record.expiresAt, 1,
       record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0,
@@ -222,6 +224,10 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     if (!skipEmbed && vector) {
       const info = db.prepare('SELECT rowid FROM memory WHERE id = ?').get(record.id) as any;
       const rowid = BigInt(info.rowid);
+      // v5.0-fix: 新行刚拿到该 rowid，memory 里不可能有别的行占用它；
+      // 若 vec_memory 同 rowid 已有行，必是历史硬删留下的孤儿。先清再插，
+      // 否则 sqlite-vec 主键冲突会让整笔记忆永久保存失败。
+      try { db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(rowid); } catch { /* 无 vec 表 */ }
       db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(rowid, new Float32Array(vector));
     }
   });
@@ -286,7 +292,9 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
     const proj = normalizeProject(updates.project);
     const newDb = DatabaseManager.getInstance(proj, newMt);
     const text = updates.text !== undefined ? normalizeMarkdown(updates.text, newMt) : existing.text;
-    const tags = updates.tags !== undefined ? JSON.stringify(updates.tags) : (existing.tags ?? '[]');
+    const tags = updates.tags !== undefined
+      ? serializeTags(updates.tags)
+      : serializeTags(existing.tags);
     const now = new Date().toISOString();
     // v1.23.2-fix: 搬家保留 parent_id/base_importance；先清目标库同 id 的旧向量，
     // 否则 INSERT OR REPLACE 换 rowid 后旧向量成为孤儿（KNN 白占名额，rowid 复用还会算错记忆）。
@@ -356,7 +364,7 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
   if (updates.type !== undefined) { fields.push('type = ?'); values.push(updates.type); }
   if (updates.category !== undefined) { fields.push('category = ?'); values.push(updates.category); }
   if (updates.subcategory !== undefined) { fields.push('subcategory = ?'); values.push(updates.subcategory); }
-  if (updates.tags !== undefined) { fields.push('tags = ?'); values.push(JSON.stringify(updates.tags)); }
+  if (updates.tags !== undefined) { fields.push('tags = ?'); values.push(serializeTags(updates.tags)); }
   if (updates.importance !== undefined) {
     // 显式改重要性 = 重新设基线，避免下一次衰减从旧基线把它拉回去
     fields.push('importance = ?, base_importance = ?');
@@ -422,8 +430,8 @@ export async function saveConversationTurn(
   }
   db.prepare(`
     INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, metadata)
-    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.3, ?, 'conversation_log', 'user', 'standard', NULL, 0, ?, ?, ?, 0, 0, ?)
-  `).run(id, text, proj, characterId, now, now, now, JSON.stringify(meta));
+    VALUES (?, ?, ?, 'episodic', 'conversation', ?, 0.3, ?, 'conversation_log', 'user', 'standard', NULL, 0, ?, ?, ?, 0, 0, ?)
+  `).run(id, text, proj, serializeTags([]), characterId, now, now, now, JSON.stringify(meta));
 
   return { id, ok: true };
 }
@@ -806,8 +814,8 @@ export function upsertSessionMemory(
   const id = generateId();
   db.prepare(`
     INSERT INTO memory (id, text, project, session_id, type, mem_type, category, tags, importance, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-    VALUES (?, ?, ?, ?, 'episodic', ?, 'session', '[]', 0.5, 'session_memory', 'user', 'standard', 1, ?, ?, ?, 0, 0)
-  `).run(id, content, proj, sessionId, normalizeMemType(memType), now, now, now);
+    VALUES (?, ?, ?, ?, 'episodic', ?, 'session', ?, 0.5, 'session_memory', 'user', 'standard', 1, ?, ?, ?, 0, 0)
+  `).run(id, content, proj, sessionId, normalizeMemType(memType), serializeTags([]), now, now, now);
   return { id, updated: false };
 }
 
@@ -826,7 +834,8 @@ export function promoteToProject(
 ): string[] {
   const cid = characterId || CHAR_ID;
   const proj = normalizeProject(project);
-  const preserve = reflectionPolicy(proj) !== 'standard';
+  // 2026-10-27 修复(NF-1):同 saveMemory,晋升路径也不能被坏配置打断
+  const preserve = reflectionPolicySafe(proj) !== 'standard';
   const now = new Date().toISOString();
   const ids: string[] = [];
   const gateRejected: Record<string, string[]> = { tooloong: [], noInfo: [], foreign: [], delta: [] };
@@ -888,7 +897,7 @@ export function promoteToProject(
     db.prepare(`
       INSERT INTO memory (id, text, project, session_id, type, mem_type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
       VALUES (?, ?, ?, NULL, 'semantic', ?, ?, ?, ?, ?, 'session_promoted', 'user', 'standard', 1, ?, ?, ?, 0, 0)
-    `).run(id, md, proj, mt, (item.category && String(item.category).trim().slice(0, 40)) || 'knowledge', '[]', 0.6, cid, now, now, now);
+    `).run(id, md, proj, mt, (item.category && String(item.category).trim().slice(0, 40)) || 'knowledge', serializeTags([]), 0.6, cid, now, now, now);
     ids.push(id);
   }
   return ids;
@@ -973,7 +982,7 @@ export async function applyIdentityActions(
       // merge:tags 合并去重、metadata 对象级 merge,其余字段由 set 覆盖
       const merged: Partial<StoreParams> = { ...u.set, project, type: 'entity' };
       if (u.set.tags && existing.tags) {
-        try { merged.tags = [...new Set([...JSON.parse(existing.tags), ...u.set.tags])]; } catch { /* 保持 set */ }
+        merged.tags = [...new Set([...parseTagsSafe(existing.tags), ...normalizeTagsForWrite(u.set.tags)])];
       }
       if (u.set.metadata && existing.metadata) {
         try {

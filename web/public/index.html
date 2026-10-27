@@ -232,7 +232,8 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg);
       <div class="row"><label>API Key</label><input id="embApiKey" type="password" placeholder="sk-..."></div>
       <div class="row"><label>模型</label><input id="embApiModel" placeholder="BAAI/bge-m3"></div>
     </div>
-    <p class="note">⚠️ 嵌入维度固定 1024,换模型需同维或重建库;保存后重启 MCP server 生效</p>
+    <div class="row"><label>维度 dim</label><input id="embDim" type="number" min="1" max="65536" placeholder="1024"></div>
+    <p class="note">⚠️ 维度取自本设置(config.json 的 embedding.dim,或环境变量 EMBEDDING_DIM),默认 1024。改维度后重启 MCP server:引擎会按新维度重建该 bank 的 vec_memory/vec_facts 索引(memory 正文与 facts 不受影响),向量按需重新嵌入。保存后重启 MCP server 生效</p>
   </div>
 
   <div class="card">
@@ -1456,6 +1457,7 @@ async function loadConfig() {
     document.getElementById('embApiUrl').value = emb.api_url || '';
     document.getElementById('embApiKey').value = emb.api_key && emb.api_key !== '****' ? emb.api_key : '';
     document.getElementById('embApiModel').value = emb.api_model || '';
+    document.getElementById('embDim').value = emb.dim ?? 1024;
     const ref = d.reflect || {};
     document.getElementById('refUrl').value = ref.llm_url || 'https://api.deepseek.com/v1';
     document.getElementById('refKey').value = ref.api_key && ref.api_key !== '****' ? ref.api_key : '';
@@ -1484,6 +1486,7 @@ async function saveAllConfig() {
       api_url: document.getElementById('embApiUrl').value.trim(),
       api_key: document.getElementById('embApiKey').value.trim(),
       api_model: document.getElementById('embApiModel').value.trim(),
+      dim: parseInt(document.getElementById('embDim').value, 10) || 1024,
     },
     reflect: {
       llm_url: document.getElementById('refUrl').value.trim(),

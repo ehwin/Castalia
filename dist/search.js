@@ -11,6 +11,7 @@ import { DatabaseManager, listProjectNames } from './db.js';
 import { embed } from './ollama.js';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { normalizeMemType } from './memType.js';
+import { parseTagsSafe } from './tags.js';
 // 中性评分权重(可配)
 const WEIGHT_CONSISTENCY = parseFloat(process.env.WEIGHT_CONSISTENCY || '0.65'); // 语义/标签匹配
 const WEIGHT_TIME = parseFloat(process.env.WEIGHT_TIME || '0.35'); // 时间衰减
@@ -118,13 +119,20 @@ async function searchInDb(db, options) {
     const existingIds = new Set(tagResults.map(r => r.id));
     let vectorResults = [];
     if (isEmbedEnabled()) {
+        let vecOk = false;
         try {
             const queryVector = await embed(options.query, options.project);
             const floatQuery = new Float32Array(queryVector);
             vectorResults = vectorKnnSearch(db, options, floatQuery, existingIds, topK, minScore);
+            vecOk = true;
         }
         catch {
-            // 向量搜索失败 → 文本回退
+            vecOk = false;
+        }
+        // 2026-10-27 修复(E6a):原来只在 embed/KNN **抛错**时回退。vec_memory 为空
+        // (换模型清空后尚未补齐、维度刚重建、批量嵌入没跑)时 KNN 会"成功返回 0 行",
+        // 于是嵌入服务明明健康却静默 0 命中。零命中同样要回退到文本检索。
+        if (!vecOk || vectorResults.length === 0) {
             vectorResults = textFallbackSearch(db, options, existingIds, topK, minScore);
         }
     }
@@ -245,7 +253,7 @@ function tagSearch(db, options) {
     LIMIT ?
   `).all(...params, topK * 3);
     return rows.map(row => {
-        const memTags = JSON.parse(row.tags || '[]');
+        const memTags = parseTagsSafe(row.tags);
         const matchedTags = keywords.filter(k => memTags.some((t) => t.toLowerCase().includes(k.toLowerCase()))).length;
         const tagScore = Math.min(1.0, matchedTags / Math.max(1, keywords.length));
         return {
@@ -321,7 +329,7 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
         if (score >= minScore) {
             results.push({
                 id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
-                subcategory: row.subcategory, tags: JSON.parse(row.tags || '[]'),
+                subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
                 importance: row.importance,
                 characterId: row.character_id, source: row.source,
                 subject: row.subject || 'user', tier: row.tier || 'standard',
@@ -377,7 +385,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
         .filter(row => !excludeIds.has(row.id))
         .map(row => ({
         id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
-        subcategory: row.subcategory, tags: JSON.parse(row.tags || '[]'),
+        subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
         importance: row.importance,
         characterId: row.character_id, source: row.source,
         subject: row.subject || 'user', tier: row.tier || 'standard',
@@ -434,7 +442,7 @@ export function getRecentMemories(characterId, limit = 5, hoursBack = 24, projec
       `).all(...params);
             all.push(...rows.map(row => ({
                 id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
-                subcategory: row.subcategory, tags: JSON.parse(row.tags || '[]'),
+                subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
                 importance: row.importance,
                 characterId: row.character_id, source: row.source, subject: row.subject || 'user',
                 tier: row.tier || 'standard',

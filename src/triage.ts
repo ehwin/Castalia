@@ -14,12 +14,11 @@
  * 回退逻辑:isTriageConfigured() = 有 TRIAGE key 或 REFLECT key。
  */
 import { callLlm, makeLlmChannel, LlmChannel } from './reflectionLlm.js';
-import { reflectionFidelityPrompt, reflectionPolicy } from './reflectionFidelity.js';
+import { reflectionFidelityPrompt, reflectionPolicy, reflectionPolicySafe } from './reflectionFidelity.js';
 import { isMemType, isClosedMemType, normalizeMarkdown, MemType } from './memType.js';
 import { getSessionMemory, upsertSessionMemory, promoteToProject, deleteSessionFragments, applyIdentityActions, saveMemory } from './store.js';
 import { normalizeProject } from './env.js';
-import { embed, cosineSimilarity } from './ollama.js';
-import { createHash } from 'node:crypto';
+import { embed, cosineSimilarity, embedCacheKey } from './ollama.js';
 import { DatabaseManager } from './db.js';
 
 /** triage 通道:未配置时回退 REFLECT_* 值(由 makeLlmChannel 统一处理) */
@@ -222,7 +221,8 @@ function normalizeText(s: string): string {
  */
 export async function isDuplicate(proj: string, text: string, memType: string): Promise<boolean> {
   proj = normalizeProject(proj);
-  const preserve = reflectionPolicy(proj) !== 'standard';
+  // 2026-10-27 修复(NF-1):isDuplicate 在晋升写路径上,不能被坏配置打断
+  const preserve = reflectionPolicySafe(proj) !== 'standard';
   const hasVec = typeof embed === 'function' && typeof cosineSimilarity === 'function';
   try {
     const candidates = DatabaseManager.getInstance(proj, memType).prepare(`
@@ -262,7 +262,10 @@ export async function isDuplicate(proj: string, text: string, memType: string): 
     for (const row of candidates) {
       const cand = row?.text;
       if (typeof cand !== 'string') continue;
-      const hash = createHash('sha256').update(cand).digest('hex');
+      // 2026-10-27 修复(E4):缓存键必须与 ollama.ts 的 embedCacheKey 一致
+      // (内含嵌入空间指纹 model|dim)。否则换模型后这里会读到旧空间的向量,
+      // 与 embed() 返回的新空间 queryVec 做余弦比较,相似度无意义。
+      const hash = embedCacheKey(cand);
       const cached = db.prepare('SELECT embedding FROM embedding_cache WHERE text_hash = ?').get(hash) as any;
       if (!cached?.embedding) continue;
       const candVec = Array.from(new Float32Array(
@@ -358,7 +361,9 @@ ${lines}
       try {
         const ids = promoteToProject(proj, promoted, characterId);
         promotedCount = ids.length;
-        if (ids.length === promoted.length && reflectionPolicy(proj) === 'standard') {
+        // 2026-10-27 修复(P2-3,复核提出):门控改 Safe 版 —— 严格版在 config.json 坏掉时
+        // 会在此抛错,被下面的 catch 记成"晋升失败"(而晋升其实已经成功),并跳过"晋升即删"清理。
+        if (ids.length === promoted.length && reflectionPolicySafe(proj) === 'standard') {
           try { deleteSessionFragments(proj, sessionId); }
           catch (e: any) { console.error('[reflect-incremental] 晋升即删失败:', e.message); }
         }
@@ -379,7 +384,9 @@ ${lines}
     }
 
     // ③ v1.15: 身份维护(identity CRUD,白名单校验在 applyIdentityActions)
-    const idResult = reflectionPolicy(proj) === 'standard' && parsed.identity && typeof parsed.identity === 'object'
+    // 2026-10-27 修复(P2-3,复核提出):门控同样改 Safe 版 —— 严格版在坏配置下抛错时,
+    // 整个身份维护块会被静默跳过(与 NF-1"写路径不被坏配置打断"的目标相悖)。
+    const idResult = reflectionPolicySafe(proj) === 'standard' && parsed.identity && typeof parsed.identity === 'object'
       ? await (async () => {
           const ida = parsed.identity as any;
           try {
@@ -445,6 +452,12 @@ ${lines}
 
     return { ok: true, sessionMemoryUpdated, promoted: promotedCount, errors: [] };
   } catch (e: any) {
+    // 2026-10-27 修复(P2-3,复核提出/实测):本 catch 此前**不打印任何日志**,而 :331 的
+    // reflectionFidelityPrompt() 内部用严格策略解析,坏 config.json(取值非法/JSON 不可解析)
+    // 会在此抛错 → 整条增量反思静默失败(会话快照不更新、promoted 不晋升),调用方 buffer.ts
+    // 只看到 ok=false,把它当可重试失败反复重排 → 无声死循环。失败面必须可见。
+    // 注意:这里**不**降级策略(反思路径保持严格,错配照样报错),只是让它不再沉默。
+    console.error('[reflect-incremental] 本轮失败(会话快照未更新/未晋升):', e.message);
     return { ...base, errors: [e.message] };
   }
 }

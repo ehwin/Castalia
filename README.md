@@ -2,7 +2,7 @@
 
 **Standard MCP stdio server (30 tools, profile-gated).** Local memory on SQLite (per-project DB files) + sqlite-vec vectors — **zero API cost** for storage, works offline once the embedding model is cached.
 
-Independent, neutral, general-purpose memory component. No personality layer, no vendor lock-in — bring your own LLM, bring your own embedding service (any Ollama-compatible `/api/embed`, 1024-dim).
+Independent, neutral, general-purpose memory component. No personality layer, no vendor lock-in — bring your own LLM, bring your own embedding service (any Ollama-compatible `/api/embed`; vector dimension configurable, default 1024).
 
 Designed after studying Claude Code's memory architecture (closed memory types, progressive session maintenance, consolidation) and engram / memory-os patterns.
 
@@ -34,7 +34,7 @@ scripts\start-embed.bat
 ```
 
 Listens on `http://127.0.0.1:11436` (Ollama-compatible `/api/embed`, 1024-dim, model `IEITYuan/Yuan-embedding-2.0-zh`, cached locally — no re-download).
-> Any Ollama-compatible embed service outputting **1024-dim** works: point `OLLAMA_URL` + `EMBEDDING_MODEL` at it and skip this step.
+> Any Ollama-compatible embed service works: point `OLLAMA_URL` + `EMBEDDING_MODEL` at it, set `EMBEDDING_DIM` (or `embedding.dim`) to that model's output dimension, and skip this step.
 
 ### 3. Configure LLM channels (optional but recommended)
 
@@ -228,7 +228,8 @@ Memories are **strictly layered** — nothing falls into an unclassified pile, e
 | `MEMORY_DB_DIR` | `./memory` | **v1.7** Memory directory: `global.sqlite` + `project-<name>.sqlite` (per-project DB files) |
 | `MEMORY_DB_PATH` | *(deprecated)* | Legacy single-DB path. If explicitly set, runs in single-DB compatibility mode with a warning |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Embedding service address (bundled service runs on 11436) |
-| `EMBEDDING_MODEL` | `yuan-embedding-2.0-zh` | Embedding model name; must output **1024-dim** |
+| `EMBEDDING_MODEL` | `yuan-embedding-2.0-zh` | Embedding model name; dimension set via `EMBEDDING_DIM` / `embedding.dim` (default **1024**) |
+| `EMBEDDING_DIM` | `1024` | **v1.25** Vector dimension (same as `config.json` → `embedding.dim`). Set it to the new model's output dimension when swapping models |
 | `EMBED_MODE` | `ollama` | **v1.5.3** Embedding pipeline: `ollama` (local) / `api` (OpenAI-compatible, `EMBEDDING_API_KEY`) / `none` (pure local, no embed service at all) |
 | `EMBEDDING_API_KEY` | *(unset)* | Key for `EMBED_MODE=api` |
 | `CHAR_ID` | `default` | Instance/partition ID. Multiple instances can share one DB without cross-talk |
@@ -328,9 +329,28 @@ The 3D view is a **semantic map**, not a decorative layout:
 ## Storage
 
 - **memdir 分库**(v1.13):`memory/<project>/<memType>/memory.sqlite` — 项目为最外层,内部 user/feedback/project/reference/general 五个分类文件夹;兼容旧 `project-<name>.sqlite` 读取
-- Fixed **1024-dim** vectors; swap embedding models only if same dim (or rebuild the DB)
+- Vector width is configurable since **v1.25** (default **1024**; see “Configurable embedding model & dimension” below)
 - WAL mode; auto-checkpoint; expired temporaries cleaned periodically; consolidation on startup when >15 memories
 - DB files are fully portable (copy while stopped)
+
+---
+
+## Configurable embedding model & dimension (v1.25) / 模型与维度可配
+
+每个记忆库(bank)自带一份模型配置,写在 `<bank>/config.json`;`embedding.dim` 指定向量维度,不填沿用 1024:
+
+```json
+{
+  "embedding": { "mode": "api", "api_url": "https://api.siliconflow.cn/v1", "api_model": "BAAI/bge-m3", "dim": 1024 },
+  "reflect":   { "llm_url": "https://api.deepseek.com", "model": "deepseek-v4-flash", "maxFacts": 15 },
+  "triage":    { "llm_url": "https://api.deepseek.com", "model": "deepseek-v4-flash" }
+}
+```
+
+- **换嵌入模型只改配置,不改源码**:`embedding.dim`(或环境变量 `EMBEDDING_DIM`)即目标维度;引擎侧 `vecDim()` 惰性读取,启动时生效。
+- **维度变化自动重建索引**:首次打开库时,若 `vec_memory` / `vec_facts` 的维度与配置不一致,引擎会重建这两张 vec 表并清空 `embedding_cache`。`memory` / `facts` 的正文与关系不动,缺向量的行在后续嵌入时按需补回(`EMBED_MODE=none` 时保持待嵌状态)。
+- **Web 控制台**:「🧬 嵌入模型」卡片新增「维度 dim」输入,写入 `embedding.dim`;卡片同时用该维度建 `vec_memory` / `vec_facts`,新建库不再被写死 1024。
+- **回归**:`node scripts/regression_embed_dim.mjs`(17 项:维度生效、自动重建、正文不丢、缓存清空、默认 1024、config.json 端到端)。
 
 ---
 

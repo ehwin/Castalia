@@ -100,10 +100,33 @@ function openDb(readonly = false) {
 }
 
 // ═══ 嵌入配置 ═══
+/**
+ * 只读原始 config.json(不注入任何默认值)。
+ *
+ * 2026-10-27 修复(E2):必须区分"文件里真的写了什么"与"生效值(含默认值/环境变量)"。
+ * 旧实现只有后者,GET 把默认 dim=1024 物化进返回体,UI 原样回传后就被 POST 写成
+ * 显式配置,进而让引擎把 4096 维库静默降维清库。
+ */
+function rawConfig() {
+  if (!existsSync(CONFIG_PATH)) return {};
+  try { return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8').replace(/^\uFEFF+/, '')); } catch { return {}; }
+}
+
+/** 实际生效的向量维度:显式 env 优先 → config.json 的 embedding.dim → 内置默认 1024(与引擎 db.ts 口径一致) */
+function effectiveVecDim() {
+  const envRaw = (process.env.EMBEDDING_DIM || process.env.VEC_DIM || '').trim();
+  const fileRaw = rawConfig()?.embedding?.dim;
+  for (const raw of [envRaw, fileRaw]) {
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n > 0 && n <= 65536) return n;
+  }
+  return 1024;
+}
+
 function loadConfig() {
   let cfg = {};
   if (existsSync(CONFIG_PATH)) {
-    try { cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8')); } catch {}
+    try { cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8').replace(/^\uFEFF+/, '')); } catch {}
   }
   return {
     embedding: {
@@ -112,6 +135,8 @@ function loadConfig() {
       model: 'yuan-embedding-2.0-zh',
       api_url: '', api_key: '', api_model: '',
       ...(cfg.embedding || {}),
+      // 生效维度(env 优先),而不是把默认值当成"已配置值"暴露出去
+      dim: effectiveVecDim(),
     },
     reflect: {
       llm_url: 'https://api.deepseek.com/v1', api_key: '', model: 'deepseek-chat',
@@ -127,6 +152,14 @@ function loadConfig() {
 
 function saveConfig(cfg) {
   writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf-8');
+}
+
+/**
+ * v1.25: 建 vec0 表用的维度 —— 取自 bank config.json 的 embedding.dim(env EMBEDDING_DIM 可覆盖),
+ * 非法/未配置回退 1024。与引擎侧 db.ts 的 vecDim() 取值口径一致,避免 web 建库把维度写死。
+ */
+function configuredVecDim() {
+  return effectiveVecDim();
 }
 
 // ═══ MCP client:调用 dist/index.js 的反思工具 ═══
@@ -406,8 +439,8 @@ function ensureLibSchema(db) {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
-  try { db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(embedding float[1024])'); } catch (e) { console.error('vec_memory create failed:', e.message); }
-  try { db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(embedding float[1024])'); } catch (e) {}
+  try { db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(embedding float[' + configuredVecDim() + '])'); } catch (e) { console.error('vec_memory create failed:', e.message); }
+  try { db.exec('CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(embedding float[' + configuredVecDim() + '])'); } catch (e) {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_memory_project ON memory(project, is_active)'); } catch {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_memory_mem_type ON memory(mem_type, is_active)'); } catch {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_memory_tier ON memory(tier, is_active)'); } catch {}
@@ -418,7 +451,7 @@ function ensureLibSchema(db) {
 
 export {
   ROOT, DB_DIR, DB_PATH, CONFIG_PATH, NODE_BIN, MCP_SERVER, LEGACY_DB_PATH, PORT,
-  loadConfig, saveConfig, openDb, openLibDb, openDbByProject,
+  loadConfig, saveConfig, rawConfig, effectiveVecDim, openDb, openLibDb, openDbByProject,
   AGGREGATE_DIRS, libFiles, libFileByProject, currentInstanceLibs, findLib,
   resolveSourceFile, ensureLibSchema, safeFilePart, libFilePath, dbDirHasData,
   mcpCall, appendReflectHistory, readReflectHistory, historyEntry,

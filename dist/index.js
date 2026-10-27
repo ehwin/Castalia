@@ -24,6 +24,7 @@ import { runAutoReflect, runDeepReflect, shouldAutoReflect, runConsolidate, shou
 import { ensureSeedInstructions, saveInstruction, getInstruction, listInstructions, deleteInstruction } from './instructions.js';
 import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject } from './env.js';
 import { MEM_TYPES, summarizeForIndex } from './memType.js';
+import { parseTagsSafe } from './tags.js';
 console.log = console.error;
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 function ok(data) {
@@ -700,7 +701,7 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
                 type: row.type,
                 memType: row.mem_type || 'general',
                 category: row.category,
-                tags: JSON.parse(row.tags || '[]'),
+                tags: parseTagsSafe(row.tags),
                 importance: row.importance,
                 tier: row.tier,
                 source: row.source,

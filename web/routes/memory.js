@@ -11,8 +11,27 @@ import {
 
 const router = Router();
 
+// 标签归一化：优先复用 dist/tags.js（与记忆内核同一份实现），不可用时退化为等价本地实现。
+// 后置条件恒为 string[]：只保留字符串、嵌套拍平一层、trim、丢弃空串；非法 JSON 归空数组。
+// 注意必须校验取到的确实是函数：命名漂移时解构只会得到 undefined 而不抛错，
+// 若不在装载期发现，就会拖到请求处理时才炸。
+let normalizeTagsForWrite;
+try {
+  const mod = await import('../../dist/tags.js');
+  const fn = mod.normalizeTagsForWrite || mod.normalizeTags || mod.parseTagsSafe;
+  if (typeof fn !== 'function') throw new Error('dist/tags.js 未导出可用的归一化函数');
+  normalizeTagsForWrite = fn;
+} catch {
+  normalizeTagsForWrite = (v) => {
+    let arr = v;
+    if (typeof v === 'string') { try { arr = JSON.parse(v); } catch { arr = []; } }
+    if (!Array.isArray(arr)) return [];
+    return arr.flat(1).filter((x) => typeof x === 'string').map((s) => s.trim()).filter(Boolean);
+  };
+}
+
 function safeTags(raw) {
-  try { const p = JSON.parse(raw || '[]'); return Array.isArray(p) ? p : []; } catch { return []; }
+  return normalizeTagsForWrite(raw);
 }
 
 // ═══ GET /api/memory:聚合当前实例全部分类库,按时间倒序 ═══
@@ -78,7 +97,7 @@ router.post('/memory/update', (req, res) => {
     for (const k of allowed) {
       if (fields[k] !== undefined) {
         sets.push(`${k === 'tags' ? 'tags' : k} = ?`);
-        vals.push(k === 'tags' ? JSON.stringify(fields[k]) : fields[k]);
+        vals.push(k === 'tags' ? JSON.stringify(normalizeTagsForWrite(fields[k])) : fields[k]);
       }
     }
     if (sets.length === 0) return res.json({ updated: false });
@@ -138,12 +157,29 @@ router.post('/memory/move', (req, res) => {
 
         let vecBuf = null;
         try {
-          const vr = srcDb.prepare('SELECT embedding FROM vec_memory WHERE rowid = ?').get(BigInt(srcMem.rowid));
-          if (vr && vr.embedding) vecBuf = vr.embedding;
+          // 2026-10-27(配合 E4 修复):只在两库嵌入空间指纹一致时才搬原始向量。
+          // 指纹是 sha256(模型|维度),同维换模型也算不同空间;把 A 空间的向量塞进
+          // B 空间会让相似度长期失真,而目标库缺向量时会由 batchEmbedPending 自动重嵌。
+          const readSpace = (d) => {
+            try { return d.prepare('SELECT space_hash FROM _embed_space WHERE id = 1').get()?.space_hash || null; } catch { return null; }
+          };
+          const srcSpace = readSpace(srcDb), dstSpace = readSpace(dstDb);
+          if (srcSpace && dstSpace && srcSpace !== dstSpace) {
+            console.warn(`[move] 跳过向量复制:源/目标库嵌入空间不同(${srcSpace.slice(0, 8)} vs ${dstSpace.slice(0, 8)}),目标库将按当前模型重嵌`);
+          } else {
+            const vr = srcDb.prepare('SELECT embedding FROM vec_memory WHERE rowid = ?').get(BigInt(srcMem.rowid));
+            if (vr && vr.embedding) vecBuf = vr.embedding;
+          }
         } catch {}
 
         const COLS = ['id','text','project','session_id','type','mem_type','category','subcategory','tags','importance','character_id','source','subject','tier','expires_at','is_active','created_at','updated_at','last_accessed_at','accessed_count','reference_count','locked'];
-        const vals = COLS.map(c => c === 'project' ? toProject : (srcMem[c] === undefined ? null : srcMem[c]));
+        // tags 必须归一化后再搬：源库若有历史脏值(如 ISO 时间戳/非法 JSON/混合类型)，
+        // 原样拷贝等于把脏值传染给目标库。归一化后恒为 string[]，合法标签不受影响。
+        const vals = COLS.map(c => {
+          if (c === 'project') return toProject;
+          if (c === 'tags') return JSON.stringify(normalizeTagsForWrite(srcMem[c]));
+          return srcMem[c] === undefined ? null : srcMem[c];
+        });
         const insertTx = dstDb.transaction(() => {
           const info = dstDb.prepare(`INSERT INTO memory (${COLS.join(',')}) VALUES (${COLS.map(() => '?').join(',')})`).run(...vals);
           if (vecBuf) dstDb.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(info.lastInsertRowid), vecBuf);
