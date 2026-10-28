@@ -181,6 +181,38 @@ try {
     (await callTool('memory_get', { id: idA, project: 'e2e' })).json?.error !== undefined
     || (await callTool('memory_get', { id: idA, project: 'e2e' })).raw.includes('not found'),
     (await callTool('memory_get', { id: idA, project: 'e2e' })).raw.slice(0, 120));
+
+  // ── A-1：工具事件（events_ingest → event_search），走真 MCP 面 ──
+  console.log('\n== 工具事件（events_ingest / event_search）==');
+  const toolList = (await rpc('tools/list', {})).tools.map(t => t.name);
+  check('events_ingest / event_search 已注册', toolList.includes('events_ingest') && toolList.includes('event_search'));
+  const ing = await callTool('events_ingest', {
+    project: 'e2e',
+    events: [
+      { toolName: 'terminal', callId: 'e2e_c1', argsDigest: 'git status --porcelain', exitCode: 0, status: 'ok', sessionId: 's', at: new Date().toISOString() },
+      { toolName: 'terminal', callId: 'e2e_c2', argsDigest: 'npm run build', exitCode: 2, status: 'error', errorHead: 'TS2345: Argument of type', sessionId: 's', at: new Date().toISOString() },
+      { toolName: 'patch', callId: 'e2e_c3', argsDigest: 'patch src/index.ts | old: PROMPT_BUDGET', exitCode: null, status: 'ok', sessionId: 's', at: new Date().toISOString() },
+    ],
+  });
+  const ingBody = ing.json?.result ?? ing.json;
+  check('events_ingest 写入 3 条', ingBody?.inserted === 3, JSON.stringify(ingBody).slice(0, 200));
+  const dup = await callTool('events_ingest', { project: 'e2e', events: [
+    { toolName: 'terminal', callId: 'e2e_c1', argsDigest: 'git status --porcelain', exitCode: 0, status: 'ok' },
+  ]});
+  const dupBody = dup.json?.result ?? dup.json;
+  check('重复 callId 不再写入', dupBody?.inserted === 0 && dupBody?.skipped === 1, JSON.stringify(dupBody).slice(0, 200));
+  const es = await callTool('event_search', { project: 'e2e', query: 'npm run build' });
+  const esBody = es.json?.result ?? es.json;
+  check('event_search 命中构建失败命令', (esBody?.results || []).some(r => r.callId === 'e2e_c2'), JSON.stringify(esBody).slice(0, 300));
+  check('命中的事件带退出码与错误首行',
+    (esBody?.results || [])[0]?.exitCode === 2 && /TS2345/.test((esBody?.results || [])[0]?.errorHead || ''),
+    JSON.stringify((esBody?.results || [])[0]));
+  const es2 = await callTool('event_search', { project: 'e2e', query: 'PROMPT_BUDGET' });
+  check('检索能命中参数摘要（patch 的 old_string）', /PROMPT_BUDGET/.test((es2.json?.result ?? es2.json)?.results?.[0]?.argsDigest || ''));
+  const stats2 = await callTool('stats_get', { project: 'e2e' });
+  const stBody = stats2.json?.result ?? stats2.json;
+  check('stats_get 暴露事件聚合', (stBody?.events?.total || 0) >= 3 && Array.isArray(stBody?.events?.byTool),
+    JSON.stringify(stBody?.events));
 } catch (e) {
   fail++;
   console.log('  ❌ 异常：' + e.message);

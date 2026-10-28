@@ -27,6 +27,7 @@ import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject, isE
 import { MEM_TYPES, MEM_TYPE_LABELS, summarizeForIndex } from './memType.js';
 import { parseTagsSafe } from './tags.js';
 import { packContext, deriveCaps, type PackSection } from './contextPack.js';
+import { ingestEvents, searchEvents, eventStats } from './events.js';
 
 /** memory_context 的总字符预算（v1.24：从"盲切"改成按段配额装箱；超预算按优先级整条裁） */
 const PROMPT_BUDGET = Number(process.env.MEMORY_CONTEXT_BUDGET || 24000);
@@ -84,8 +85,8 @@ function memorySnapshotWarn(createdAt: string): string | null {
 // ═══════════════════════════════════════════════════════════════════
 
 const TOOL_GROUPS: Record<string, string[]> = {
-  agent: ['memory_search', 'memory_get', 'memory_recent', 'memory_index', 'fact_search', 'memory_graph'],
-  harness: ['auto_process', 'conversation_save', 'digest_run', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save'],
+  agent: ['memory_search', 'memory_get', 'memory_recent', 'memory_index', 'fact_search', 'memory_graph', 'event_search'],
+  harness: ['auto_process', 'conversation_save', 'digest_run', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'events_ingest'],
   admin: ['memory_list', 'stats_get', 'recent_conversations', 'daily_summary_data', 'reflect_analyze', 'reflect_apply', 'memory_context', 'context_get', 'project_list', 'project_create', 'instruction_list', 'instruction_delete', 'consolidate_deep'],
 };
 
@@ -653,7 +654,7 @@ register(
       }
       head.push(`【当前记忆上下文】总记忆 ${stats.c} 条。请优先参考以下记忆,它们是之前会话沉淀的事实与经验:`);
       head.push(packed.text);
-      head.push(`\n【要求】以上记忆来自用户的真实历史,与当前任务相关时请直接使用,不要重新询问用户已知信息。`);
+      head.push(`\n【要求】以上记忆来自用户的真实历史,与当前任务相关时请直接使用,不要重新询问用户已知信息。若问题涉及"上次是怎么修的/跑了什么命令/哪里报错",用 event_search 查已执行过的工具调用。`);
       const promptText = head.join('\n');
 
       const bundle = {
@@ -718,6 +719,7 @@ register(
         byCategory: Object.entries(byCategory).map(([category, c]) => ({ category, c })),
         bySource: Object.entries(bySource).map(([source, c]) => ({ source, c })),
         byMemType: Object.entries(byMemType).map(([mem_type, c]) => ({ mem_type, c })),
+        events: (() => { try { return eventStats(proj, 7); } catch { return null; } })(),
         characterId: CHAR_ID,
         project: proj,
       });
@@ -843,6 +845,61 @@ register(
         },
       });
     } catch (e: any) { return err(e.message, 'GET_FAILED'); }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════
+// 工具事件（A-1）：harness 写入，agent 检索
+//   ingest 由 hooks/导入脚本调用；search 让 agent 回答"上次是怎么修好的"。
+// ═══════════════════════════════════════════════════════════════════
+
+register(
+  'events_ingest', 'harness',
+  '[Internal] Ingest tool-call events (command, exit code, error head, duration) so they become searchable. Never stores full output. Deduped by callId.',
+  {
+    events: z.array(z.object({
+      toolName: z.string().describe('Tool name, e.g. terminal / patch / execute_code'),
+      callId: z.string().nullish().describe('Provider tool-call id (dedupe key)'),
+      argsDigest: z.string().nullish().describe('Command line or short args summary (<=600 chars)'),
+      exitCode: z.number().nullish(),
+      status: z.enum(['ok', 'error', 'unknown']).nullish(),
+      errorHead: z.string().nullish().describe('First line of the error, <=200 chars'),
+      resultChars: z.number().nullish(),
+      sessionId: z.string().nullish(),
+      turnId: z.string().nullish(),
+      at: z.string().nullish().describe('ISO timestamp of the call'),
+      durationMs: z.number().nullish(),
+    })).max(200),
+    project: z.string().optional(),
+    characterId: z.string().optional(),
+  },
+  async (args) => {
+    try {
+      const r = ingestEvents(args.events as any, { project: args.project, characterId: args.characterId });
+      return ok({ op: 'events_ingest', ...r });
+    } catch (e: any) { return err(e.message, 'EVENTS_INGEST_FAILED'); }
+  }
+);
+
+register(
+  'event_search', 'agent',
+  'Search executed tool calls (commands, exit codes, errors) by keyword. Use when asked "how did we fix X", "which command did I run", "what broke". Returns one line per call, not full output.',
+  {
+    query: z.string().optional().describe('Keyword(s); omit to get the most recent events'),
+    tool: z.string().optional().describe('Filter by tool name, e.g. terminal'),
+    sessionId: z.string().optional(),
+    since: z.string().optional().describe('ISO datetime lower bound'),
+    limit: z.number().optional().describe('Max results (default 10, cap 50)'),
+    project: z.string().optional(),
+  },
+  async (args) => {
+    try {
+      const r = searchEvents(args.query || '', {
+        project: args.project, tool: args.tool, sessionId: args.sessionId,
+        since: args.since, limit: args.limit,
+      });
+      return ok({ op: 'event_search', mode: r.mode, count: r.rows.length, results: r.rows });
+    } catch (e: any) { return err(e.message, 'EVENT_SEARCH_FAILED'); }
   }
 );
 
