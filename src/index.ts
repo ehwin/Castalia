@@ -23,9 +23,13 @@ import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnan
 import { autoProcess } from './autoProcessor.js';
 import { runAutoReflect, runDeepReflect, shouldAutoReflect, runConsolidate, shouldAutoConsolidate, AUTO_REFLECT_LIMIT } from './reflectDriver.js';
 import { ensureSeedInstructions, saveInstruction, getInstruction, listInstructions, deleteInstruction } from './instructions.js';
-import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject } from './env.js';
+import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject, isEmbedEnabled } from './env.js';
 import { MEM_TYPES, MEM_TYPE_LABELS, summarizeForIndex } from './memType.js';
 import { parseTagsSafe } from './tags.js';
+import { packContext, deriveCaps, type PackSection } from './contextPack.js';
+
+/** memory_context 的总字符预算（v1.24：从"盲切"改成按段配额装箱；超预算按优先级整条裁） */
+const PROMPT_BUDGET = Number(process.env.MEMORY_CONTEXT_BUDGET || 24000);
 
 console.log = console.error;
 
@@ -519,18 +523,14 @@ register(
         .reduce((n, r) => n + (r.c || 0), 0);
       const stats = { c: total };
 
-      // 5. Ground Truth 提示词组装(指令分节在最前面)
-      const sections: string[] = [];
-      if (instructions.length > 0) {
-        const lines = instructions.map(i => {
-          const base = i.scope === 'global' ? '[全局]' : i.scope === 'user' ? '[用户]' : '[项目]';
-          const pathTag = i.paths && i.paths.length ? ` ${i.paths.join(', ')}` : '';
-          return `${base}${pathTag} ${i.content}`;
-        });
-        sections.push(`【指令(全局→项目,项目约束最高)】\n${lines.join('\n')}`);
-      }
+      // 5. 上下文装箱（v1.24 / A-2）
+      //    旧实现：所有段拼成一个大字符串，超限 `slice(0, 24000)` —— 段序决定"谁先死"，
+      //    实测最先被砍的正是"经验沉淀/已知事实/索引"，而且砍在句子中间。
+      //    新实现（contextPack.packContext）：按权重分配段配额 → 按条整条裁 → 同一来源跨段只渲染一次。
+      const caps = deriveCaps(PROMPT_BUDGET);
+      const parts: PackSection[] = [];
 
-      // 0.5 会话滚动状态(可选 sessionId):渐进式临时反思的滚动快照注入
+      // 0.5 会话滚动状态（可选 sessionId）
       if (args.sessionId) {
         const sess = db.prepare(`
           SELECT text FROM memory
@@ -538,15 +538,14 @@ register(
           ORDER BY updated_at DESC LIMIT 1
         `).get(proj, args.sessionId) as any;
         if (sess?.text) {
-          sections.push(`\n■ 会话滚动状态(会话 ${args.sessionId},以此为准,勿重复询问):`);
-          sections.push(sess.text);
+          parts.push({
+            key: 'session', title: `会话滚动状态(会话 ${args.sessionId},以此为准,勿重复询问):`,
+            priority: 2, cap: caps.session, items: [{ packetKey: null, lines: [String(sess.text)] }],
+          });
         }
       }
 
-      sections.push(`【当前记忆上下文】总记忆 ${stats.c} 条。请优先参考以下记忆,它们是之前会话沉淀的事实与经验:`);
-
-      // v1.15: 用户偏好段(带触发条件,score_priority 排序,最先展示)
-      // user 偏好独立成库;跨库聚合后再排序取前 8。
+      // v1.15: 用户偏好段（带触发条件，score_priority 排序，最先展示）
       const prefs = DatabaseManager.queryAll<any>(proj, `
         SELECT text, metadata, score_priority, importance FROM memory
         WHERE is_active = 1 AND project = ? AND type = 'preference' AND mem_type = 'user'
@@ -554,92 +553,124 @@ register(
       `, [proj]).sort((a, b) => (Number(b.score_priority || 0) - Number(a.score_priority || 0))
         || (Number(b.importance || 0) - Number(a.importance || 0))).slice(0, 8);
       if (prefs.length > 0) {
-        sections.push(`\n■ 用户偏好(跨会话行为指令,优先遵守):`);
-        prefs.forEach((p: any, i: number) => {
-          let ctxLine = '';
-          try {
-            const meta = JSON.parse(p.metadata || '{}');
-            const oc = meta.originContext;
-            if (oc) {
-              const parts: string[] = [];
-              if (oc.trigger) parts.push(`触发:${oc.trigger}`);
-              if (oc.applicableWhen) parts.push(`适用:${oc.applicableWhen}`);
-              if (oc.notApplicableWhen) parts.push(`不适用:${oc.notApplicableWhen}`);
-              if (parts.length) ctxLine = ` (${parts.join(';')})`;
-            }
-          } catch { /* metadata 非 JSON 忽略 */ }
-          sections.push(`${i + 1}. ${String(p.text || '').replace(/^# .*\n/, '')}${ctxLine}`);
+        parts.push({
+          key: 'prefs', title: '用户偏好(跨会话行为指令,优先遵守):', priority: 1, cap: caps.prefs,
+          items: prefs.map((p: any, i: number) => {
+            let ctxLine = '';
+            try {
+              const meta = JSON.parse(p.metadata || '{}');
+              const oc = meta.originContext;
+              if (oc) {
+                const bits: string[] = [];
+                if (oc.trigger) bits.push(`触发:${oc.trigger}`);
+                if (oc.applicableWhen) bits.push(`适用:${oc.applicableWhen}`);
+                if (oc.notApplicableWhen) bits.push(`不适用:${oc.notApplicableWhen}`);
+                if (bits.length) ctxLine = ` (${bits.join(';')})`;
+              }
+            } catch { /* metadata 非 JSON 忽略 */ }
+            return { packetKey: null, lines: [`${i + 1}. ${String(p.text || '').replace(/^# .*\n/, '')}${ctxLine}`] };
+          }),
         });
       }
 
+      // 近期重要记忆
       if (recent.length > 0) {
-        sections.push(`\n■ 近期重要记忆(近 ${hoursBack} 小时):`);
-        recent.forEach((m: any, i: number) => {
-          sections.push(`${i + 1}. [${m.category}] ${m.text}${m.importance >= 0.8 ? ' (重要)' : ''}`);
-          const warn = memorySnapshotWarn(m.createdAt);
-          if (warn) sections.push(`  ${warn}`);
+        parts.push({
+          key: 'recent', title: `近期重要记忆(近 ${hoursBack} 小时):`, priority: 4, cap: caps.recent,
+          items: recent.map((m: any, i: number) => {
+            const lines = [`${i + 1}. [${m.category}] ${m.text}${m.importance >= 0.8 ? ' (重要)' : ''}`];
+            const warn = memorySnapshotWarn(m.createdAt);
+            if (warn) lines.push(`  ${warn}`);
+            return { packetKey: m.parentId || m.id || null, lines };
+          }),
         });
       }
 
+      // 与当前任务相关
       if (related.length > 0) {
-        sections.push(`\n■ 与当前任务相关:「${args.query}」`);
-        related.forEach((m: any, i: number) => {
-          sections.push(`${i + 1}. [${m.category}] ${m.text}`);
-          const warn = memorySnapshotWarn(m.createdAt);
-          if (warn) sections.push(`  ${warn}`);
+        parts.push({
+          key: 'related', title: `与当前任务相关:「${args.query}」`, priority: 3, cap: caps.related,
+          items: related.map((m: any, i: number) => {
+            const lines = [`${i + 1}. [${m.category}] ${m.text}`];
+            const warn = memorySnapshotWarn(m.createdAt);
+            if (warn) lines.push(`  ${warn}`);
+            return { packetKey: (m as any).parentId || m.id || null, lines };
+          }),
         });
       }
 
+      // 原文回捞（命中的是提炼记忆，这里是它对应的对话原文）
       if (hydrated.length > 0) {
-        sections.push(`\n■ 原文回捞（上面命中的是提炼记忆，以下是它对应的对话原文，用于核对细节）:`);
-        hydrated.forEach((h, i) => sections.push(`${i + 1}. (来源 ${h.parentId.slice(0, 8)}，命中比 ${h.ratio}${h.mode === 'full' ? '，整段' : h.mode === 'head' ? '，锚点未命中取开头' : '，命中片段'}) ${h.excerpt}`));
+        parts.push({
+          key: 'hydrated', title: '原文回捞（上面命中的是提炼记忆，以下是它对应的对话原文，用于核对细节）:',
+          priority: 7, cap: caps.hydrated,
+          items: hydrated.map((h, i) => ({
+            packetKey: h.parentId,
+            lines: [`${i + 1}. (来源 ${h.parentId.slice(0, 8)}，命中比 ${h.ratio}${h.mode === 'full' ? '，整段' : h.mode === 'head' ? '，锚点未命中取开头' : '，命中片段'}) ${h.excerpt}`],
+          })),
+        });
       }
 
+      // 经验沉淀
       if (cognitives.length > 0) {
-        sections.push(`\n■ 经验沉淀(决策/错误/模式):`);
-        cognitives.forEach((m: any, i: number) => {
-          const tag = m.category === 'mistake' ? '⚠️教训' : m.category === 'decision' ? '🎯决策' : '📐模式';
-          sections.push(`${i + 1}. ${tag} ${m.text}`);
+        parts.push({
+          key: 'cognitives', title: '经验沉淀(决策/错误/模式):', priority: 5, cap: caps.cognitives,
+          items: cognitives.map((m: any, i: number) => {
+            const tag = m.category === 'mistake' ? '⚠️教训' : m.category === 'decision' ? '🎯决策' : '📐模式';
+            return { packetKey: null, lines: [`${i + 1}. ${tag} ${m.text}`] };
+          }),
         });
       }
 
+      // 已知事实
       if (facts.length > 0) {
-        sections.push(`\n■ 已知事实:`);
-        facts.forEach((f: any, i: number) => {
-          sections.push(`${i + 1}. ${f.subject} — ${f.predicate}: ${f.object}`);
+        parts.push({
+          key: 'facts', title: '已知事实:', priority: 6, cap: caps.facts,
+          items: facts.map((f: any, i: number) => ({ packetKey: null, lines: [`${i + 1}. ${f.subject} — ${f.predicate}: ${f.object}`] })),
         });
       }
 
+      // 记忆索引（先索引后详情）
       if (indexLayer.length > 0) {
-        sections.push(`\n■ 记忆索引(仅摘要,详情用 memory_get(id) 展开):`);
-        indexLayer.forEach((m: any, i: number) => {
-          sections.push(`${i + 1}. [${m.memType}] ${m.summary} (id: ${m.id})`);
+        parts.push({
+          key: 'index', title: '记忆索引(仅摘要,详情用 memory_get(id) 展开):', priority: 8, cap: caps.index,
+          items: indexLayer.map((m: any, i: number) => ({ packetKey: m.id, lines: [`${i + 1}. [${m.memType}] ${m.summary} (id: ${m.id})`] })),
         });
       }
 
-      sections.push(`\n【要求】以上记忆来自用户的真实历史,与当前任务相关时请直接使用,不要重新询问用户已知信息。`);
+      const packed = packContext(parts, { totalBudget: PROMPT_BUDGET });
 
-      // v1.23.1-fix: 总预算封顶，避免任意调用方把整库灌进 prompt
-      const PROMPT_BUDGET = 24000;
-      let promptText = sections.join('\n');
-      if (promptText.length > PROMPT_BUDGET) {
-        promptText = promptText.slice(0, PROMPT_BUDGET) + `\n…（已截断，原始 ${sections.join('\n').length} 字，必要时用 memory_get/memory_search 精确取）`;
+      // 指令段不进装箱器：它是配置不是检索结果，永不裁剪，但同样显示预算
+      const head: string[] = [];
+      if (instructions.length > 0) {
+        const lines = instructions.map(i => {
+          const base = i.scope === 'global' ? '[全局]' : i.scope === 'user' ? '[用户]' : '[项目]';
+          const pathTag = i.paths && i.paths.length ? ` ${i.paths.join(', ')}` : '';
+          return `${base}${pathTag} ${i.content}`;
+        });
+        const insChars = lines.reduce((n, l) => n + l.length + 1, 0);
+        head.push(`【指令(全局→项目,项目约束最高)】 characters="${insChars}/${PROMPT_BUDGET}"\n${lines.join('\n')}`);
       }
+      head.push(`【当前记忆上下文】总记忆 ${stats.c} 条。请优先参考以下记忆,它们是之前会话沉淀的事实与经验:`);
+      head.push(packed.text);
+      head.push(`\n【要求】以上记忆来自用户的真实历史,与当前任务相关时请直接使用,不要重新询问用户已知信息。`);
+      const promptText = head.join('\n');
 
       const bundle = {
         prompt: promptText,
         instructions,
-        recent: recent.map(m => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
+        recent: recent.map((m: any) => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
         related,
         hydrated,
-        cognitives: cognitives.map(m => ({ text: m.text, category: m.category })),
+        cognitives: cognitives.map((m: any) => ({ text: m.text, category: m.category })),
         facts,
         index: indexLayer,
-        stats: { total: stats.c },
+        stats: { total: stats.c, chars: promptText.length, budget: PROMPT_BUDGET, evicted: packed.evicted, sections: packed.sections },
         injectedAt: new Date().toISOString(),
       };
 
       return ok(args.asText === false ? bundle : { prompt: bundle.prompt });
+
     } catch (e: any) { return err(e.message); }
   }
 );
@@ -656,9 +687,19 @@ register(
       const byCategory: Record<string, number> = {};
       const bySource: Record<string, number> = {};
       const byMemType: Record<string, number> = {};
+      // v1.24: 向量覆盖率必须可见。实测 hermes 库 735 条 active 只有 465 条有向量（63%），
+      // 用户画像库 91 条里只有 4 条 —— 语义检索对这些内容系统性失效，但以前没有任何地方能看出来。
+      let vecMissing = 0;
+      let vecTotal = 0;
       for (const mt of DatabaseManager.existingMemTypes(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
         total += (db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj) as any).c;
+        try {
+          const miss = (db.prepare(`SELECT COUNT(*) as c FROM memory m
+            WHERE m.is_active=1 AND m.project=? AND m.rowid NOT IN (SELECT rowid FROM vec_memory)`).get(proj) as any).c;
+          vecMissing += miss;
+          vecTotal += (db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj) as any).c;
+        } catch { /* 无 vec 表 */ }
         for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY category').all(proj) as any[]) {
           byCategory[r.category] = (byCategory[r.category] || 0) + r.c;
         }
@@ -672,6 +713,8 @@ register(
       return ok({
         op: 'stats',
         total,
+        vecMissing,
+        vecCoverage: vecTotal > 0 ? Math.round((1 - vecMissing / vecTotal) * 1000) / 1000 : 1,
         byCategory: Object.entries(byCategory).map(([category, c]) => ({ category, c })),
         bySource: Object.entries(bySource).map(([source, c]) => ({ source, c })),
         byMemType: Object.entries(byMemType).map(([mem_type, c]) => ({ mem_type, c })),
@@ -725,10 +768,11 @@ register(
 
 register(
   'memory_get', 'agent',
-  'Get one memory by ID with full text. Use to expand a search/recent/list result.',
+  'Get one memory by ID with full text. Use to expand a search/recent/list result. When the memory is a merge result, its sources are attached; when it was superseded, the successor is attached.',
   {
     id: z.string().describe('Memory ID'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    includeInactive: z.boolean().optional().describe('Also resolve memories that were superseded/merged away (is_active=0). Use to audit history.'),
   },
   async (args) => {
     try {
@@ -738,13 +782,40 @@ register(
       let row: any = null;
       for (const mt of DatabaseManager.existingMemTypes(proj)) {
         const d = DatabaseManager.getInstance(proj, mt);
-        const r = d.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(args.id) as any;
+        const r = d.prepare(`SELECT * FROM memory WHERE id = ? ${args.includeInactive ? '' : 'AND is_active = 1'}`).get(args.id) as any;
         if (r) { db = d; row = r; break; }
       }
       if (!row) return err('memory not found: ' + args.id, 'NOT_FOUND');
       // v1.3: 访问一次 → 热度 +1(配合热度升格:accessed_count ≥ 阈值自动升 tier)
       db.prepare('UPDATE memory SET accessed_count = accessed_count + 1, last_accessed_at = ? WHERE id = ?')
         .run(new Date().toISOString(), args.id);
+      // v1.24 (C-2): 血缘展开。合并结果必须能列出它吃掉了谁；被取代的行必须能指向取代者。
+      // 只做只读旁证，不改主查询语义（默认仍只返回 active）。
+      const parseIds = (raw: any): string[] => {
+        try { const v = JSON.parse(String(raw || '[]')); return Array.isArray(v) ? v.filter((x: any) => typeof x === 'string') : []; } catch { return []; }
+      };
+      const lineage: any = {};
+      const mergedFrom = parseIds(row.merged_from);
+      if (mergedFrom.length > 0) {
+        let quotes: { id: string; q: string }[] = [];
+        try { const q = JSON.parse(String(row.merged_quotes || '[]')); quotes = Array.isArray(q) ? q : []; } catch { /* 引证坏掉不影响展开 */ }
+        const srcRows = DatabaseManager.queryAll<any>(proj,
+          `SELECT id, substr(text,1,400) AS excerpt, created_at, is_active FROM memory WHERE id IN (${mergedFrom.map(() => '?').join(',')})`,
+          mergedFrom);
+        lineage.mergedFrom = mergedFrom.map(id => {
+          const r = srcRows.find(x => x.id === id);
+          return {
+            id,
+            excerpt: r?.excerpt ?? null,
+            createdAt: r?.created_at ?? null,
+            isActive: r ? !!r.is_active : null,
+            quote: quotes.find(q => q.id === id)?.q ?? null,
+          };
+        });
+      }
+      if (row.merged_into) lineage.mergedInto = row.merged_into;
+      if (row.expired_at) lineage.expiredAt = row.expired_at;
+      if (row.valid_at) lineage.validAt = row.valid_at;
       return ok({
         op: 'get',
         result: {
@@ -761,6 +832,9 @@ register(
           subject: row.subject,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
+          status: row.status || null,
+          isActive: !!row.is_active,
+          lineage: Object.keys(lineage).length ? lineage : null,
           metadata: {
             accessedCount: row.accessed_count + 1,
             referenceCount: row.reference_count,
@@ -1190,6 +1264,36 @@ async function main() {
     if (swept > 0) console.error(`[session-memory] TTL 清扫: ${swept} 条过期会话记忆已清除`);
   } catch (e: any) {
     console.error('[session-memory] TTL 清扫失败:', e.message);
+  }
+
+  // v1.24 (P0): 启动时补齐缺失向量。
+  // promoteToProject 刻意不嵌（后台反思不依赖嵌入服务），代价是晋升出来的记忆要等
+  // reflect_batch_embed 才可语义检索 —— 实测 hermes 库 63%、user 库 4/91 有向量。
+  // 这里在启动后异步补一次，不阻塞 MCP 就绪；失败只记日志。
+  if (process.env.CASTALIA_BACKGROUND_TASKS !== '0' && isEmbedEnabled()) {
+    setTimeout(() => {
+      (async () => {
+        try {
+          let total = 0;
+          const projects = [...new Set([PROJECT_ID, ...listProjectNames()])];
+          // batchEmbedPending 单个库单轮上限 200 条，缺失可能更多 —— 循环到没有进展为止。
+          for (let round = 1; round <= 12; round++) {
+            let progressed = 0;
+            for (const p of projects) {
+              const r = await batchEmbedPending('any', p, { paceMs: 120, resetFailures: round === 1 });
+              progressed += r.embedded;
+              if (r.errors.length) console.error(`[vec-backfill] ${p}: ${r.errors.length} 条失败（首条 ${r.errors[0]}）`);
+            }
+            total += progressed;
+            if (progressed === 0) break;
+            console.error(`[vec-backfill] 第 ${round} 轮补齐 ${progressed} 条`);
+          }
+          console.error(`[vec-backfill] 完成，本次共补 ${total} 条`);
+        } catch (e: any) {
+          console.error('[vec-backfill] 失败:', e.message);
+        }
+      })();
+    }, 8000);
   }
 
   // Agent state: nothing to flush (in-memory only)

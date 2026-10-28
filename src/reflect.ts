@@ -295,10 +295,13 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
     };
     try {
       action = { ...action };
-      // v1.23-fix: 整合模式放行 merge（合并结果落库后再软删源，内容可回查）；其余破坏性动作照旧禁止。
-      const mergeAllowedByConsolidation = options.consolidation === true && action.action === 'merge';
+      // v1.24 (C-1): 取消 consolidation 对 merge 的豁免。
+      // 旧实现在 `consolidation===true` 时放行 merge —— 而 consolidate_deep 是启动时自动跑的
+      // （记忆 >15 条即触发），等于"保真策略只约束手动反思"。实测 hermes 库在
+      // preservation=evidence 下仍有 424 条 merge 源死行、最近一次发生在今天 02:36。
+      // 现在：保真库（verbatim 始终 / evidence 自动路径）不得 merge/delete/split；
+      // 手动 reflect_apply 仍可显式作案，但会写 merged_from/merged_quotes/merged_into 留痕（见 merge 分支）。
       if ((protectedReflectionProject(project) || (options.automatic && reflectionPolicy(project) === 'evidence')) &&
-          !mergeAllowedByConsolidation &&
           (['merge', 'delete', 'split', 'identityUpdate'].includes(action.action) || (action.action === 'reclassify' && action.newText !== undefined))) {
         throw new Error('preservation policy forbids destructive reflection actions');
       }
@@ -370,18 +373,52 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             project,
             source: 'reflect_merge',
           });
+          // ═══ v1.24 (C-2) 血缘：合并必须可追溯，源行不得静默消失 ═══
+          // Graphiti EntityEdge 语义的本地化：
+          //   结果行 → merged_from(源 id 列表) + merged_quotes(逐字引证) + valid_at/reference_time
+          //   源行   → is_active=0 + status='superseded' + expired_at + merged_into(反向指针)
+          // 向量**保留**（旧实现 DELETE FROM vec_memory，导致源行即使按 id 也取不回原文的可检索性）。
+          const nowIso = new Date().toISOString();
+          // 合并前先把源正文读出来：既能算引证，也能在写失败时保持可复述。
+          const srcTexts = mergeSources
+            .filter(s => s.id !== merged.id)
+            .map(s => {
+              const row = s.db.prepare('SELECT text, created_at FROM memory WHERE id = ?').get(s.id) as any;
+              return { id: s.id, text: String(row?.text || ''), createdAt: String(row?.created_at || '') };
+            });
+          // 引证：每条源取"首个 ≥24 字、≤160 字的连续片段"，最多 3 条。子串天然成立（就是切出来的），
+          // 但写入前仍做一次 includes 校验，防止 normalizeMarkdown 之类的重写让引证与源脱钩。
+          const quotes: { id: string; q: string }[] = [];
+          for (const s of srcTexts) {
+            if (quotes.length >= 3) break;
+            const flat = s.text.replace(/\s+/g, ' ').trim();
+            const m = /[^。；！？.!?\n]{24,160}/.exec(flat);
+            const q = (m ? m[0] : flat.slice(0, 120)).trim();
+            if (!q || q.length < 24) continue;
+            if (!flat.includes(q)) continue;
+            quotes.push({ id: s.id, q });
+          }
+          const validAt = srcTexts.map(s => s.createdAt).filter(Boolean).sort()[0] || nowIso;
+          try {
+            const mergedDb = memDbFor(merged.id, project, db);
+            mergedDb.prepare(`UPDATE memory SET merged_from = ?, merged_quotes = ?, valid_at = ?, reference_time = ? WHERE id = ?`)
+              .run(JSON.stringify(srcTexts.map(s => s.id)), JSON.stringify(quotes), validAt, validAt, merged.id);
+          } catch (e: any) {
+            console.error('[reflect] merge 血缘写入失败（合并结果仍有效）:', e.message);
+            receipt.reason = `provenance: ${e.message}`;
+          }
           receipt.rowsAffected = mergeSources.length;
-          // 所有源均已确认 active 且合并结果已落库后，才软删除并清理向量。
+          // 所有源均已确认 active 且合并结果已落库后，才标记取代（软失效，不删行、不删向量）。
+          let superseded = 0;
           for (const src of mergeSources) {
             if (src.id === merged.id) continue;
-            src.db.prepare('UPDATE memory SET is_active = 0 WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0').run(src.id);
-            try {
-              const row = src.db.prepare('SELECT rowid FROM memory WHERE id = ?').get(src.id) as any;
-              if (row) src.db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(row.rowid);
-            } catch { /* 无向量时不阻断合并 */ }
+            superseded += src.db.prepare(
+              `UPDATE memory SET is_active = 0, status = 'superseded', expired_at = ?, merged_into = ?
+               WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0`
+            ).run(nowIso, merged.id, src.id).changes;
           }
           if (receipt.status === 'applied') result.applied++;
-          result.details.push(`merge: ${action.sourceIds.length} → 1`);
+          result.details.push(`merge: ${action.sourceIds.length} → 1（superseded ${superseded}，引证 ${quotes.length}）`);
           break;
         }
 

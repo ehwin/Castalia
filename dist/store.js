@@ -464,7 +464,7 @@ export async function reEmbedMemory(id, project) {
  * v1.5: 支持按项目隔离 — 传 project 只处理该项目;不传则默认项目
  * 扫描 is_active=1 但 vec_memory 中无对应向量的记录
  */
-export async function batchEmbedPending(characterId = 'airi', project) {
+export async function batchEmbedPending(characterId = 'airi', project, opts = {}) {
     if (!isEmbedEnabled())
         return { embedded: 0, embeddedFacts: 0, errors: ['embedding disabled (EMBED_MODE=none)'] };
     const proj = normalizeProject(project);
@@ -474,6 +474,18 @@ export async function batchEmbedPending(characterId = 'airi', project) {
     // memdir:遍历项目全部分类库补嵌入
     for (const mt of DatabaseManager.existingMemTypes(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
+        // v1.24: 嵌入空间切换后，旧空间留下的失败计数没有意义（失败原因已不存在），
+        // 否则这些行会被 COALESCE(embed_fail_count,0) < 3 永久挡在窗口外 —— 实测本机 190 条
+        // 卡在 fc=3，覆盖率永远是 74%。resetFailures 只清"没有向量"的行，不会掩盖真错误：
+        // 每轮重新失败一样会被重新计数。
+        if (opts.resetFailures) {
+            try {
+                db.prepare(`UPDATE memory SET embed_fail_count = 0
+        WHERE COALESCE(embed_fail_count, 0) >= 3
+          AND rowid NOT IN (SELECT rowid FROM vec_memory)`).run();
+            }
+            catch { /* 旧库无列 */ }
+        }
         // 找所有有记忆但无向量的记录(source 为 NULL 也算,修复 NULL != 'x' 恒假的坑)
         // characterId='any' 时不按角色过滤(跨库产物如 reflect 库 character_id 为 NULL 也能补嵌入)
         const conditions = [
@@ -500,18 +512,49 @@ export async function batchEmbedPending(characterId = 'airi', project) {
         for (const row of pending) {
             try {
                 const vec = new Float32Array(await embed(row.text, project));
+                // v1.24: 先删后插 —— 多个引擎共用一个库时（bridge 各自起进程），
+                // 补历史欠账会并发插同一个 rowid，直接 INSERT 会撞
+                // "UNIQUE constraint failed on vec_memory primary key"（本机实测 165 条）。
+                // 行已被别的进程补上时，这次覆盖是同值，无害。
+                try {
+                    db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(BigInt(row.rowid));
+                }
+                catch { /* 无 vec 表 */ }
                 db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(row.rowid), vec);
                 db.prepare('UPDATE memory SET embed_fail_count = 0 WHERE rowid = ?').run(row.rowid);
                 embedded++;
             }
             catch (e) {
-                // 失败重试 3 次后跳过，避免坏记录永久堵住窗口
-                try {
-                    db.prepare('UPDATE memory SET embed_fail_count = COALESCE(embed_fail_count, 0) + 1 WHERE rowid = ?').run(row.rowid);
+                // v1.24: 并发/重入时 rowid 可能已被别人补上 —— 只要现在有向量就算成功，
+                // 不要把它记成失败（否则 embed_fail_count 被无谓推到 3，窗口永久跳过）。
+                const dup = /UNIQUE constraint failed on vec_memory/i.test(String(e.message));
+                let nowHasVec = false;
+                if (dup) {
+                    try {
+                        nowHasVec = !!db.prepare('SELECT rowid FROM vec_memory WHERE rowid = ?').get(BigInt(row.rowid));
+                    }
+                    catch { /* 忽略 */ }
                 }
-                catch { /* 旧库无列 */ }
-                errors.push(`${row.id}: ${e.message}`);
+                if (nowHasVec) {
+                    try {
+                        db.prepare('UPDATE memory SET embed_fail_count = 0 WHERE rowid = ?').run(row.rowid);
+                    }
+                    catch { /* 旧库无列 */ }
+                    embedded++;
+                }
+                else {
+                    // 失败重试 3 次后跳过，避免坏记录永久堵住窗口
+                    try {
+                        db.prepare('UPDATE memory SET embed_fail_count = COALESCE(embed_fail_count, 0) + 1 WHERE rowid = ?').run(row.rowid);
+                    }
+                    catch { /* 旧库无列 */ }
+                    errors.push(`${row.id}: ${e.message}`);
+                }
             }
+            // v1.24: 补历史欠账时是连续几百次请求，远端 API 会 429（表现为 fetch failed）。
+            // 加一点间隔比调大重试次数便宜；正常写入路径默认 0 延迟，不受影响。
+            if (opts.paceMs && opts.paceMs > 0)
+                await new Promise(r => setTimeout(r, opts.paceMs));
         }
     }
     // v1.21: facts 补嵌入 —— saveFacts 只在写入那一刻嵌,历史 facts 会永远缺向量(fact_search 的 KNN 搜不到)

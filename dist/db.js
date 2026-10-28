@@ -610,6 +610,41 @@ export function initProjectSchema(db) {
         db.exec(`ALTER TABLE facts ADD COLUMN evidence TEXT`);
     }
     catch (_e) { /* already exists */ }
+    // v1.24 记忆血缘（Graphiti EntityEdge 语义）：合并必须可追溯，旧行不得消失
+    //   valid_at       事实/记忆何时开始成立
+    //   expired_at     何时被系统取代（soft supersede，与"事实不再成立"区分）
+    //   reference_time 产生它的来源时间（用于相对日期归一）
+    //   merged_from    这条合并结果吃掉了哪些 id（JSON 数组）
+    //   merged_quotes  合并结果的逐字引证（JSON 数组，写入时做子串校验）
+    //   merged_into    反向指针：这条被谁取代（旧行 → 新行）
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN valid_at DATETIME`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN expired_at DATETIME`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN reference_time DATETIME`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN merged_from TEXT`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN merged_quotes TEXT`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN merged_into TEXT`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_merged_into ON memory(merged_into)`);
+    }
+    catch (_e) { }
     // v1.23.1: 衰减基线。importance 会被 consolidate 按年龄衰减；如果每次都在“已衰减值”上再乘一次，
     // 衰减速度就取决于 consolidate 跑了几次而不是记忆多老（实测 61 天 0.9 分 7 次运行后跌破阈值被删）。
     // base_importance 保存原始值，衰减永远从基线算；触发器覆盖所有 INSERT 路径。
