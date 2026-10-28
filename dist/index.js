@@ -457,7 +457,7 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         // 4.5 记忆索引层(4 种封闭类型,轻量摘要 — 对应 Claude Code MEMORY.md,先索引后详情)
         //     这 4 类各自独立成库,必须跨库聚合;只读 general 会恒空。
         const indexRows = DatabaseManager.queryAll(proj, `
-        SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len, updated_at
+        SELECT id, mem_type, substr(text, 1, 400) AS summary, length(text) AS full_len, updated_at
         FROM memory
         WHERE is_active = 1 AND project = ?
           AND mem_type IN ('user','feedback','project','reference')
@@ -465,11 +465,11 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         LIMIT 10
       `, [proj]).sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || ''))).slice(0, 10);
         const indexLayer = indexRows.map((row) => {
-            const s = row.summary || '';
             return {
                 id: row.id,
                 memType: row.mem_type || 'general',
-                summary: row.full_len > 150 ? summarizeForIndex(s, 149) : s,
+                // v1.24/B-1': 去样板 + 去重复标题行 + 就近分句收尾（不用 LLM 生成描述）
+                summary: summarizeForIndex(row.summary, 150),
             };
         });
         // 0. 三层指令记忆(全局→用户→项目;拼接顺序 L1→L2→L3,L3 在 Prompt 末尾约束最高)
@@ -925,7 +925,7 @@ register('memory_index', 'agent', 'Lightweight memory index (corresponds to Clau
         params.push(limit);
         // 索引层跨 5 个分类库聚合;每库先取 limit,再全局排序截断。
         const rows = DatabaseManager.queryAll(proj, `
-        SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len, updated_at
+        SELECT id, mem_type, substr(text, 1, 400) AS summary, length(text) AS full_len, updated_at
         FROM memory
         WHERE ${conds.join(' AND ')}
         ORDER BY updated_at DESC
@@ -937,7 +937,7 @@ register('memory_index', 'agent', 'Lightweight memory index (corresponds to Clau
             results: rows.map((row) => ({
                 id: row.id,
                 memType: row.mem_type || 'general',
-                summary: row.summary,
+                summary: summarizeForIndex(row.summary, 150),
                 summaryTruncated: row.full_len > 150,
                 updatedAt: row.updated_at,
             })),
