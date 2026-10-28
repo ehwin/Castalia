@@ -1319,6 +1319,24 @@ async function main() {
         setInterval(runOnce, reflectIntervalHours * 3600 * 1000);
         console.error(`[castalia] auto-reflect every ${reflectIntervalHours}h`);
     }
+    // ═══ stdio 管道被对面关掉时的存活保护 (2026-10-28) ═══
+    // stdio 模式下 process.stdout 是个 Socket。客户端(宿主/mcp-proxy)关掉会话后再回写,
+    // 就是 EPIPE,而 Node 对未处理的 'error' 事件是直接抛 —— 进程当场死,端口还在听、
+    // 子进程没了,看护判"空壳桥"重建,顺带把 LobeHub 重启一圈。
+    // 实测: bridge-hermes-bridge.log 里 consolidate 完成后 EPIPE → exit 1,反复发生。
+    // 对面已经走了,这条响应没有接收方,记一行日志即可,不该拿进程陪葬;
+    // 非管道类错误照旧抛出。
+    const guardStdioErrors = (stream, name) => {
+        stream.on('error', (err) => {
+            if (err && (err.code === 'EPIPE' || err.code === 'ECONNRESET' || err.code === 'ERR_STREAM_DESTROYED')) {
+                console.error(`[stdio] ${name} 写入失败(对面已关闭): ${err.code}`);
+                return;
+            }
+            throw err;
+        });
+    };
+    guardStdioErrors(process.stdout, 'stdout');
+    guardStdioErrors(process.stderr, 'stderr');
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error(`[${SERVER_NAME}] v${SERVER_VERSION} started — unified MCP server (proxy + LLM tools)`);
