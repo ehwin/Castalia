@@ -29,9 +29,19 @@ export function parseTagsSafe(raw) {
     if (!Array.isArray(parsed))
         return [];
     // Postcondition enforcement: flatten one level, keep strings only, trim, drop empties.
-    const flattened = parsed.flat(1);
+    return normalizeTags(parsed);
+}
+/**
+ * 数组形态的归一化（不做 JSON 解析）：只接受数组，非数组一律 []。
+ *
+ * parseTagsSafe 的内核；Full 的总反思模块（reflectAll.ts）直接 import 这个函数，
+ * 所以它是 core 与 bus 之间的共享契约，改名/删除会直接让总线编译不过。
+ */
+export function normalizeTags(value) {
+    if (!Array.isArray(value))
+        return [];
     const out = [];
-    for (const item of flattened) {
+    for (const item of value.flat(1)) {
         if (typeof item !== 'string')
             continue;
         const tag = item.trim();

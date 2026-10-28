@@ -214,14 +214,19 @@ export async function applyReflectActions(actions, characterId = 'airi', project
         };
         try {
             action = { ...action };
-            // v1.24 (C-1): 取消 consolidation 对 merge 的豁免。
-            // 旧实现在 `consolidation===true` 时放行 merge —— 而 consolidate_deep 是启动时自动跑的
-            // （记忆 >15 条即触发），等于"保真策略只约束手动反思"。实测 hermes 库在
-            // preservation=evidence 下仍有 424 条 merge 源死行、最近一次发生在今天 02:36。
-            // 现在：保真库（verbatim 始终 / evidence 自动路径）不得 merge/delete/split；
-            // 手动 reflect_apply 仍可显式作案，但会写 merged_from/merged_quotes/merged_into 留痕（见 merge 分支）。
-            if ((protectedReflectionProject(project) || (options.automatic && reflectionPolicy(project) === 'evidence')) &&
-                (['merge', 'delete', 'split', 'identityUpdate'].includes(action.action) || (action.action === 'reclassify' && action.newText !== undefined))) {
+            // v1.24 保真契约（C-1 修正版，与 v1.23-fix 合并后）：
+            //   · verbatim：任何路径都不得改写 —— merge/delete/split/identityUpdate/reclassify(newText) 全拒。
+            //   · evidence + 自动路径（consolidate_deep 启动即跑）：禁止**不可追回**的破坏性动作
+            //     （delete/split/identityUpdate/reclassify-newText）；merge **放行**。
+            // 为什么 merge 放行：v1.23-fix 已经证明"evidence 下拒绝 merge"会让整合退化成
+            // 逐条重摘要（merged 恒 0、净增记忆、token 照烧）；而 C-1 要治的是"无痕"，不是 merge 本身 ——
+            // 现在 merge 强制写 merged_from/merged_quotes，源行标 superseded + merged_into 并保留向量，
+            // 源文可 memory_get(includeInactive) 原样追回。旧实现两者都没做，才留下 424 条死行。
+            const policy = reflectionPolicy(project);
+            const guardActive = policy === 'verbatim' || (options.automatic && policy === 'evidence');
+            const untraceable = ['delete', 'split', 'identityUpdate'].includes(action.action)
+                || (action.action === 'reclassify' && action.newText !== undefined);
+            if (guardActive && (untraceable || (action.action === 'merge' && policy === 'verbatim'))) {
                 throw new Error('preservation policy forbids destructive reflection actions');
             }
             if (action.action === 'reclassify') {

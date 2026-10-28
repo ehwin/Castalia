@@ -6,9 +6,9 @@ Independent, neutral, general-purpose memory component. No personality layer, no
 
 Designed after studying Claude Code's memory architecture (closed memory types, progressive session maintenance, consolidation) and engram / memory-os patterns.
 
-> **Lite edition (this repo):** single-instance memory — no federation / cross-library reflection. If you need the full edition (cross-library `reflect_all` + federation search over `FEDERATION_DIRS`), see **[Castalia-Full](https://github.com/ehwin/Castalia-Full)**. For the emotional variant (agent state / bias layer / emotion-weighted search), see **[Castalia-Anima](https://github.com/ehwin/Castalia-Anima)**.
+> **Lite edition (this repo):** single-instance memory — no federation / cross-library reflection. The bus interface (cross-library `reflect_all` + federation search `memory_search_all` / `federation_members`) is **[Castalia-Full](https://github.com/ehwin/Castalia-Full)**. For the emotional variant (agent state / bias layer / emotion-weighted search), see **[Castalia-Anima](https://github.com/ehwin/Castalia-Anima)**.
 >
-> 架构：**本仓是引擎核心**（Lite）；`Castalia-Full` 是**联邦/跨库总线**（核心 + federation / reflect_all / 聚合星图），`Castalia-Anima` 是情感变体。三者版本由同一个 `VERSION` 统一，核心文件从本仓同步到 Full（`sync_core.py`）。
+> 架构：**本仓是引擎核心**（Lite）；`Castalia-Full` 是**总线接口**（总线 `fedServer` + 总反思 `reflect_all` + 聚合星图），它的引擎核心由本仓同步（`sync_core.py`）、入口由 `port_bus_entry.py` 生成，不独立演进；`Castalia-Anima` 是情感变体，自带一条引擎线与版本号。**版本锚是 Lite**：`Castalia/VERSION` == `Castalia-Full/VERSION`。
 
 > 📖 详细技术设计见 [docs/TECHNICAL.md](docs/TECHNICAL.md)(架构/数据模型/管线/决策记录)。
 
@@ -358,7 +358,7 @@ The 3D view is a **semantic map**, not a decorative layout:
 
 Independent evolution of a memory system; design informed by:
 
-- **[Castalia-Full](https://github.com/ehwin/Castalia-Full)** — full edition of this project (adds cross-library federation `reflect_all`); same neutral core, more tools
+- **[Castalia-Full](https://github.com/ehwin/Castalia-Full)** — the bus interface this core mounts (cross-library `reflect_all` + federation `memory_search_all` / `federation_members`); same neutral core, synced from here
 - **[Castalia-Anima](https://github.com/ehwin/Castalia-Anima)** — the emotional variant (personality layer on the same architecture); the repos cross-pollinate — Anima feeds architecture back into Castalia, Castalia keeps the neutral core stable
 - **Claude Code** (Anthropic) — closed memory types (user/feedback/project/reference), MEMORY.md index, progressive session maintenance, consolidation sub-agent, snapshot warnings (patterns re-implemented in SQLite)
 - **engram** — profile-gated tool exposure, setup script

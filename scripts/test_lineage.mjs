@@ -22,7 +22,7 @@ process.env.EMBED_MODE = 'none';
 process.env.MCP_TOOLS = 'all';
 
 fs.writeFileSync(process.env.MEMORY_CONFIG, JSON.stringify({
-  reflect: { preservation: 'evidence', projectPolicies: { p_std: 'standard' } },
+  reflect: { preservation: 'evidence', projectPolicies: { p_std: 'standard', p_verb: 'verbatim' } },
   embedding: { mode: 'none' },
 }, null, 1), 'utf8');
 
@@ -61,23 +61,49 @@ const hasVec = (project, memType, id) => {
   try { return !!db.prepare('SELECT rowid FROM vec_memory WHERE rowid = ?').get(BigInt(r.rowid)); } catch { return false; }
 };
 
-console.log(`\n== C-1：保真策略必须拦住 automatic merge（临时库 ${TMP}）==`);
+console.log(`\n== C-1：保真契约分层（verbatim 全拒 / evidence 只拒不可追回的动作）==`);
 {
   const t1 = '用户偏好：报告先给结论，再给过程，不要铺垫。';
-  const t2 = '用户偏好：改动必须以真实命令输出为证据，不接受“看起来对”。';
+  const t2 = '用户偏好：改动必须以真实命令输出为证据，不接受"看起来对"。';
   const a = await saveMemory({ text: t1, memType: 'user', category: 'preference', project: 'p_ev', characterId: 'test' });
   const b = await saveMemory({ text: t2, memType: 'user', category: 'preference', project: 'p_ev', characterId: 'test' });
-  const res = await applyReflectActions(
+
+  // (1) verbatim：任何路径都不得改写
+  const av = await saveMemory({ text: t1, memType: 'user', project: 'p_verb', characterId: 'test' });
+  const bv = await saveMemory({ text: t2, memType: 'user', project: 'p_verb', characterId: 'test' });
+  const rv = await applyReflectActions(
+    [{ action: 'merge', sourceIds: [av.id, bv.id], newText: '被压缩过的版本', newMemType: 'user' }],
+    'test', 'p_verb', { automatic: true, consolidation: true },
+  );
+  check('verbatim 库 merge 被拒', rv.receipts?.[0]?.status === 'failed', JSON.stringify(rv.receipts));
+  check('verbatim 拒绝原因提到 preservation policy',
+    (rv.errors || []).some(e => String(e).includes('preservation policy')), JSON.stringify(rv.errors));
+  check('verbatim 两条源仍 active', !!row('p_verb', 'user', av.id)?.is_active && !!row('p_verb', 'user', bv.id)?.is_active);
+
+  // (2) evidence + 自动路径：delete 仍被拒（不可追回）
+  const rd = await applyReflectActions(
+    [{ action: 'delete', targetId: a.id, reason: '自动整合想删' }],
+    'test', 'p_ev', { automatic: true, consolidation: true },
+  );
+  check('evidence 自动路径 delete 仍被拒', rd.receipts?.[0]?.status === 'failed', JSON.stringify(rd.receipts));
+  check('evidence 两条源仍 active（delete 未生效）',
+    !!row('p_ev', 'user', a.id)?.is_active && !!row('p_ev', 'user', b.id)?.is_active);
+
+  // (3) evidence + 自动路径：merge 放行，但必须留痕（这是 v1.23-fix 与 C-1 的收敛点）
+  const rm = await applyReflectActions(
     [{ action: 'merge', sourceIds: [a.id, b.id], newText: '用户要求：先结论后过程；改动须有真实命令证据。', newMemType: 'user', newCategory: 'preference' }],
     'test', 'p_ev', { automatic: true, consolidation: true },
   );
-  check('merge 被拒（receipt failed）', res.receipts?.[0]?.status === 'failed', JSON.stringify(res.receipts));
-  check('拒绝原因提到 preservation policy',
-    (res.errors || []).some(e => String(e).includes('preservation policy')), JSON.stringify(res.errors));
-  check('两条源仍 active', !!row('p_ev', 'user', a.id)?.is_active && !!row('p_ev', 'user', b.id)?.is_active);
-  const mergedRows = DatabaseManager.getInstance('p_ev', 'user')
-    .prepare("SELECT count(*) c FROM memory WHERE source='reflect_merge'").get().c;
-  check('没有产生合并结果行', mergedRows === 0, `count=${mergedRows}`);
+  check('evidence 自动路径 merge 放行（否则整合退化成逐条重摘要）',
+    rm.receipts?.[0]?.status === 'applied', JSON.stringify(rm.receipts));
+  const mergedEv = DatabaseManager.getInstance('p_ev', 'user')
+    .prepare("SELECT * FROM memory WHERE source='reflect_merge' ORDER BY created_at DESC LIMIT 1").get();
+  const evFrom = (() => { try { return JSON.parse(mergedEv?.merged_from || '[]'); } catch { return []; } })();
+  check('放行的 merge 写了 merged_from（2 条源）', evFrom.length === 2, mergedEv?.merged_from);
+  const srcA = row('p_ev', 'user', a.id);
+  check('源行不再是 active、状态 superseded', srcA && Number(srcA.is_active) === 0 && srcA.status === 'superseded',
+    JSON.stringify({ a: srcA?.is_active, s: srcA?.status }));
+  check('源行指回合并结果（merged_into）', srcA?.merged_into === mergedEv?.id, `${srcA?.merged_into} vs ${mergedEv?.id}`);
 }
 
 console.log('\n== C-2：standard 库 merge 必须留痕 ==');
