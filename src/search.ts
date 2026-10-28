@@ -101,9 +101,11 @@ function computeScore(similarity: number, row: any): number {
   const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
   const decay = decayFor(row, hoursSinceCreated);
 
-  const tierBoost = row.tier === 'critical' ? 2.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
-  const importanceMult = 0.5 + (row.importance || 0.5);
-  const accessBoost = 1 + Math.min(0.5, Math.log2(1 + (row.accessed_count || 0)) * 0.1);
+  // 2026-10-28:原来 critical ×2.0、importance ×(0.5+imp)、访问次数 ×(1~1.5) 全乘在总分上,
+  // 结构性元数据能压过相关性(Anima 上实测:6 字垃圾行 score 4.3 排第一,真答案 1.88)。收成有界项。
+  const tierBoost = row.tier === 'critical' ? 1.10 : (row.tier === 'temporary' ? 0.95 : 1.0);
+  const importanceMult = 0.85 + 0.3 * (row.importance || 0.5);
+  const accessBoost = 1 + Math.min(0.08, Math.log2(1 + (row.accessed_count || 0)) * 0.02);
 
   const rawScore = WEIGHT_CONSISTENCY * consistency
                  + WEIGHT_TIME * decay;
@@ -443,7 +445,8 @@ function vectorKnnSearch(db: any, options: SearchOptions, floatQuery: Float32Arr
 
   const results: SearchResult[] = [];
   for (const row of rows) {
-    if (excludeIds.has(row.id)) continue;
+    // 2026-10-28:原来标签路弱命中(0.33)的行在这里被整条跳掉,强相似度永远上报不了。
+    // 不排除,交给合并去重取 similarity 高者。
     const dist = rowidMap.get(row.rowid) ?? 1.0;
     const similarity = l2ToCosine(dist);   // L2 → 余弦(2026-10-28)
     const score = computeScore(similarity, row);
@@ -485,6 +488,22 @@ function textFallbackSearch(
   if (options.characterId) { conds.push('m.character_id = ?'); params.push(options.characterId); }
   if (options.subject) { conds.push('m.subject = ?'); params.push(options.subject); }
 
+  // 2026-10-28:IDF 加权 —— 「母亲」「黑潮」这类罕见词比「自己」「记得」这种高频 bigram 有信息量,
+  // 按命中个数一视同仁会让实体问句的要点行排在后面。
+  const dfSql = `SELECT COUNT(*) c FROM memory m WHERE m.is_active = 1 AND m.project = ?`
+    + ` AND COALESCE(m.status, '') <> 'superseded'`
+    + (options.memType ? ' AND m.mem_type = ?' : '')
+    + (options.characterId ? ' AND m.character_id = ?' : '');
+  const dfBase: any[] = [project, ...(options.memType ? [String(options.memType)] : []), ...(options.characterId ? [options.characterId] : [])];
+  let corpusN = 1;
+  try { corpusN = Number((db.prepare(dfSql).get(...dfBase) as any)?.c) || 1; } catch { corpusN = 1; }
+  const idf = terms.map((t) => {
+    let df = 0;
+    try { df = Number((db.prepare(`${dfSql} AND m.text LIKE ?`).get(...dfBase, `%${t}%`) as any)?.c) || 0; } catch { df = 0; }
+    return Math.log(1 + corpusN / (1 + df));
+  });
+  const totalWeight = idf.reduce((a: number, b: number) => a + b, 0) || 1;
+
   const rows = db.prepare(`
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.importance, m.character_id, m.source,
@@ -492,23 +511,30 @@ function textFallbackSearch(
       m.created_at, m.last_accessed_at, m.accessed_count
     FROM memory m
     WHERE ${conds.join(' AND ')}
-    ORDER BY (${terms.map(() => 'CASE WHEN m.text LIKE ? THEN 1 ELSE 0 END').join(' + ')}) DESC, m.created_at DESC
+    ORDER BY (${terms.map(() => `CASE WHEN m.text LIKE ? THEN 1 ELSE 0 END`).join(' + ')}) DESC, m.created_at DESC
     LIMIT ?
   `).all(...params, ...likeParams, topK * 2) as any[];
 
   return rows
     .filter(row => !excludeIds.has(row.id))
-    .map(row => ({
-      id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
-      subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
-      importance: row.importance,
-      characterId: row.character_id, source: row.source,
-      subject: row.subject || 'user', tier: row.tier || 'standard',
-      parentId: row.parent_id || null,
-      score: computeScore(0.3, row), similarity: 0.3,
-      createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
-      accessedCount: row.accessed_count,
-    }));
+    .map(row => {
+      // 真实词法覆盖率(IDF 加权),不再硬写 0.3 —— 硬写会让所有词法命中在相关性上完全并列,
+      // 排序只能靠元数据决定(2026-10-28)。
+      const lower = String(row.text || '').toLowerCase();
+      const matchedWeight = terms.reduce((n: number, t: string, i: number) => n + (lower.includes(t.toLowerCase()) ? idf[i] : 0), 0);
+      const lexSim = Math.min(1, matchedWeight / totalWeight);
+      return {
+        id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
+        subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
+        importance: row.importance,
+        characterId: row.character_id, source: row.source,
+        subject: row.subject || 'user', tier: row.tier || 'standard',
+        parentId: row.parent_id || null,
+        score: computeScore(lexSim, row), similarity: Math.round(lexSim * 1000) / 1000,
+        createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
+        accessedCount: row.accessed_count,
+      };
+    });
 }
 
 /** 更新记忆访问计数 */
