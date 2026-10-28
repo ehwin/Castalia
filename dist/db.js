@@ -667,6 +667,34 @@ export function initProjectSchema(db) {
              BEGIN UPDATE memory SET base_importance = NEW.importance WHERE id = NEW.id; END`);
     }
     catch (_e) { /* trigger 已存在或旧库不支持 */ }
+    // v1.24: 词法通道（FTS5 trigram + 外部内容表 + 触发器）。
+    // 现有三路（tags LIKE / 向量 KNN / text LIKE）对"精确短语"无能为力：
+    // 古籍原句、卦名、错误码、路径、端口都查不到 —— 这是用户笔记里记过的老问题。
+    // 外部内容表 + 触发器让同步完全由 SQLite 负责，不需要在每个写路径上手插索引。
+    try {
+        const exists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_fts'").get();
+        if (!exists) {
+            db.exec(`CREATE VIRTUAL TABLE memory_fts USING fts5(
+        text, tags, category, content='memory', content_rowid='rowid', tokenize='trigram'
+      )`);
+            db.exec(`CREATE TRIGGER IF NOT EXISTS trg_memory_fts_ai AFTER INSERT ON memory BEGIN
+        INSERT INTO memory_fts(rowid, text, tags, category) VALUES (new.rowid, new.text, new.tags, new.category);
+      END`);
+            db.exec(`CREATE TRIGGER IF NOT EXISTS trg_memory_fts_ad AFTER DELETE ON memory BEGIN
+        INSERT INTO memory_fts(memory_fts, rowid, text, tags, category) VALUES ('delete', old.rowid, old.text, old.tags, old.category);
+      END`);
+            db.exec(`CREATE TRIGGER IF NOT EXISTS trg_memory_fts_au AFTER UPDATE OF text, tags, category ON memory BEGIN
+        INSERT INTO memory_fts(memory_fts, rowid, text, tags, category) VALUES ('delete', old.rowid, old.text, old.tags, old.category);
+        INSERT INTO memory_fts(rowid, text, tags, category) VALUES (new.rowid, new.text, new.tags, new.category);
+      END`);
+            // 建表后立刻用现有行回填（外部内容表的一次性 rebuild）
+            db.exec(`INSERT INTO memory_fts(memory_fts) VALUES('rebuild')`);
+        }
+    }
+    catch (e) {
+        // 无 FTS5 的构建：检索侧会自动回落到 LIKE，这里只记一次日志
+        console.error(`[db] memory_fts 不可用（${e.message}），词法检索回落 LIKE`);
+    }
     // Unique index for fact dedup (per-project: same SPO allowed across projects)
     // v1.23.1-fix: 不再每次启动 DROP。旧实现 DROP 成功、CREATE 因历史重复失败且被吞掉，
     // 此后 saveFacts 的 ON CONFLICT 目标消失 → 每次 prepare 直接抛错，facts 静默断流。

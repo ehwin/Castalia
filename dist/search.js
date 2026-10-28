@@ -109,14 +109,18 @@ async function searchInDb(db, options) {
     const profile = options.profile ? SEARCH_PROFILES[options.profile] : null;
     const topK = options.topK ?? profile?.topK ?? 10;
     const minScore = options.minScore ?? profile?.minScore ?? 0;
-    // ═══ Phase 1: 标签搜索(0 次向量调用) ═══
+    // ═══ Phase 1: 标签搜索 + 词法(FTS5/BM25)(0 次向量调用) ═══
+    // v1.24: 词法通道与标签并列进 Phase 1 —— 精确短语命中不该排在向量后面，
+    // 而且 FTS 是本地 CPU 活，比一次远端 embed 便宜三个数量级。
     const tagResults = tagSearch(db, options);
-    // 标签结果足够好 → 直接返回（访问记账统一在 searchMemory 里做）
-    if (tagResults.length >= topK && tagResults[0].score >= 0.5) {
-        return tagResults.slice(0, topK);
+    const lexical = lexicalSearch(db, options, new Set(tagResults.map(r => r.id)), topK);
+    const tagResults2 = [...tagResults, ...lexical].sort((a, b) => b.score - a.score);
+    // 标签/词法结果足够好 → 直接返回（访问记账统一在 searchMemory 里做）
+    if (tagResults2.length >= topK && tagResults2[0].score >= 0.5) {
+        return tagResults2.slice(0, topK);
     }
-    // ═══ Phase 2: 标签不够 → 向量 KNN 补充(EMBED_MODE=none 时跳过,纯文本回退) ═══
-    const existingIds = new Set(tagResults.map(r => r.id));
+    // ═══ Phase 2: 不足 → 向量 KNN 补充(EMBED_MODE=none 时跳过,纯文本回退) ═══
+    const existingIds = new Set(tagResults2.map(r => r.id));
     let vectorResults = [];
     if (isEmbedEnabled()) {
         let vecOk = false;
@@ -141,7 +145,7 @@ async function searchInDb(db, options) {
         vectorResults = textFallbackSearch(db, options, existingIds, topK, minScore);
     }
     // 合并 + 去重 + 排序
-    const merged = [...tagResults, ...vectorResults];
+    const merged = [...tagResults2, ...vectorResults];
     merged.sort((a, b) => b.score - a.score);
     const seen = new Set();
     const unique = [];
@@ -264,6 +268,59 @@ function tagSearch(db, options) {
             subject: row.subject || 'user', tier: row.tier || 'standard',
             parentId: row.parent_id || null,
             score: computeScore(tagScore, row), similarity: Math.round(tagScore * 1000) / 1000,
+            createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
+            accessedCount: row.accessed_count,
+        };
+    });
+}
+/**
+ * v1.24 词法通道：FTS5(trigram) + BM25。
+ * 与 tags LIKE / 向量 KNN / text LIKE 并列的第四路，专治"精确短语"：
+ * 古籍原句、卦名爻辞、错误码、文件路径、端口号、函数名。
+ * 相似度由 BM25 排名折算（不是原始 bm25 值 —— 它随查询长度剧烈变化），
+ * 再走同一个 computeScore，保证时间衰减/重要性/层级的语义与其它通道一致。
+ */
+function lexicalSearch(db, options, excludeIds, topK) {
+    const terms = String(options.query || '').split(/\s+/).map(t => t.trim()).filter(Boolean);
+    // trigram 分词器要求每个词 ≥3 字符；短词（中文二字）由 textFallbackSearch 的 LIKE 兜底
+    if (terms.length === 0 || terms.some(t => t.length < 3))
+        return [];
+    const match = terms.map(t => `"${t.replace(/"/g, '""')}"`).join(' AND ');
+    const where = ['memory_fts MATCH ?', 'm.is_active = 1', "COALESCE(m.status,'') <> 'superseded'"];
+    const params = [match];
+    if (options.project) {
+        where.push('m.project = ?');
+        params.push(options.project);
+    }
+    if (options.category) {
+        where.push('m.category = ?');
+        params.push(options.category);
+    }
+    let rows = [];
+    try {
+        rows = db.prepare(`
+      SELECT m.*, bm25(memory_fts) AS rank
+      FROM memory_fts JOIN memory m ON m.rowid = memory_fts.rowid
+      WHERE ${where.join(' AND ')}
+      ORDER BY rank LIMIT ?
+    `).all(...params, Math.max(topK * 3, 12));
+    }
+    catch {
+        return []; // 库没建 FTS 或语法不支持 → 静默退回其它通道
+    }
+    return rows
+        .filter(row => !excludeIds.has(row.id))
+        .map((row, i) => {
+        // 排名折算：首位 0.88，按名次递减，下限 0.45（仍高于纯 LIKE 的 0.3）
+        const similarity = Math.max(0.45, 0.88 - i * 0.06);
+        return {
+            id: row.id, text: row.text, project: row.project || 'default', type: row.type,
+            memType: row.mem_type || 'general', category: row.category,
+            subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
+            importance: row.importance, characterId: row.character_id, source: row.source,
+            subject: row.subject || 'user', tier: row.tier || 'standard',
+            parentId: row.parent_id || null,
+            score: computeScore(similarity, row), similarity: Math.round(similarity * 1000) / 1000,
             createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
             accessedCount: row.accessed_count,
         };
