@@ -73,12 +73,18 @@ if (seed) {
 const sql = (db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get('vec_memory') || {}).sql || '';
 const m2 = /float\\[(\\d+)\\]/.exec(sql);
 const count = (t) => { try { return db.prepare('SELECT COUNT(*) c FROM ' + t).get().c; } catch (_e) { return -1; } };
+// L2→余弦换算(sqlite-vec vec0 默认 L2 距离,代码按 1-d 当余弦用过 —— v1.28.7 修)
+const sm = await import(dbEntry.replace(/db\.js$/, 'search.js'));
 console.log(JSON.stringify({
   dim: m.vecDim(),
   tableDim: m2 ? Number(m2[1]) : 0,
   memory: count('memory'),
   vec: count('vec_memory'),
   cache: count('embedding_cache'),
+  cos_hit: sm.l2ToCosine(0.6683),
+  cos_same: sm.l2ToCosine(0),
+  cos_orth: sm.l2ToCosine(Math.SQRT2),
+  cos_far: sm.l2ToCosine(2),
 }));
 `);
 
@@ -105,6 +111,12 @@ console.log(`[embed-dim] 临时库: ${tmpRoot}`);
 console.log('\n1) 新库 + EMBEDDING_DIM=4096');
 const s1 = run(4096, { seed: true });
 check('vecDim() = 4096', s1.json.dim === 4096, `got ${s1.json.dim}`);
+// L2→余弦换算:单位向量下 d²=2-2cos ⟹ cos=1-d²/2。旧算法 1-d 会把真实命中(d=0.6683,
+// 真实余弦 0.7767)算成 0.33 → 低于注入门槛 0.5,向量召回全被丢弃。
+check('l2ToCosine(同向量 0)=1', Math.abs(s1.json.cos_same - 1) < 1e-9, `got ${s1.json.cos_same}`);
+check('l2ToCosine(0.6683)≈0.7767', Math.abs(s1.json.cos_hit - 0.7767) < 0.002, `got ${s1.json.cos_hit}`);
+check('l2ToCosine(√2)=0(正交)', Math.abs(s1.json.cos_orth) < 1e-9, `got ${s1.json.cos_orth}`);
+check('l2ToCosine(2)=0(不出现负数)', s1.json.cos_far === 0, `got ${s1.json.cos_far}`);
 check('vec0 表维度 = 4096', s1.json.tableDim === 4096, `got ${s1.json.tableDim}`);
 check('种子行写入(1 memory / 1 vec / 1 cache)', s1.json.memory === 1 && s1.json.vec === 1 && s1.json.cache === 1, JSON.stringify(s1.json));
 

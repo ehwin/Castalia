@@ -136,8 +136,12 @@ async function searchInDb(db, options) {
         // 2026-10-27 修复(E6a):原来只在 embed/KNN **抛错**时回退。vec_memory 为空
         // (换模型清空后尚未补齐、维度刚重建、批量嵌入没跑)时 KNN 会"成功返回 0 行",
         // 于是嵌入服务明明健康却静默 0 命中。零命中同样要回退到文本检索。
-        if (!vecOk || vectorResults.length === 0) {
-            vectorResults = textFallbackSearch(db, options, existingIds, topK, minScore);
+        // 2026-10-28(2):有向量时也**始终**合并词法结果。原来只在 KNN 抛错/零命中时才回退,
+        // 向量一旦返回任何一条(哪怕相似度 0.37)就把精确词法命中(0.5~1.0)整条挤掉。
+        // 同 id 去重时保留 similarity 更高的那份(下方 bestById)。
+        vectorResults = [...vectorResults, ...textFallbackSearch(db, options, new Set(), topK, minScore)];
+        if (vectorResults.length === 0 && !vecOk) {
+            vectorResults = textFallbackSearch(db, options, new Set(), topK, minScore);
         }
     }
     else {
@@ -341,12 +345,25 @@ function lexicalSearch(db, options, excludeIds, topK) {
             subject: row.subject || 'user', tier: row.tier || 'standard',
             parentId: row.parent_id || null,
             score: computeScore(similarity, row), similarity: Math.round(similarity * 1000) / 1000,
+            basis: 'vector', // 2026-10-28:向量命中自带 basis(注入层按来源取门槛)
             createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
             accessedCount: row.accessed_count,
         };
     });
 }
 /** 向量 KNN 搜索 */
+/**
+ * sqlite-vec 的 vec0 默认是 **L2** 距离(建表时没写 distance_metric,见 db.ts),
+ * 而这里一直按 `1 - 距离` 当作余弦相似度 —— 单位向量下正确换算是 `1 - d²/2`
+ * (d² = 2 - 2cos)。实测:「第 127 位谕女」那句查自己的行,distance=0.6683 而真实
+ * 余弦=0.7767,按旧算法得 0.33 → 低于注入门槛,于是**真实语义命中被丢掉**。
+ * 排序本来就没错(单位向量下 L2 序 = 余弦序),错的只是喂给门槛的值。
+ */
+export function l2ToCosine(dist) {
+    if (!Number.isFinite(dist))
+        return 0;
+    return Math.max(0, Math.min(1, 1 - (dist * dist) / 2));
+}
 function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
     // v1.5: vec0 虚拟表禁止 JOIN(KNN 必须在 vec0 上 LIMIT),项目过滤放在第二段 memory 查询
     // 候选集放大(全库 KNN)保证单项目召回;隔离语义由 memory 查询的 project=? 保证
@@ -401,7 +418,7 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
         if (excludeIds.has(row.id))
             continue;
         const dist = rowidMap.get(row.rowid) ?? 1.0;
-        const similarity = Math.max(0, 1.0 - dist);
+        const similarity = l2ToCosine(dist); // L2 → 余弦(2026-10-28)
         const score = computeScore(similarity, row);
         if (score >= minScore) {
             results.push({
@@ -596,7 +613,7 @@ export async function searchFacts(query, options = {}) {
     const results = [];
     for (const row of rows) {
         const dist = rowidMap.get(row.rowid) ?? 1.0;
-        const similarity = Math.max(0, 1.0 - dist);
+        const similarity = l2ToCosine(dist); // L2 → 余弦(2026-10-28)
         const confidence = row.confidence;
         if (confidence < minConfidence)
             continue;
