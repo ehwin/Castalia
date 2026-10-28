@@ -243,13 +243,30 @@ export async function searchMemoryAcross(options: SearchOptions & { projects?: s
 // 标签搜索 — 从 query 提取关键词，SQL tag LIKE 匹配
 // ═══════════════════════════════════════════════════════════════════
 
+const QUERY_STOP_WORDS = new Set(['的', '了', '是', '我', '你', '他', '她', '吗', '呢', '吧', '啊',
+  'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'of', 'and', 'or',
+  '有', '在', '不', '要', '会', '能', '就', '都', '也', '还', '和', '与', '这', '那', '什么', '怎么']);
+
+/**
+ * 检索词切分(2026-10-28,移植自 Anima v1.28.3):中文没有空格时整句会变成一个超长 token,
+ * `text LIKE` / `tags LIKE` 永远匹配不到 —— 自然问句召回 0 条。CJK 连续段按 bigram 切分,
+ * 其它语言仍按空白/标点切;词数封顶,避免 SQL 条件爆炸。
+ */
+export function queryTerms(query: string, max = 16): string[] {
+  const out = new Set<string>();
+  for (const raw of String(query ?? '').split(/[\s,，。！？、；：""''（）()\[\]【】\-\/\\|]+/)) {
+    const seg = raw.trim();
+    if (seg.length < 2) continue;
+    if (!/[\u4e00-\u9fff]/.test(seg)) out.add(seg);
+    else for (let i = 0; i + 2 <= seg.length; i++) out.add(seg.slice(i, i + 2));
+    if (out.size >= max) break;
+  }
+  return [...out].slice(0, max);
+}
+
 /** 从中文/英文 query 中提取关键词 */
 function extractKeywords(query: string): string[] {
-  const stopWords = new Set(['的', '了', '是', '我', '你', '他', '她', '吗', '呢', '吧', '啊',
-    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'of', 'and', 'or',
-    '有', '在', '不', '要', '会', '能', '就', '都', '也', '还', '和', '与', '这', '那', '什么', '怎么']);
-  const tokens = query.split(/[\s,，。！？、；：""''（）()\[\]【】\-\/\\|]+/);
-  return [...new Set(tokens.filter(t => t.length >= 2 && !stopWords.has(t.toLowerCase())))];
+  return queryTerms(query).filter(t => !QUERY_STOP_WORDS.has(t.toLowerCase()));
 }
 
 /** SQL 标签搜索：匹配 memory.tags JSON 数组 */
@@ -435,14 +452,15 @@ function textFallbackSearch(
   db: any, options: SearchOptions, excludeIds: Set<string>,
   topK: number, minScore: number
 ): SearchResult[] {
-  const terms = options.query.split(/\s+/).filter(t => t.length > 0);
+  const terms = queryTerms(options.query);
   if (terms.length === 0) return [];
   const project = normalizeProject(options.project);
 
-  const likeConditions = terms.map(() => 'm.text LIKE ?').join(' OR ');
+  // 召回优先:命中 ≥1 词就进候选,精度交给排序(命中词多的排前面)。试过 need=2 的闸门,
+  // 结果短问句(只共享 1 个 bigram)又变 0 条,等于没修(2026-10-28)。
   const likeParams = terms.map(t => `%${t}%`);
 
-  const conds: string[] = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `(${likeConditions})`];
+  const conds: string[] = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `(${terms.map(() => 'm.text LIKE ?').join(' OR ')})`];
   const params: any[] = [project, ...likeParams];
   if (options.memType) { conds.push('m.mem_type = ?'); params.push(options.memType); }
   if (options.type) { conds.push('m.type = ?'); params.push(options.type); }
@@ -457,8 +475,9 @@ function textFallbackSearch(
       m.created_at, m.last_accessed_at, m.accessed_count
     FROM memory m
     WHERE ${conds.join(' AND ')}
-    ORDER BY m.created_at DESC LIMIT ?
-  `).all(...params, topK * 2) as any[];
+    ORDER BY (${terms.map(() => 'CASE WHEN m.text LIKE ? THEN 1 ELSE 0 END').join(' + ')}) DESC, m.created_at DESC
+    LIMIT ?
+  `).all(...params, ...likeParams, topK * 2) as any[];
 
   return rows
     .filter(row => !excludeIds.has(row.id))
