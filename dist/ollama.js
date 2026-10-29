@@ -150,3 +150,4 @@ function setMemCache(text, vec) {
     }
     memCache.set(text, vec);
 }
+//# sourceMappingURL=ollama.js.map

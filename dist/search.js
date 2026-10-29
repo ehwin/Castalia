@@ -684,3 +684,4 @@ export async function searchFacts(query, options = {}) {
     // v1.23.2-fix: 按 topK 截断（此前会把 knnLimit 内的 60 条全返回并全部记访问）
     return results.slice(0, topK);
 }
+//# sourceMappingURL=search.js.map

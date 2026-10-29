@@ -291,3 +291,4 @@ export function deleteInstruction(scope, project) {
     const r = db.prepare('DELETE FROM instructions WHERE scope = ? AND project IS ?').run(scope, project ?? null);
     return { deleted: r.changes > 0 };
 }
+//# sourceMappingURL=instructions.js.map

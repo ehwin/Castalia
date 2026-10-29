@@ -70,3 +70,4 @@ export function normalizeTagsForWrite(raw) {
 export function serializeTags(raw) {
     return JSON.stringify(normalizeTagsForWrite(raw));
 }
+//# sourceMappingURL=tags.js.map

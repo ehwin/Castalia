@@ -106,3 +106,4 @@ processedSourceIds 只能列出已完整审阅且其有价值信息均已提取�
 ${consolidation ? '输出格式：{"actions":[{"action":"extract","sourceId":"输入ID","newText":"完整证据","newMemType":"project","newCategory":"context"}]}' : '输出格式：{"processedSourceIds":["已完整处理的输入ID"],"summary":"本批主题与问题的导航","highlights":[],"facts":[{"subject":"user","predicate":"项目","object":"Castalia","confidence":0.9}],"insights":[],"actions":[{"action":"extract","sourceId":"输入ID","newText":"该主题的结构化记录","newMemType":"project","newCategory":"context","newImportance":0.7,"quotes":["原文逐字片段1","原文逐字片段2"],"hardFacts":[{"subject":"environment","predicate":"端口","object":"3318","evidence":"原文里出现 3318 的那句","confidence":0.9,"validFrom":"2026-10-23"}],"linkedMemoryIds":["同主题旧记忆ID"]},{"action":"extract","sourceId":"同一来源的第二个主题","newText":"…"}]}'}
 `;
 }
+//# sourceMappingURL=reflectionFidelity.js.map

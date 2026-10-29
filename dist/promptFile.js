@@ -35,3 +35,4 @@ export function loadPromptOverride(envKey, builtin) {
     console.error(`[prompt] ${envKey} unreadable (${candidates.join(' | ')}), using builtin prompt`);
     return builtin;
 }
+//# sourceMappingURL=promptFile.js.map

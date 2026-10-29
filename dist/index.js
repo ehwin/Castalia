@@ -1404,3 +1404,4 @@ async function main() {
     process.on('SIGTERM', () => { DatabaseManager.close(); process.exit(0); });
 }
 main();
+//# sourceMappingURL=index.js.map

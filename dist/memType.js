@@ -99,3 +99,4 @@ export function summarizeForIndex(text, maxLen = 150) {
         return win.slice(0, cut + 1) + '…';
     return win.replace(/\s+\S*$/, '') + '…';
 }
+//# sourceMappingURL=memType.js.map

@@ -154,3 +154,4 @@ export function packContext(sections, opts) {
     const finalText = out.join('\n');
     return { text: finalText, sections: stats, totalChars: finalText.length, evicted };
 }
+//# sourceMappingURL=contextPack.js.map

@@ -43,10 +43,14 @@ const CONFIG_PATH = (() => {
  * 解密失败/文件缺失:静默跳过,console.warn 一次。
  */
 function loadEncryptedSecrets() {
+    // keys.enc 与 config.json 同住 bank 根;只认 cwd 时宿主用 MEMORY_DB_DIR 指定库就永远找不到 key。
+    const bankDir = (process.env.MEMORY_DB_DIR || '').trim();
+    const keysInBank = bankDir ? path.join(bankDir, 'keys.enc') : '';
+    const keyInBank = bankDir ? path.join(bankDir, 'keys.key') : '';
     const keysFile = process.env.CASTALIA_KEYS_FILE
-        || path.join(process.cwd(), 'memory', 'keys.enc');
+        || (keysInBank && fs.existsSync(keysInBank) ? keysInBank : path.join(process.cwd(), 'memory', 'keys.enc'));
     const keyFile = process.env.CASTALIA_KEY_FILE
-        || path.join(process.cwd(), 'memory', 'keys.key');
+        || (keyInBank && fs.existsSync(keyInBank) ? keyInBank : path.join(process.cwd(), 'memory', 'keys.key'));
     const keyMissing = !fs.existsSync(keyFile);
     const encMissing = !fs.existsSync(keysFile);
     if (keyMissing && encMissing)
@@ -211,3 +215,4 @@ try {
 catch (e) {
     console.error('[config] load failed:', e.message);
 }
+//# sourceMappingURL=configLoader.js.map
