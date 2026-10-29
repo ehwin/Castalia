@@ -152,6 +152,52 @@ export function parseJsonRobust(raw, allowSalvage = true) {
     // 收尾:截断救济(内部第一步即"补全原 body",失败再逐级回退元素边界)
     return allowSalvage ? salvageTruncatedJson(body) : null;
 }
+const _usage = { calls: 0, prompt: 0, completion: 0, reasoning: 0, cached: 0, ms: 0 };
+/** 读当前累计(返回副本,不影响累计值) */
+export function llmUsageSnapshot() { return { ..._usage }; }
+/** 两次快照相减,得到一段工作的真实用量 */
+export function llmUsageDelta(before, after = llmUsageSnapshot()) {
+    return {
+        calls: after.calls - before.calls,
+        prompt: after.prompt - before.prompt,
+        completion: after.completion - before.completion,
+        reasoning: after.reasoning - before.reasoning,
+        cached: after.cached - before.cached,
+        ms: after.ms - before.ms,
+    };
+}
+/**
+ * DeepSeek 官方价目(元/百万 token,2026-09-10 调价后)。
+ * 闲时 = 高峰×0.5;高峰 = 工作日(不含法定节假日) 9:00-12:00、14:00-18:00(北京时间)。
+ * 认不出的模型 → 按 flash 计(偏保守),并在返回里标记 estimated=true。
+ */
+const PRICES = {
+    'deepseek-flash': { hit: 0.02, miss: 1.0, out: 4.0 },
+    'deepseek-v4-flash': { hit: 0.02, miss: 1.0, out: 4.0 },
+    'deepseek-v4-pro': { hit: 0.15, miss: 4.5, out: 13.5 },
+    'deepseek-v4-1-flash': { hit: 0.02, miss: 1.0, out: 4.0 },
+};
+/** 北京时间是否落在 DeepSeek 高峰时段(法定节假日不在此判定内 —— 只会把节假日当高峰,偏保守) */
+export function isPeakHour(at = new Date()) {
+    // 固定 UTC+8,不受宿主时区影响
+    const bj = new Date(at.getTime() + 8 * 3600_000);
+    const day = bj.getUTCDay(); // 0=周日 6=周六
+    if (day === 0 || day === 6)
+        return false;
+    const h = bj.getUTCHours();
+    return (h >= 9 && h < 12) || (h >= 14 && h < 18);
+}
+/** 估算一段用量的成本(元);peak 参数让调用方复算峰谷 */
+export function estimateCostCny(u, model, at = new Date()) {
+    const p = PRICES[String(model || '').trim().toLowerCase()];
+    const price = p || PRICES['deepseek-flash'];
+    const peak = isPeakHour(at);
+    const k = peak ? 2 : 1;
+    const hit = Math.min(u.cached, u.prompt);
+    const miss = Math.max(0, u.prompt - hit);
+    const cny = (hit * price.hit + miss * price.miss + u.completion * price.out) * k / 1e6;
+    return { cny: Math.round(cny * 1e4) / 1e4, peak, estimated: !p };
+}
 /**
  * v1.11.3 重路径(总反思/深度反思/整合)的输出预算 —— 与浅层(triage 临时反思 / reflect_auto)分开。
  * 为什么需要:推理模型(如 deepseek-v4-pro)的**思考 token 也计入 max_tokens**,8192 会被"想"吃光,
@@ -205,6 +251,13 @@ export async function callLlm(systemPrompt, userPrompt, channel, maxTokens = 819
                 ` prompt=${usage.prompt_tokens ?? '?'} completion=${usage.completion_tokens ?? '?'}` +
                 ` reasoning=${reasoning} cached=${cached}` +
                 ` finish=${finishReason || 'n/a'} ms=${Date.now() - startedAt}`);
+            // 用量落账(账单归因):cost 由 estimateCostCny 在调用方按峰谷复算
+            _usage.calls += 1;
+            _usage.prompt += Number(usage.prompt_tokens || 0);
+            _usage.completion += Number(usage.completion_tokens || 0);
+            _usage.reasoning += Number(reasoning || 0);
+            _usage.cached += Number(cached || 0);
+            _usage.ms += Date.now() - startedAt;
             if (finishReason === 'length') {
                 console.error(`[llm] 警告：输出撞到 max_tokens=${maxTokens} 被截断，prompt+completion 仍全额计费`);
             }
