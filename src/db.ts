@@ -27,6 +27,8 @@ export function memTypeDir(memType?: string): string {
 /** 默认向量维度(Yuan-EB 2.0-zh)。实际取值见 vecDim():可由 config.json 的 embedding.dim / env EMBEDDING_DIM 覆盖。 */
 const DEFAULT_VEC_DIM = 1024;
 let _vecDim: number | undefined;
+/** 库内已记录的嵌入模型(未显式配置时沿用,避免"默认模型"销毁别人建好的索引) */
+let _embedModelOverride = '';
 
 /**
  * 当前向量维度(v1.25 起不再是常量)。
@@ -52,7 +54,25 @@ function vecDimIsExplicit(): boolean {
 
 /** 当前嵌入模型名(惰性读取,configLoader 注入 EMBEDDING_MODEL 后也能生效) */
 export function embedModelName(): string {
-  return (process.env.EMBEDDING_MODEL || 'yuan-embedding-2.0-zh').trim();
+  return (_embedModelOverride || process.env.EMBEDDING_MODEL || 'yuan-embedding-2.0-zh').trim();
+}
+
+/** 嵌入模型是否来自显式配置(env EMBEDDING_MODEL,含 config.json 注入)。未设置 = 只是内置默认值。 */
+function embedModelIsExplicit(): boolean {
+  return !!((process.env.EMBEDDING_MODEL || '').trim());
+}
+
+/**
+ * 目标嵌入后端是否**真的能重嵌**。清空向量索引是不可恢复操作(原文不在 vec 表里,
+ * 清了就只能靠重嵌补回来),所以只有确认能重嵌时才允许清。
+ * - EMBED_MODE=api:必须有 EMBEDDING_API_KEY,否则每次请求都 401/fetch failed。
+ * - EMBED_MODE=none:已在 isEmbedEnabled() 里挡掉。
+ * - 其余(ollama/默认本地):无法在清空前探活,保持原行为(允许清)。
+ */
+function embedTargetUsable(): boolean {
+  const mode = (process.env.EMBED_MODE || '').toLowerCase().trim();
+  if (mode === 'api') return !!((process.env.EMBEDDING_API_KEY || '').trim());
+  return true;
 }
 
 /**
@@ -89,8 +109,28 @@ export function ensureEmbedSpace(db: Database.Database): { changed: boolean; to:
       return { changed: false, to };
     }
     if (row.space_hash === to) return { changed: false, to };
+    // 2026-10-29 修复(与 reconcileVecDim 的 E2 同构):模型**未显式配置**时,绝不因为
+    // 「内置默认模型」与库内不同就销毁索引。默认值只是历史常量(yuan-embedding-2.0-zh),
+    // 含义是"没人告诉我要用哪个模型",不代表库里的向量是错的;沿用库内模型即可。
+    // 真换模型必须显式设置 EMBEDDING_MODEL(或 config.json 的 embedding.api_model/model),
+    // 那时才允许清空重嵌。实测事故:宿主 cwd 下缺 memory/config.json → 默认模型 y
+    // yuan-embedding-2.0-zh 覆盖了库内 BAAI/bge-m3 → 817 条记忆的向量被清空且无法重嵌。
+    if (!embedModelIsExplicit() && row.model && String(row.model).trim()
+        && String(row.model).trim() !== embedModelName()) {
+      _embedModelOverride = String(row.model).trim();
+      console.warn(`[db] 未显式配置嵌入模型,沿用库内 ${_embedModelOverride}(不清向量);`
+        + '要换模型请显式设置 EMBEDDING_MODEL 或 config.json 的 embedding.api_model/model');
+      return { changed: false, to: embedSpaceHash() };
+    }
     if (!isEmbedEnabled()) {
       console.warn(`[db] 嵌入空间变化(库内 ${row.model}/${row.dim} → 配置 ${embedModelName()}/${vecDim()}),但 EMBED_MODE=none 无法重嵌,暂不改动向量与缓存`);
+      return { changed: false, to };
+    }
+    // 同一类的第二道闸:目标是云端 API 但没拿到 key 时清空是**不可恢复**的
+    // (清了也没法重嵌,只会把可用索引变成空索引),按 EMBED_MODE=none 同样处理。
+    if (!embedTargetUsable()) {
+      console.warn(`[db] 嵌入空间变化(库内 ${row.model}/${row.dim} → 配置 ${embedModelName()}/${vecDim()}),`
+        + '但 EMBED_MODE=api 且没有 EMBEDDING_API_KEY,无法重嵌,暂不改动向量与缓存');
       return { changed: false, to };
     }
     console.warn(`[db] 嵌入空间变化: ${row.model}/${row.dim} → ${embedModelName()}/${vecDim()}(维度可能相同,旧向量属于另一语义空间),清空向量索引与嵌入缓存,稍后按新空间重嵌`);

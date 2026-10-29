@@ -13,8 +13,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-const CONFIG_PATH = process.env.MEMORY_CONFIG
-  || path.join(process.cwd(), 'memory', 'config.json');
+/**
+ * 配置文件路径:显式 MEMORY_CONFIG > <MEMORY_DB_DIR>/config.json > <cwd>/memory/config.json
+ *
+ * 2026-10-29 修:原来只认 MEMORY_CONFIG 和 cwd/memory/config.json,完全无视 MEMORY_DB_DIR ——
+ * 而 MEMORY_DB_DIR 才是「这个进程用哪个库」的唯一声明(Hermes 的 MCP 注册、以及任何
+ * `MEMORY_DB_DIR=<bank> node dist/index.js` 的用法都只传它)。于是宿主的 cwd 下没有
+ * memory/config.json 时,整份 bank 配置(embed.mode/api_model/api_key、reflect、triage)
+ * 被静默忽略:嵌入模型回落到内置默认 yuan-embedding-2.0-zh、后端仍是本地 ollama,
+ * 空间指纹与库内 BAAI/bge-m3 不符 → ensureEmbedSpace 清空向量索引 → 重嵌全部失败
+ * (实测 2026-10-29 10:26,hermes 库 817 条记忆的 vec_memory 被清成 0 条)。
+ */
+const CONFIG_PATH = (() => {
+  const explicit = (process.env.MEMORY_CONFIG || '').trim();
+  if (explicit) return explicit;
+  const bankDir = (process.env.MEMORY_DB_DIR || '').trim();
+  if (bankDir) {
+    const inBank = path.join(bankDir, 'config.json');
+    if (fs.existsSync(inBank)) return inBank;
+  }
+  return path.join(process.cwd(), 'memory', 'config.json');
+})();
 
 /**
  * 解密 memory/keys.enc(由 scripts/keygen.js 生成)注入环境变量。
