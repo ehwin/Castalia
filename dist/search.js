@@ -307,11 +307,16 @@ function tagSearch(db, options) {
  * 再走同一个 computeScore，保证时间衰减/重要性/层级的语义与其它通道一致。
  */
 function lexicalSearch(db, options, excludeIds, topK) {
-    const terms = String(options.query || '').split(/\s+/).map(t => t.trim()).filter(Boolean);
-    // trigram 分词器要求每个词 ≥3 字符；短词（中文二字）由 textFallbackSearch 的 LIKE 兜底
-    if (terms.length === 0 || terms.some(t => t.length < 3))
+    // trigram 分词器只索引 3 字符窗口:≥3 字符的词才可能命中,短的(中文二字)交给
+    // textFallbackSearch 的 LIKE。**逐词过滤,不要整条通道退出** —— 旧实现只要有一个短词
+    // 就 `return []`,于是 "Kernel-Power 105 掉电" 这种混着技术串+二字词的常用查询,
+    // FTS 通道整条失效(实测:精确短语/错误码正是它最该负责的场景)。
+    // 多个词之间用 OR 而非 AND:BM25 天然奖励命中词更多/更稀有的行,AND 只会把召回砍掉。
+    const terms = String(options.query || '').split(/\s+/).map(t => t.trim())
+        .filter(t => t.length >= 3).slice(0, 12);
+    if (terms.length === 0)
         return [];
-    const match = terms.map(t => `"${t.replace(/"/g, '""')}"`).join(' AND ');
+    const match = terms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
     const where = ['memory_fts MATCH ?', 'm.is_active = 1', "COALESCE(m.status,'') <> 'superseded'"];
     const params = [match];
     if (options.project) {
