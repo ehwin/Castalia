@@ -76,7 +76,8 @@ check('preference metadata 落库', prow && prow.metadata.includes('originContex
 check('score_priority=0.85', prow && prow.score_priority === 0.85);
 
 console.log(`\n===== 结果: ${pass} 通过, ${fail} 失败 =====`);
-// Windows 上句柄可能还没释放，rmSync 会抛 EPERM；清理失败不该把一次全绿的验证判成崩溃。
+// 先关连接再删：sqlite 句柄没释放时 Windows 上 rmSync 必抛 EPERM（实测每次留一个临时库）。
+try { DatabaseManager.close(); } catch { /* 没开过库也无所谓 */ }
 try { fs.rmSync(TEST_DIR, { recursive: true, force: true }); }
 catch (e) { console.log(`（临时库未删除：${TEST_DIR} — ${e.code || e.message}）`); }
 process.exit(fail > 0 ? 1 : 0);
