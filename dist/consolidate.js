@@ -54,6 +54,8 @@ function scanVectorPairs(db, proj, threshold, limit, seen, pairs) {
     WHERE m.is_active = 1 AND m.project = ? AND (m.locked IS NULL OR m.locked = 0)
       AND COALESCE(m.tier, 'standard') <> 'critical'
       AND COALESCE(m.status, '') NOT IN ('cold', 'superseded')
+      -- v1.27: 派生叙述不参与整合（摘要之间互合并只会让模型的自述越滚越大）
+      AND m.derived = 0
     ORDER BY m.created_at DESC
     LIMIT 500
   `).all(proj);
@@ -134,6 +136,7 @@ function scanStructPairs(db, proj, limit, seen, pairs) {
         WHERE is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
           AND COALESCE(tier, 'standard') <> 'critical'
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
+          AND derived = 0
         ORDER BY created_at DESC LIMIT 500
       `).all(proj);
         }

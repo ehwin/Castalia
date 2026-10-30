@@ -22,11 +22,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { protectedReflectionProject, reflectionPolicy, wholeRecordBatches, fidelitySystemPrompt } from './reflectionFidelity.js';
 import { getUnanalyzedConversations } from './reflectionSources.js';
+import { derivedFilter } from './provenance.js';
+import { debugCatch } from './log.js';
 export { getUnanalyzedConversations, markConversationsReflected, deepReflectionCursor } from './reflectionSources.js';
 /**
  * 获取所有记忆（供大模型分析）
  */
-export function listAllMemories(characterId = 'airi', limit = 200, project) {
+export function listAllMemories(characterId = 'airi', limit = 200, project, derivedPolicy = 'excluded') {
     const proj = normalizeProject(project);
     // memdir:聚合项目**已存在**的分类库（读路径不懒建库）
     const dirs = DatabaseManager.existingMemTypes(proj);
@@ -36,17 +38,23 @@ export function listAllMemories(characterId = 'airi', limit = 200, project) {
             const db = DatabaseManager.getInstance(proj, mt);
             const rows = db.prepare(`
         SELECT id, text, type, mem_type, category, tags, importance,
-               subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
+               subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked,
+               derived, generated_by
         FROM memory
         WHERE is_active = 1 AND project = ?
           -- v1.23: 冷存与被接管的旧记忆不参加新一轮沉淀（否则深反思会反复处理同一批死记忆）
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
+          -- v1.27: 派生叙述不进入下一轮反思输入（模型写的摘要/洞察不能再当证据喂回去）。
+          -- 默认 excluded（这是**证据链**入口）；只有列表/审计这类显式调用才传 demoted/only。
+          ${derivedFilter('memory', derivedPolicy)}
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
       `).all(proj, limit);
             all.push(...rows);
         }
-        catch { /* 单分类库失败不影响其他 */ }
+        catch (e) {
+            debugCatch('reflect:listAllMemories', e);
+        }
     }
     all.sort((a, b) => (b.importance - a.importance) || String(b.created_at || '').localeCompare(String(a.created_at || '')));
     const rows = all.slice(0, limit);
@@ -69,6 +77,8 @@ export function listAllMemories(characterId = 'airi', limit = 200, project) {
             accessedCount: r.accessed_count,
             referenceCount: r.reference_count || 0,
             locked: r.locked || 0,
+            derived: !!r.derived,
+            generatedBy: r.generated_by ?? null,
         };
     });
 }
@@ -280,7 +290,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         const sdb = memDbFor(id, project, db);
                         // v1.23: critical 不参与合并（否则核心记忆会被"沉淀"掉）
                         // v1.23.2: conversation_log 源天然是 is_active=0，merge 也必须能合并它们
-                        const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND (is_active = 1 OR (is_active = 0 AND source = 'conversation_log')) AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical'").get(id);
+                        const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND (is_active = 1 OR (is_active = 0 AND source = 'conversation_log')) AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(derived, 0) = 0").get(id);
                         if (!src) {
                             mergeInvalid = `source not found or locked: ${id}`;
                             break;
@@ -308,6 +318,8 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         characterId,
                         project,
                         source: 'reflect_merge',
+                        generatedBy: 'reflect_merge',
+                        evidenceIds: mergeSources.map(s => s.id),
                     });
                     // ═══ v1.24 (C-2) 血缘：合并必须可追溯，源行不得静默消失 ═══
                     // Graphiti EntityEdge 语义的本地化：
@@ -370,8 +382,8 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     }
                     const source = resolveReflectTarget(action.targetId, project);
                     const row = source.db.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(source.id);
-                    if (!row || row.locked || row.identity_locked)
-                        throw new Error('split: target locked or inactive');
+                    if (!row || row.locked || row.identity_locked || row.derived)
+                        throw new Error('split: target locked, inactive or derived');
                     const children = [];
                     for (const frag of action.fragments) {
                         children.push(await saveMemory({
@@ -379,6 +391,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                             memType: row.mem_type, category: frag.category || row.category || 'conversation',
                             tags: frag.tags || [], importance: frag.importance ?? 0.5,
                             characterId, project, source: 'reflect_split',
+                            generatedBy: 'reflect_split', evidenceIds: [source.id],
                         }));
                     }
                     if (!children.some(child => child.id === source.id)) {
@@ -569,6 +582,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         characterId,
                         project,
                         source: 'reflect_extract',
+                        generatedBy: 'reflect_extract', evidenceIds: [action.sourceId],
                         metadata: JSON.stringify({ reflection: { sourceIds: [action.sourceId], project: normalizeProject(project), role: 'leaf', quotes: validQuotes.length } }),
                     });
                     // Exact duplicate extraction can point to several source records.
@@ -600,8 +614,11 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                             };
                             const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : '');
                             // facts 表与 general 库同一 sqlite；extract 若落到 project/user 等分类库，
-                            // source_memory_id 跨库会触发 FOREIGN KEY（与 Anima 同一坑）。跨库时不挂来源。
-                            const factOwnerMemType = findDbByMemoryId(extracted.id, project)?.memType;
+                            // source_memory_id 跨库会触发 FOREIGN KEY。v1.27 起不再因此丢掉出处：
+                            // source_memory_id 仍只在同库时挂，source / mem_type / evidence_ids 一定落库，
+                            // 事实始终能追回到它来自哪条记忆、哪一类库。
+                            const factOwner = findDbByMemoryId(extracted.id, project);
+                            const factOwnerMemType = factOwner?.memType;
                             const factSourceId = factOwnerMemType === 'general' ? extracted.id : null;
                             const facts = action.hardFacts
                                 .filter((f) => f && typeof f === 'object' && str(f.subject) && str(f.predicate) && str(f.object))
@@ -618,7 +635,9 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                                 validTo: iso(f.validTo),
                             }));
                             if (facts.length)
-                                await saveFacts(facts, factSourceId, characterId, project);
+                                await saveFacts(facts, factSourceId, characterId, project, {
+                                    source: 'reflect_extract', memType: factOwnerMemType ?? null, evidenceIds: [action.sourceId],
+                                });
                         }
                         catch (e) {
                             // 事实是"提取之外的富化"：失败只记在回执里，绝不能把整批打回重跑。
@@ -778,8 +797,8 @@ export async function applyReflectActions(actions, characterId = 'airi', project
 // 导出别名 — 供 proxy.py / _memory_engine.mjs 调用
 // ═══════════════════════════════════════════════════════════
 /** 获取所有记忆（别名，供外部调用） */
-export function getAllMemories(characterId = 'airi', limit = 200, project) {
-    return listAllMemories(characterId, limit, project);
+export function getAllMemories(characterId = 'airi', limit = 200, project, derivedPolicy = 'excluded') {
+    return listAllMemories(characterId, limit, project, derivedPolicy);
 }
 /** 获取记忆关联图 */
 export function getMemoryGraph(characterId = 'airi', project) {
@@ -913,6 +932,10 @@ export async function applyReflectResult(result, characterId = 'airi', project, 
                 project,
                 source: 'reflect_summary',
                 subject: 'user',
+                // v1.27: 摘要 = 派生叙述。带 provenance + 幂等键，默认不进检索/注入/反思/整合。
+                derived: true,
+                generatedBy: 'reflect_summary',
+                evidenceIds: [...(options.allowedSourceIds || [])],
                 metadata: JSON.stringify({ reflection: { sourceIds: [...(options.allowedSourceIds || [])], project: normalizeProject(project), role: 'navigation' } }),
             });
             out.summaryId = mem.id;
@@ -927,7 +950,10 @@ export async function applyReflectResult(result, characterId = 'airi', project, 
     const facts = (result.facts || []).filter((f) => f && typeof f === 'object' && f.subject && f.predicate && f.object);
     if (facts.length > 0) {
         try {
-            const fr = await saveFacts(facts, out.summaryId, characterId, project);
+            // v1.27: 事实不能再挂在摘要是（摘要已成派生叙述）。出处改成这一批的真实证据 id。
+            const fr = await saveFacts(facts, null, characterId, project, {
+                source: 'reflect_facts', evidenceIds: [...(options.allowedSourceIds || [])],
+            });
             out.factsInserted = fr.inserted;
             out.factsUpdated = fr.updated;
         }
@@ -948,6 +974,10 @@ export async function applyReflectResult(result, characterId = 'airi', project, 
                     project,
                     source: 'reflect_insight',
                     subject: 'user',
+                    // v1.27: 洞察同属派生叙述，规则与摘要一致
+                    derived: true,
+                    generatedBy: 'reflect_insight',
+                    evidenceIds: [...(options.allowedSourceIds || [])],
                 });
                 out.insightsCount++;
             }

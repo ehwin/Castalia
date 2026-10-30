@@ -12,6 +12,7 @@ import { embed } from './ollama.js';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { MemType, normalizeMemType } from './memType.js';
 import { parseTagsSafe } from './tags.js';
+import { derivedFilter, derivedPredicate, normalizeDerivedPolicy, parseEvidenceIds, type DerivedPolicy } from './provenance.js';
 import { debugCatch } from './log.js';
 import type Database from 'better-sqlite3';
 
@@ -36,7 +37,28 @@ export interface SearchOptions {
   profile?: 'quick' | 'balanced' | 'deep';
   // v1.15: LobeHub 精细化吸收 — 评分排序
   sort?: 'default' | 'priority' | 'urgency';  // priority=score_priority 优先,urgency=score_urgency 优先
+  /**
+   * v1.27: 派生叙述（reflect_summary / reflect_insight）在检索里的待遇。
+   * 默认 demoted（参与但降权），证据链侧恒排除 —— 见 provenance.ts 的说明。
+   */
+  derivedPolicy?: DerivedPolicy;
 }
+
+/** 策略 → (SQL 片段, 打分折扣) */
+function derivedOpts(options: SearchOptions): { predicate: string; filter: string; penalty: number } {
+  const policy = normalizeDerivedPolicy(options.derivedPolicy);
+  return {
+    predicate: derivedPredicate('m', policy),
+    filter: derivedFilter('m', policy),
+    penalty: policy === 'demoted' ? DERIVED_RANK_PENALTY : 1,
+  };
+}
+
+/** 派生叙述的排序折扣（0.75 ≈ 同等相关性下掉到第 3~4 位）。设 1 = 不降权。 */
+const DERIVED_RANK_PENALTY = (() => {
+  const v = parseFloat(process.env.DERIVED_RANK_PENALTY || '0.75');
+  return Number.isFinite(v) && v > 0 && v <= 1 ? v : 0.75;
+})();
 
 // minScore 阈值可配;harness 可用 SEARCH_MIN_SCORE 覆盖
 const SEARCH_PROFILES: Record<string, { topK: number; minScore: number }> = {
@@ -61,6 +83,8 @@ export interface SearchResult {
   tier: string;
   /** v1.23 Parent-Child：leaf 指向的对话原文 id，用于检索后回捞 */
   parentId?: string | null;
+  /** v1.27: 派生叙述标记（仅 includeDerived 时可能出现） */
+  derived?: boolean;
   score: number;
   similarity: number;
   createdAt: string;
@@ -96,8 +120,8 @@ function decayFor(row: any, hoursSinceCreated: number): number {
   return timeDecay(hoursSinceCreated);
 }
 
-/** 统一评分:一致性 + 情绪(弱) + 时间 */
-function computeScore(similarity: number, row: any): number {
+/** 统一评分:一致性 + 情绪(弱) + 时间（+ 派生叙述折扣） */
+function computeScore(similarity: number, row: any, derivedPenalty: number = 1): number {
   const consistency = Math.min(Math.max(similarity, 0), 0.85);
   const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
   const decay = decayFor(row, hoursSinceCreated);
@@ -110,7 +134,9 @@ function computeScore(similarity: number, row: any): number {
 
   const rawScore = WEIGHT_CONSISTENCY * consistency
                  + WEIGHT_TIME * decay;
-  return Math.round(rawScore * importanceMult * tierBoost * accessBoost * 1000) / 1000;
+  // v1.27: 叙述型派生是导航层，不是证据；留在结果里但压一档，同等相关性下让证据先出
+  const derivedMult = row.derived ? derivedPenalty : 1;
+  return Math.round(rawScore * importanceMult * tierBoost * accessBoost * derivedMult * 1000) / 1000;
 }
 
 /**
@@ -293,6 +319,9 @@ function tagSearch(db: any, options: SearchOptions): SearchResult[] {
   // v1.23-fix: superseded 在三条检索路径上一致排除（此前只有向量路径过滤，标签/文本路径仍会返回被接管的旧记忆）
   const conditions: string[] = ['m.is_active = 1', 'm.project = ?', "COALESCE(m.status, '') <> 'superseded'"];
   const params: any[] = [project];
+  // v1.27: 派生叙述按策略处理（默认参与但降权）
+  const dp = derivedOpts(options);
+  if (dp.predicate) conditions.push(dp.predicate);
 
   conditions.push(`((${tagCond}) OR (${looseCond}))`);
   params.push(...tagParams, ...looseParams);
@@ -306,7 +335,7 @@ function tagSearch(db: any, options: SearchOptions): SearchResult[] {
   const rows = db.prepare(`
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.importance, m.character_id, m.source,
-      m.subject, m.tier, m.parent_id,
+      m.subject, m.tier, m.parent_id, m.derived,
       m.created_at, m.last_accessed_at, m.accessed_count
     FROM memory m
     WHERE ${conditions.join(' AND ')}
@@ -331,8 +360,8 @@ function tagSearch(db: any, options: SearchOptions): SearchResult[] {
       importance: row.importance,
       characterId: row.character_id, source: row.source,
       subject: row.subject || 'user', tier: row.tier || 'standard',
-      parentId: row.parent_id || null,
-      score: computeScore(tagScore, row), similarity: Math.round(tagScore * 1000) / 1000,
+      parentId: row.parent_id || null, derived: !!row.derived,
+      score: computeScore(tagScore, row, dp.penalty), similarity: Math.round(tagScore * 1000) / 1000,
       createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
       accessedCount: row.accessed_count,
     };
@@ -359,6 +388,8 @@ function lexicalSearch(
   if (terms.length === 0) return [];
   const match = terms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
   const where: string[] = ['memory_fts MATCH ?', 'm.is_active = 1', "COALESCE(m.status,'') <> 'superseded'"];
+  const dpLex = derivedOpts(options);
+  if (dpLex.predicate) where.push(dpLex.predicate);
   const params: any[] = [match];
   if (options.project) { where.push('m.project = ?'); params.push(options.project); }
   if (options.category) { where.push('m.category = ?'); params.push(options.category); }
@@ -384,8 +415,8 @@ function lexicalSearch(
         subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
         importance: row.importance, characterId: row.character_id, source: row.source,
         subject: row.subject || 'user', tier: row.tier || 'standard',
-        parentId: row.parent_id || null,
-        score: computeScore(similarity, row), similarity: Math.round(similarity * 1000) / 1000,
+        parentId: row.parent_id || null, derived: !!row.derived,
+        score: computeScore(similarity, row, dpLex.penalty), similarity: Math.round(similarity * 1000) / 1000,
         basis: 'vector' as const,   // 2026-10-28:向量命中自带 basis(注入层按来源取门槛)
         createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
         accessedCount: row.accessed_count,
@@ -434,6 +465,8 @@ function vectorKnnSearch(db: any, options: SearchOptions, floatQuery: Float32Arr
   const conditions: string[] = [`m.rowid IN (${rowidPlaceholders})`, 'm.is_active = 1', 'm.project = ?',
     // v1.23: 被新记忆接管的旧记忆默认不出现在检索结果里（仍可按 id 展开）
     "COALESCE(m.status, '') <> 'superseded'"];
+  const dpVec = derivedOpts(options);
+  if (dpVec.predicate) conditions.push(dpVec.predicate);
   const params: any[] = [...rowidParams, project];
 
   if (options.type) { conditions.push('m.type = ?'); params.push(options.type); }
@@ -444,7 +477,7 @@ function vectorKnnSearch(db: any, options: SearchOptions, floatQuery: Float32Arr
   const rows = db.prepare(`
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.importance, m.character_id, m.source,
-      m.subject, m.tier, m.parent_id,
+      m.subject, m.tier, m.parent_id, m.derived,
       m.created_at, m.last_accessed_at, m.accessed_count, m.rowid
     FROM memory m WHERE ${conditions.join(' AND ')}
   `).all(...params) as any[];
@@ -455,7 +488,7 @@ function vectorKnnSearch(db: any, options: SearchOptions, floatQuery: Float32Arr
     // 不排除,交给合并去重取 similarity 高者。
     const dist = rowidMap.get(row.rowid) ?? 1.0;
     const similarity = l2ToCosine(dist);   // L2 → 余弦(2026-10-28)
-    const score = computeScore(similarity, row);
+    const score = computeScore(similarity, row, dpVec.penalty);
     if (score >= minScore) {
       results.push({
         id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
@@ -463,7 +496,7 @@ function vectorKnnSearch(db: any, options: SearchOptions, floatQuery: Float32Arr
         importance: row.importance,
         characterId: row.character_id, source: row.source,
         subject: row.subject || 'user', tier: row.tier || 'standard',
-        parentId: row.parent_id || null,
+        parentId: row.parent_id || null, derived: !!row.derived,
         score, similarity: Math.round(similarity * 1000) / 1000,
         createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
         accessedCount: row.accessed_count,
@@ -486,7 +519,8 @@ function textFallbackSearch(
   // 结果短问句(只共享 1 个 bigram)又变 0 条,等于没修(2026-10-28)。
   const likeParams = terms.map(t => `%${t}%`);
 
-  const conds: string[] = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `(${terms.map(() => 'm.text LIKE ?').join(' OR ')})`];
+  const dpTxt = derivedOpts(options);
+  const conds: string[] = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'" + dpTxt.filter, `(${terms.map(() => 'm.text LIKE ?').join(' OR ')})`];
   const params: any[] = [project, ...likeParams];
   if (options.memType) { conds.push('m.mem_type = ?'); params.push(options.memType); }
   if (options.type) { conds.push('m.type = ?'); params.push(options.type); }
@@ -513,7 +547,7 @@ function textFallbackSearch(
   const rows = db.prepare(`
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.importance, m.character_id, m.source,
-      m.subject, m.tier, m.parent_id,
+      m.subject, m.tier, m.parent_id, m.derived,
       m.created_at, m.last_accessed_at, m.accessed_count
     FROM memory m
     WHERE ${conds.join(' AND ')}
@@ -535,8 +569,8 @@ function textFallbackSearch(
         importance: row.importance,
         characterId: row.character_id, source: row.source,
         subject: row.subject || 'user', tier: row.tier || 'standard',
-        parentId: row.parent_id || null,
-        score: computeScore(lexSim, row), similarity: Math.round(lexSim * 1000) / 1000,
+        parentId: row.parent_id || null, derived: !!row.derived,
+        score: computeScore(lexSim, row, dpTxt.penalty), similarity: Math.round(lexSim * 1000) / 1000,
         createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
         accessedCount: row.accessed_count,
       };
@@ -570,13 +604,14 @@ export function getRecentMemories(characterId: string, limit: number = 5, hoursB
   for (const mt of dirs) {
     try {
       const db = DatabaseManager.getInstance(proj, mt);
-      const conds: string[] = ['is_active = 1', 'character_id = ?', 'project = ?', 'created_at > ?', "COALESCE(status, '') <> 'superseded'"];
+      // recent = 自动注入（用户没点名要）→ 这里保持硬排除，不跟检索策略走
+      const conds: string[] = ['is_active = 1', 'character_id = ?', 'project = ?', 'created_at > ?', "COALESCE(status, '') <> 'superseded'", 'derived = 0'];
       const params: any[] = [characterId, proj, since];
       if (memType) { conds.push('mem_type = ?'); params.push(memType); }
       params.push(limit);
       const rows = db.prepare(`
         SELECT id, text, project, type, mem_type, category, subcategory, tags,
-               importance, character_id, source, subject, tier,
+               importance, character_id, source, subject, tier, derived,
                created_at, last_accessed_at, accessed_count
         FROM memory
         WHERE ${conds.join(' AND ')}
@@ -588,7 +623,7 @@ export function getRecentMemories(characterId: string, limit: number = 5, hoursB
         subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
         importance: row.importance,
         characterId: row.character_id, source: row.source, subject: row.subject || 'user',
-        tier: row.tier || 'standard',
+        tier: row.tier || 'standard', derived: !!row.derived,
         score: row.importance, similarity: 0,
         createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
         accessedCount: row.accessed_count,
@@ -611,6 +646,10 @@ export interface FactSearchResult {
   confidence: number;
   similarity: number;
   sourceMemoryId: string | null;
+  /** v1.27: 出处（即使跨 memType 也能追回） */
+  sourceMemorySource?: string | null;
+  sourceMemoryMemType?: string | null;
+  evidenceIds?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -677,7 +716,8 @@ export async function searchFacts(
 
   const rows = db.prepare(`
     SELECT f.rowid, f.id, f.subject, f.predicate, f.object, f.confidence,
-           f.source_memory_id, f.created_at, f.updated_at
+           f.source_memory_id, f.source_memory_source, f.source_memory_mem_type, f.evidence_ids,
+           f.created_at, f.updated_at
     FROM facts f
     WHERE ${conditions.join(' AND ')}
     ORDER BY f.confidence DESC
@@ -700,6 +740,9 @@ export async function searchFacts(
       confidence,
       similarity: Math.round(similarity * 1000) / 1000,
       sourceMemoryId: row.source_memory_id,
+      sourceMemorySource: row.source_memory_source ?? null,
+      sourceMemoryMemType: row.source_memory_mem_type ?? null,
+      evidenceIds: parseEvidenceIds(row.evidence_ids),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     });

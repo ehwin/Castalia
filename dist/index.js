@@ -138,9 +138,10 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
     memType: z.enum(MEM_TYPES).optional().describe('Filter by usage dimension: user/feedback/project/reference/general'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
     projects: z.array(z.string()).optional().describe('Cross-library search: search several libraries in one call (e.g. ["default","shared"]). "*" or ["all"] = every library of this instance. Omit for single-library search. Each result carries its source library in "project".'),
+    derivedPolicy: z.enum(['demoted', 'only', 'excluded']).optional().describe('How to treat derived narratives (reflect summaries/insights): demoted = included but ranked down (default), only = only those, excluded = hide them completely. They are never usable as evidence regardless.'),
 }, async (args) => {
     try {
-        const base = { query: args.query, topK: args.topK ?? 5, category: args.category, memType: args.memType, characterId: CHAR_ID };
+        const base = { query: args.query, topK: args.topK ?? 5, category: args.category, memType: args.memType, characterId: CHAR_ID, derivedPolicy: args.derivedPolicy };
         const r = args.projects && args.projects.length > 0
             ? await searchMemoryAcross({ ...base, projects: args.projects })
             : await searchMemory({ ...base, profile: 'balanced', project: args.project });
@@ -158,6 +159,8 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
                 category: m.category,
                 importance: m.importance,
                 score: m.score,
+                source: m.source,
+                derived: m.derived === true,
                 createdAt: m.createdAt,
             })),
             hint: '用 memory_get(id) 取完整内容',
@@ -639,9 +642,15 @@ register('stats_get', 'admin', 'Get memory system statistics: total count, by ca
         // 用户画像库 91 条里只有 4 条 —— 语义检索对这些内容系统性失效，但以前没有任何地方能看出来。
         let vecMissing = 0;
         let vecTotal = 0;
+        // v1.27: 派生叙述单列 —— 检索/注入看不见它们，但必须能观测到"模型自己写了多少"
+        let derivedCount = 0;
         for (const mt of DatabaseManager.existingMemTypes(proj)) {
             const db = DatabaseManager.getInstance(proj, mt);
             total += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj).c;
+            try {
+                derivedCount += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND derived=1').get(proj).c;
+            }
+            catch { /* 旧库未迁移 */ }
             try {
                 const miss = db.prepare(`SELECT COUNT(*) as c FROM memory m
             WHERE m.is_active=1 AND m.project=? AND m.rowid NOT IN (SELECT rowid FROM vec_memory)`).get(proj).c;
@@ -662,6 +671,7 @@ register('stats_get', 'admin', 'Get memory system statistics: total count, by ca
         return ok({
             op: 'stats',
             total,
+            derivedCount,
             vecMissing,
             vecCoverage: vecTotal > 0 ? Math.round((1 - vecMissing / vecTotal) * 1000) / 1000 : 1,
             byCategory: Object.entries(byCategory).map(([category, c]) => ({ category, c })),
@@ -690,9 +700,10 @@ register('memory_list', 'admin', 'List active memories, optionally filtered. Adm
     source: z.string().optional(),
     memType: z.enum(MEM_TYPES).optional().describe('Filter by usage dimension: user/feedback/project/reference/general'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    derivedPolicy: z.enum(['demoted', 'only', 'excluded']).optional().describe('Which rows to list: demoted = all (default, derived rows carry a flag), excluded = evidence only, only = derived narratives only.'),
 }, async (args) => {
     try {
-        const memories = getAllMemories(CHAR_ID, args.limit, args.project);
+        const memories = getAllMemories(CHAR_ID, args.limit, args.project, args.derivedPolicy ?? 'demoted');
         let filtered = memories;
         if (args.category)
             filtered = filtered.filter((m) => m.category === args.category);
@@ -711,6 +722,7 @@ register('memory_list', 'admin', 'List active memories, optionally filtered. Adm
                 memType: m.memType || 'general',
                 category: m.category,
                 importance: m.importance,
+                derived: m.derived === true,
                 createdAt: m.createdAt,
             })),
             hint: '用 memory_get(id) 取完整内容',
@@ -796,6 +808,17 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
                 tier: row.tier,
                 source: row.source,
                 subject: row.subject,
+                // v1.27: provenance 随结果返回 —— 派生叙述要能当场认出来，而不是靠 source 猜
+                derived: !!row.derived,
+                generatedBy: row.generated_by ?? null,
+                evidenceIds: (() => { try {
+                    const v = JSON.parse(String(row.evidence_ids || '[]'));
+                    return Array.isArray(v) ? v : [];
+                }
+                catch {
+                    return [];
+                } })(),
+                evidenceKey: row.evidence_key ?? null,
                 createdAt: row.created_at,
                 updatedAt: row.updated_at,
                 status: row.status || null,
@@ -1278,23 +1301,28 @@ async function main() {
         }, 8000);
     }
     // Agent state: nothing to flush (in-memory only)
+    // v1.27: 后台定时器统一受 CASTALIA_BACKGROUND_TASKS 控制（默认开，=0 全关）。
+    // 报告里"生成器默认不自启"落到这里：只读证据的后台任务可以关掉，不会留下半个循环在跑。
+    const backgroundTasksEnabled = process.env.CASTALIA_BACKGROUND_TASKS !== '0';
     // Consolidate every 24 hours（v1.26：遍历全部库，不再只维护默认库）
-    setInterval(() => {
-        for (const proj of listAllProjects(PROJECT_ID)) {
-            consolidate(proj).catch((e) => debugCatch(`consolidate:${proj}`, e));
-        }
-    }, 24 * 60 * 60 * 1000);
+    if (backgroundTasksEnabled)
+        setInterval(() => {
+            for (const proj of listAllProjects(PROJECT_ID)) {
+                consolidate(proj).catch((e) => debugCatch(`consolidate:${proj}`, e));
+            }
+        }, 24 * 60 * 60 * 1000);
     // Event-driven digest check every 1 minute（v1.26：逐个库检查，热闸本就是 per-project）
-    setInterval(() => {
-        for (const proj of listAllProjects(PROJECT_ID)) {
-            try {
-                maybeDigest(CHAR_ID, proj)?.catch((e) => console.error(`digest error (${proj}):`, e));
+    if (backgroundTasksEnabled)
+        setInterval(() => {
+            for (const proj of listAllProjects(PROJECT_ID)) {
+                try {
+                    maybeDigest(CHAR_ID, proj)?.catch((e) => console.error(`digest error (${proj}):`, e));
+                }
+                catch (e) {
+                    console.error(`digest error (${proj}):`, e);
+                }
             }
-            catch (e) {
-                console.error(`digest error (${proj}):`, e);
-            }
-        }
-    }, 60 * 1000);
+        }, 60 * 1000);
     // WAL checkpoint every 30 minutes
     setInterval(() => {
         try {
@@ -1306,19 +1334,20 @@ async function main() {
             debugCatch('index:walCheckpoint', e);
         }
     }, 30 * 60 * 1000);
-    // Cleanup expired every 30 minutes（v1.26：全部库）
-    setInterval(() => {
-        for (const proj of listAllProjects(PROJECT_ID)) {
-            try {
-                const cleaned = cleanupExpiredMemories(proj);
-                if (cleaned > 0)
-                    console.error(`[castalia] cleaned ${cleaned} expired temporary memories (${proj})`);
+    // Cleanup expired every 30 minutes（v1.26：全部库；v1.27 起随 CASTALIA_BACKGROUND_TASKS=0 关闭）
+    if (backgroundTasksEnabled)
+        setInterval(() => {
+            for (const proj of listAllProjects(PROJECT_ID)) {
+                try {
+                    const cleaned = cleanupExpiredMemories(proj);
+                    if (cleaned > 0)
+                        console.error(`[castalia] cleaned ${cleaned} expired temporary memories (${proj})`);
+                }
+                catch (e) {
+                    console.error(`[castalia] cleanup error (${proj}):`, e.message);
+                }
             }
-            catch (e) {
-                console.error(`[castalia] cleanup error (${proj}):`, e.message);
-            }
-        }
-    }, 30 * 60 * 1000);
+        }, 30 * 60 * 1000);
     // Auto-reflect every N hours (REFLECT_INTERVAL_HOURS > 0 enables)
     const reflectIntervalHours = parseFloat(process.env.REFLECT_INTERVAL_HOURS || '0');
     if (reflectIntervalHours > 0 && process.env.CASTALIA_BACKGROUND_TASKS !== '0') {

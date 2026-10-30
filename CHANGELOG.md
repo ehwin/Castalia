@@ -3,6 +3,32 @@
 > 本文件记录每次功能/架构变更,供 AIRI 主系统(`主系统`)吸收改进时快速对账。
 > 格式:Keep a Changelog 简化版(Added / Changed / Fixed / Removed)。
 
+## [v1.27.0] — 2026-10-31 证据 / 派生叙述分界 + 崩溃安全的处理游标与 claim
+
+> 来源：`psyche-memory-self-cycle-audit-2026-10-30` 与 `psyche-full-chain-upgrade-report-2026-10-31`
+> 中**与记忆体有关、与情感/psyche 无关**的不变量。VAD、psyche 状态机、情绪排序一律没有引入。
+
+### Added
+- **`src/provenance.ts`**：`derivedGuard()` / `isDerivedSource()` / `evidenceKeyOf()` / `parseEvidenceIds()` / `backfillDerivedFlag()`
+- **`src/processClaims.ts`**：`process_claim` + `process_cursor` 两张表；`claimBatch()` / `completeClaims()` / `releaseClaims()` / `getCursor()` / `setCursor()` / `claimStats()` / `processOwner()`；全部读-判-写在 `BEGIN IMMEDIATE` 内
+- **memory 表四列**：`derived` / `generated_by` / `evidence_ids` / `evidence_key`（+ 两个索引）
+- **facts 表三列**：`source_memory_source` / `source_memory_mem_type` / `evidence_ids`
+- **`reflectionSources.listMemoriesForReflection()`**：按 `(created_at, memType, rowid)` 有序推进的证据扫描，排除派生叙述
+- **`ux_memory_evidence_key`**：`(project, evidence_key)` 部分唯一索引 —— 幂等不能只靠 SELECT-then-INSERT
+- `memory_search` / `memory_list` 新增 `derivedPolicy`（`demoted` / `only` / `excluded`）；`memory_get` 返回 `derived` / `generatedBy` / `evidenceIds` / `evidenceKey`；`stats_get` 新增 `derivedCount`
+- 四个回归脚本：`regression_provenance_isolation.mjs`（26 项）、`regression_process_claim.mjs`（19 项，含真·第二进程）、`regression_facts_provenance.mjs`（14 项）、`test_provenance_mcp.mjs`（17 项，真 MCP stdio）
+
+### Changed
+- **叙述型派生的处置：证据链硬排除，检索降权**。`reflect_summary` / `reflect_insight` 不进反思输入、不做整合候选、不能当 `facts` 出处、不能被 merge/split 当源、不进 `memory_recent` 自动注入；但 `memory_search` **仍然返回**，默认乘 `DERIVED_RANK_PENALTY`（0.75）并带 `derived` 标记，可用 `derivedPolicy` 改成 `excluded` / `only`。
+  取舍依据：全库只读普查 95 个库文件 / 9198 行里叙述型 802 行（8.7%），但 `lobehub/lobehub/general` 占 95%、`dsh/dsh/general` 90%、`hermes/hermes/general` 76% —— 硬隔离会把这三个库的召回砍掉大半，而报告反对的是"模型自述被当成用户事实"，不是"搜得到自己写的大纲"。**证据边界一分不让，检索可见性交给部署方**
+- **摘要写入不再被重复生成**：`evidence_key`（证据集合哈希）幂等，同批证据重跑复用已有行
+- **facts 出处不再丢失**：旧实现跨 memType 时把 `source_memory_id` 丢成 NULL 就等于没有出处；现在来源/分类/证据 ids 全部落库，派生记录来源直接拒绝
+- **深度反思换游标**：`reflection_scan.last_id` 的 id 字符串比较 → `(created_at, memType, rowid)` 持久游标，升级时按旧 id 定位一次，避免整库重反射
+- **反思处理加租约**：`auto_reflect` / `deep_reflect` 每批先 claim，多个桥进程不再重复处理同一批证据；崩溃后过期租约由下一轮回收
+- **深度反思轮转语义变了**：从"按 importance 取前 500 轮转"改为"按 `(created_at, memType, rowid)` 顺序推进"。可回放了，但**哪批记忆会被优先整理变了** —— 老的高重要度记忆不再插队
+- **启动迁移**：老库里的 `reflect_summary` / `reflect_insight` 打开库即回填 `derived=1`（`_provenance_meta` 打点，只跑一次）。全库演练（95 库 / 9198 行，只读克隆）结果：行数 9198→9198 零丢失、derived 802 行逐库与预期一致、内容型 2145 行全部仍可见、唯一索引全部建成、总迁移耗时 1055ms
+- `CASTALIA_BACKGROUND_TASKS=0` 现在同时关闭 consolidate / digest / 过期清理（此前只关周期反思）
+
 ## [v1.26.0] — 2026-10-30 已知限制五条逐条落地（晋升即嵌/多库维护/精确晋升即删/空 catch 有出口）
 
 ### Added

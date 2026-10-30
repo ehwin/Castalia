@@ -84,3 +84,78 @@ export function getUnanalyzedConversations(
   return all.filter(row => !processed.has(row.id)).slice(0, limit).map(row => ({ id: row.id, text: row.text, createdAt: row.created_at }));
 }
 
+/**
+ * v1.27 反射输入扫描 —— 按 (created_at, memType, rowid) 全局有序推进。
+ *
+ * 为什么要换掉原来的 `deepReflectionCursor`（id 字符串比较）：
+ *   1. id 是随机串，`m.id > cursor` 与时间顺序无关，轮转会出现"永远轮不到"和"反复轮同一批"；
+ *   2. id 比较无法表达"这一条我处理到哪了"，进程中断后只能整批重来；
+ *   3. 派生叙述（reflect_summary / reflect_insight）必须排除在输入之外，
+ *      否则模型读自己写的摘要再写摘要，就是报告里说的自我强化。
+ *
+ * rowid 只在单库内可比，所以跨 memType 扫描时用 memType 作为次级键。
+ */
+export interface ReflectionScanRow {
+  id: string;
+  text: string;
+  createdAt: string;
+  rowid: number;
+  memType: string;
+  type: string;
+  category: string;
+  tags: string;
+  importance: number;
+  source: string | null;
+  tier: string;
+  locked: number;
+}
+
+export function listMemoriesForReflection(opts: {
+  project?: string;
+  after?: { createdAt: string; rowid: number; tag?: string } | null;
+  limit?: number;
+}): ReflectionScanRow[] {
+  const proj = normalizeProject(opts.project);
+  const limit = Math.max(1, opts.limit ?? 200);
+  const after = opts.after ?? null;
+  const out: ReflectionScanRow[] = [];
+  for (const mt of listMemTypeDirs(proj)) {
+    let db: any;
+    try { db = DatabaseManager.getInstance(proj, mt); } catch { continue; }
+    const conds = [
+      'is_active = 1',
+      'project = ?',
+      "COALESCE(status, '') NOT IN ('cold', 'superseded')",
+      'derived = 0',
+    ];
+    const params: any[] = [proj];
+    if (after) {
+      // (created_at, memType, rowid) 严格大于游标
+      conds.push('(created_at > ? OR (created_at = ? AND (? > ? OR (? = ? AND rowid > ?))))');
+      params.push(after.createdAt, after.createdAt, mt, after.tag ?? '', mt, after.tag ?? '', after.rowid);
+    }
+    try {
+      const rows = db.prepare(`
+        SELECT rowid, id, text, type, mem_type, category, tags, importance, source, tier,
+               locked, created_at
+        FROM memory
+        WHERE ${conds.join(' AND ')}
+        ORDER BY created_at ASC, rowid ASC
+        LIMIT ?
+      `).all(...params, limit) as any[];
+      for (const r of rows) {
+        out.push({
+          id: String(r.id), text: String(r.text ?? ''), createdAt: String(r.created_at),
+          rowid: Number(r.rowid), memType: mt, type: String(r.type || 'episodic'),
+          category: String(r.category || 'general'), tags: String(r.tags || '[]'),
+          importance: Number(r.importance ?? 0.5), source: r.source ?? null,
+          tier: String(r.tier || 'standard'), locked: Number(r.locked || 0),
+        });
+      }
+    } catch { /* 单分类库失败不影响其它库 */ }
+  }
+  out.sort((a, b) =>
+    a.createdAt.localeCompare(b.createdAt) || a.memType.localeCompare(b.memType) || a.rowid - b.rowid);
+  return out.slice(0, limit);
+}
+

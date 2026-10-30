@@ -13,7 +13,7 @@
  *   REFLECT_MAX_FACTS     每轮最多提取 facts 条数 (default 15)
  *   REFLECT_INTERVAL_HOURS auto-reflect interval (hours), 0 = off, default 0
  */
-import { getUnanalyzedConversations, listAllMemories, applyReflectResult, applyReflectActions, markConversationsReflected, deepReflectionCursor } from './reflect.js';
+import { getUnanalyzedConversations, applyReflectResult, applyReflectActions, markConversationsReflected, deepReflectionCursor } from './reflect.js';
 import { DatabaseManager, listMemTypeDirs, currentMemDir, safeFilePart } from './db.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -26,6 +26,10 @@ import { loadPromptOverride } from './promptFile.js';
 import { makeLlmChannel, callLlm, parseJsonRobust, REFLECT_DEEP_MAX_TOKENS } from './reflectionLlm.js';
 export { makeLlmChannel, callLlm, parseJsonRobust, REFLECT_DEEP_MAX_TOKENS } from './reflectionLlm.js';
 import { fidelitySystemPrompt, reflectionPolicy, reflectionFidelityPrompt, wholeRecordBatches } from './reflectionFidelity.js';
+import { listMemoriesForReflection } from './reflectionSources.js';
+import { claimBatch, completeClaims, releaseClaims, getCursor, setCursor, processOwner } from './processClaims.js';
+/** v1.27: 反射处理的 claim 租约。LLM 一批可能跑几分钟，10 分钟不够就按 15 分钟给。 */
+const REFLECT_CLAIM_TTL_MS = 15 * 60 * 1000;
 const FACT_EXTRACTION = (process.env.REFLECT_FACT_EXTRACTION || 'auto').trim().toLowerCase();
 const MAX_FACTS = parseInt(process.env.REFLECT_MAX_FACTS || '15', 10) || 15;
 // 启动自动反思触发阈值(条件达成后,下次启动 server 时自动执行一次)
@@ -414,9 +418,23 @@ export async function runAutoReflect(charId, limit = 30, project) {
         // v1.23.2-fix: 先落“进行中”状态（原子写），进程被 kill/OOM 时下次不会把半轮当“从未尝试”
         if (batches.length > 0)
             recordReflectAttempt(normalizeProject(project), false, ['上一轮未完成（进程可能被中断）'], 0);
-        for (const batch of batches) {
+        // v1.27: 会话证据同样要走 claim —— 多个桥并行时不能两个进程同时对同一批对话做反思，
+        // 否则会各写一条摘要（错误去重靠 evidence_key，但白花一次 LLM 调用）。
+        const autoOwner = processOwner();
+        const autoKind = 'auto_reflect';
+        for (const rawBatch of batches) {
+            const claimed = new Set(claimBatch({
+                project, kind: autoKind, owner: autoOwner,
+                keys: rawBatch.map((x) => String(x.id)), ttlMs: REFLECT_CLAIM_TTL_MS,
+            }));
+            const batch = rawBatch.filter((x) => claimed.has(String(x.id)));
+            if (batch.length === 0) {
+                out.errors.push('本批会话已被其它进程处理（claim 未取到），跳过');
+                break;
+            }
             const llm = await callLlm(systemPrompt, `请逐条分析以下完整记录，输出反思JSON：\n${JSON.stringify(batch)}`, undefined, REFLECT_DEEP_MAX_TOKENS);
             if (!llm || llm.finishReason === 'length') {
+                releaseClaims({ project, kind: autoKind, owner: autoOwner, keys: [...claimed] });
                 out.errors.push(!llm ? 'LLM 调用失败；本批保留待重试' : 'LLM 输出被截断；本批未应用，保留待重试');
                 break;
             }
@@ -424,6 +442,7 @@ export async function runAutoReflect(charId, limit = 30, project) {
             if (!parsed || !Array.isArray(parsed.actions)) {
                 // 失败必须可诊断：空响应常是服务端内容过滤(finish=content_filter)，
                 // 记下 finish/chars/头部，省得下次只能看到“未返回完整 JSON”再猜。
+                releaseClaims({ project, kind: autoKind, owner: autoOwner, keys: [...claimed] });
                 const head = llm.content ? `, head=${JSON.stringify(llm.content.slice(0, 160))}` : '';
                 out.errors.push(`未返回完整反思 JSON 和 actions；本批保留待重试（finish=${llm.finishReason || 'n/a'}, chars=${llm.content.length}${head}）`);
                 break;
@@ -455,9 +474,12 @@ export async function runAutoReflect(charId, limit = 30, project) {
                 console.error('[reflect] warning:', w);
             }
             out.errors.push(...r.errors);
-            if (r.errors.length)
+            if (r.errors.length) {
+                releaseClaims({ project, kind: autoKind, owner: autoOwner, keys: [...claimed] });
                 break;
+            }
             markConversationsReflected(processedIds, project);
+            completeClaims({ project, kind: autoKind, owner: autoOwner, keys: [...claimed] });
             out.processedCount += processedIds.length;
             out.deferredCount -= processedIds.length;
             if (processedIds.length < batch.length) {
@@ -476,6 +498,18 @@ export async function runAutoReflect(charId, limit = 30, project) {
     }
 }
 /**
+ * v1.27 一次性迁移：旧 `reflection_scan.last_id` 只存 id，把它映射成
+ * (created_at, memType, rowid) 游标，避免升级后整库从头再反射一遍（那是几十次 LLM 调用）。
+ */
+function seedDeepCursorFromLegacy(project) {
+    const legacy = deepReflectionCursor(project);
+    if (!legacy)
+        return null;
+    const rows = listMemoriesForReflection({ project, after: null, limit: 2000 });
+    const hit = rows.find(r => r.id === legacy);
+    return hit ? { createdAt: hit.createdAt, rowid: hit.rowid, tag: hit.memType } : null;
+}
+/**
  * 深度校准:全量记忆 → 去重/画像/图谱
  * v1.20: 分批送模型(默认每批 12 条,单次最多 4 批)。一次性塞 30+ 条会让模型输出超过
  * max_tokens 被截断,JSON 解析失败反而整轮丢弃;分批后每批输出小、必闭合,代价是多次调用。
@@ -487,12 +521,20 @@ export async function runDeepReflect(charId, limit = 500, project) {
         return { ...base, skipped: true, errors: ['REFLECT_LLM_API_KEY 未配置,跳过反思'] };
     }
     try {
-        const memories = listAllMemories(charId, limit, project);
-        memories.sort((a, b) => a.id.localeCompare(b.id));
-        const cursor = deepReflectionCursor(project);
-        const nextIndex = memories.findIndex(m => m.id > cursor);
-        if (nextIndex > 0)
-            memories.push(...memories.splice(0, nextIndex));
+        const owner = processOwner();
+        const kind = 'deep_reflect';
+        // v1.27: 输入 = 按 (created_at, memType, rowid) 有序推进的证据扫描，排除派生叙述。
+        // 旧实现按 id 字符串比较轮转，既与时间无关，也无法从中断点恢复。
+        let cursor = getCursor(project, kind);
+        if (!cursor)
+            cursor = seedDeepCursorFromLegacy(project);
+        let scan = listMemoriesForReflection({ project, after: cursor, limit });
+        if (scan.length === 0 && cursor) {
+            // 走到末尾 → 从头再轮一遍（等价于原来的环绕，但游标是持久且可回放的）
+            cursor = null;
+            scan = listMemoriesForReflection({ project, after: null, limit });
+        }
+        const memories = scan;
         if (memories.length === 0) {
             return { ...base, ok: true, memoryCount: 0, skipped: true, errors: ['库为空'] };
         }
@@ -500,8 +542,14 @@ export async function runDeepReflect(charId, limit = 500, project) {
             id: m.id,
             text: m.text || '',
             type: m.type, memType: m.memType || 'general', category: m.category,
-            tags: m.tags || [], importance: m.importance ?? 0.5,
-            emotionalImpact: m.emotionalImpact ?? 0, tier: m.tier || 'standard',
+            tags: (() => { try {
+                return JSON.parse(m.tags);
+            }
+            catch {
+                return [];
+            } })(),
+            importance: m.importance ?? 0.5,
+            emotionalImpact: 0, tier: m.tier || 'standard',
             locked: m.locked || 0, source: m.source || '',
             date: (m.createdAt || '').slice(0, 10),
         }));
@@ -513,20 +561,33 @@ export async function runDeepReflect(charId, limit = 500, project) {
             actions: 0, applied: 0, factsInserted: 0, factsUpdated: 0, errors: [], receipts: [],
         };
         let okBatches = 0;
-        for (const batch of batches.slice(0, maxCalls)) {
+        for (const rawBatch of batches.slice(0, maxCalls)) {
+            // v1.27: 处理前先取租约 —— 本机多个桥各起一个引擎进程时，同一批证据只能有一个执行者。
+            // 抢不到的键直接跳过；进程被杀后租约到期由下一轮回收（stale reclaim）。
+            const claimed = new Set(claimBatch({
+                project, kind, owner, keys: rawBatch.map((x) => String(x.id)), ttlMs: REFLECT_CLAIM_TTL_MS,
+            }));
+            const batch = rawBatch.filter((x) => claimed.has(String(x.id)));
+            if (batch.length === 0) {
+                out.errors.push('本批证据已被其它进程处理（claim 未取到），跳过');
+                break;
+            }
             const userPrompt = `记忆列表(${batch.length} 条)：\n\n${JSON.stringify(batch, null, 1)}\n\n请深度分析本批记忆，返回 JSON 操作对象。`;
             const systemPrompt = reflectionPolicy(project) === 'standard' ? buildDeepReflectPrompt() + '\n' + reflectionFidelityPrompt(project) : fidelitySystemPrompt(project);
             const llm = await callLlm(systemPrompt, userPrompt, undefined, REFLECT_DEEP_MAX_TOKENS);
             if (!llm) {
+                releaseClaims({ project, kind, owner, keys: [...claimed] });
                 out.errors.push('LLM 调用失败');
                 break;
             }
             if (llm.finishReason === 'length') {
+                releaseClaims({ project, kind, owner, keys: [...claimed] });
                 out.errors.push('本批输出被截断，已保留未处理；下次重试');
                 break;
             }
             const parsed = parseJsonRobust(llm.content, false);
             if (!parsed || !Array.isArray(parsed.actions)) {
+                releaseClaims({ project, kind, owner, keys: [...claimed] });
                 out.errors.push(`未找到有效 JSON actions 结果（finish=${llm.finishReason || 'n/a'}, chars=${llm.content.length}）`);
                 break;
             }
@@ -534,8 +595,16 @@ export async function runDeepReflect(charId, limit = 500, project) {
             const r = await applyReflectResult(result, charId, project, { allowedSourceIds: new Set(batch.map(x => x.id)), automatic: true });
             if (r.errors.length === 0) {
                 okBatches++;
-                deepReflectionCursor(project, batch[batch.length - 1].id);
+                // v1.27: 游标只在写库成功之后推进；推游标与释放租约同一步，崩溃后按证据重放。
+                const last = batch[batch.length - 1];
+                const lastRow = memories.find(m => m.id === last.id);
+                if (lastRow)
+                    setCursor(project, kind, { createdAt: lastRow.createdAt, rowid: lastRow.rowid, tag: lastRow.memType });
+                completeClaims({ project, kind, owner, keys: [...claimed] });
                 out.processedCount = (out.processedCount || 0) + batch.length;
+            }
+            else {
+                releaseClaims({ project, kind, owner, keys: [...claimed] });
             }
             out.actions += (result.actions || []).length;
             out.applied += r.actionsApplied;

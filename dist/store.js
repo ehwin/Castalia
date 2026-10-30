@@ -10,6 +10,7 @@ import { CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
 import { isMemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 import { reflectionPolicySafe } from './reflectionFidelity.js';
+import { isDerivedSource, normalizeEvidenceIds, serializeEvidenceIds, evidenceKeyOf, parseEvidenceIds } from './provenance.js';
 import { debugCatch, debugLog } from './log.js';
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
@@ -18,8 +19,16 @@ export async function saveMemory(params) {
         throw new Error('memory text must not be empty');
     // memdir 路由:按 memType 落对应分类库(memory/<project>/<memType>/memory.sqlite)
     const now = new Date().toISOString();
-    const skipEmbed = params.skipEmbed === true;
     const project = normalizeProject(params.project);
+    // v1.27 来源分界：派生叙述不向量化（它不该成为检索目标，也不该占向量位）、
+    // 记录 provenance，并用 evidence_key 做崩溃重试幂等。
+    const derived = params.derived === true || isDerivedSource(params.source);
+    const generatedBy = params.generatedBy ?? (derived ? (params.source ?? null) : null);
+    const evidenceIds = normalizeEvidenceIds(params.evidenceIds);
+    const evidenceKey = params.evidenceKey ?? (derived ? evidenceKeyOf(generatedBy || 'derived', evidenceIds) : null);
+    // v1.27-B: 派生叙述仍然可检索（降权而非隐藏），所以照常向量化；
+    // 只有调用方显式 skipEmbed（digest 暂存）才不嵌。
+    const skipEmbed = params.skipEmbed === true;
     // 2026-10-27 修复(NF-1):写路径必须用 Safe 版 —— 坏 config.json 不能让 memory_save 失效
     const preserve = reflectionPolicySafe(project) !== 'standard';
     let memType;
@@ -55,7 +64,25 @@ export async function saveMemory(params) {
         scoreConfidence: row.score_confidence, scoreImpact: row.score_impact,
         scorePriority: row.score_priority, scoreUrgency: row.score_urgency,
         identityLocked: !!row.identity_locked,
+        derived: !!row.derived, generatedBy: row.generated_by ?? null,
+        evidenceIds: parseEvidenceIds(row.evidence_ids), evidenceKey: row.evidence_key ?? null,
     });
+    // ═══ v1.27 evidence_key 幂等：同一证据集合 + 同一派生种类只落一行 ═══
+    // 崩溃发生在"写完日记/摘要"与"提交处理进度"之间时，重试必须复用已有派生行，
+    // 不能因为模型重新措辞就多出一条（那正是自我强化/重复摘要的来源）。
+    if (evidenceKey) {
+        for (const mt of DatabaseManager.existingMemTypes(project)) {
+            try {
+                const d = DatabaseManager.getInstance(project, mt);
+                const hit = d.prepare('SELECT * FROM memory WHERE is_active = 1 AND project = ? AND evidence_key = ? LIMIT 1').get(project, evidenceKey);
+                if (hit) {
+                    d.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(hit.id);
+                    return recordOf(hit);
+                }
+            }
+            catch { /* 旧库缺列时按无幂等处理 */ }
+        }
+    }
     const exactDup = db.prepare(`
     SELECT * FROM memory
     WHERE is_active = 1 AND project = ? AND ${preserve ? 'TRIM(text) = TRIM(?)' : 'LOWER(TRIM(text)) = LOWER(TRIM(?))'}
@@ -136,12 +163,13 @@ export async function saveMemory(params) {
         scoreConfidence: params.scoreConfidence ?? null, scoreImpact: params.scoreImpact ?? null,
         scorePriority: params.scorePriority ?? null, scoreUrgency: params.scoreUrgency ?? null,
         identityLocked: params.identityLocked === true,
+        derived, generatedBy, evidenceIds, evidenceKey,
     };
     const storeTx = db.transaction(() => {
         db.prepare(`
-      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, metadata, title, status, score_confidence, score_impact, score_priority, score_urgency, identity_locked)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory, serializeTags(record.tags), record.importance, record.importance, record.characterId, record.source, record.subject, record.tier, record.expiresAt, 1, record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0, 0, record.metadata, record.title, record.status, record.scoreConfidence, record.scoreImpact, record.scorePriority, record.scoreUrgency, record.identityLocked ? 1 : 0);
+      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, metadata, title, status, score_confidence, score_impact, score_priority, score_urgency, identity_locked, derived, generated_by, evidence_ids, evidence_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory, serializeTags(record.tags), record.importance, record.importance, record.characterId, record.source, record.subject, record.tier, record.expiresAt, 1, record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0, 0, record.metadata, record.title, record.status, record.scoreConfidence, record.scoreImpact, record.scorePriority, record.scoreUrgency, record.identityLocked ? 1 : 0, derived ? 1 : 0, generatedBy, serializeEvidenceIds(evidenceIds), evidenceKey);
         // v5.0: 仅在非 skipEmbed 时写入向量
         if (!skipEmbed && vector) {
             const info = db.prepare('SELECT rowid FROM memory WHERE id = ?').get(record.id);
@@ -156,7 +184,23 @@ export async function saveMemory(params) {
             db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(rowid, new Float32Array(vector));
         }
     });
-    storeTx();
+    try {
+        storeTx();
+    }
+    catch (e) {
+        // v1.27: 唯一索引 ux_memory_evidence_key 兜住跨进程竞态 ——
+        // 两个进程同时算同一批证据时，后到的那个在这里撞约束，回读已存在的行即可。
+        if (evidenceKey && /UNIQUE constraint failed.*evidence_key/i.test(String(e.message))) {
+            for (const mt of DatabaseManager.existingMemTypes(project)) {
+                const d = DatabaseManager.getInstance(project, mt);
+                const hit = d.prepare('SELECT * FROM memory WHERE is_active = 1 AND project = ? AND evidence_key = ? LIMIT 1')
+                    .get(project, evidenceKey);
+                if (hit)
+                    return recordOf(hit);
+            }
+        }
+        throw e;
+    }
     // 定期整理
     saveCount++;
     if (saveCount >= CONSOLIDATE_INTERVAL) {
@@ -502,6 +546,7 @@ export async function batchEmbedPending(characterId = 'airi', project, opts = {}
             params.push(characterId);
         }
         conditions.push("COALESCE(m.source, '') != 'conversation_log'");
+        // v1.27-B: 派生叙述参与检索（降权），同样需要补向量；不再排除
         if (project) {
             conditions.push('m.project = ?');
             params.push(proj);
@@ -591,7 +636,13 @@ export async function batchEmbedPending(characterId = 'airi', project, opts = {}
  *   - 同一 S-P-O → 更新 confidence 为 MAX(old, new)，不重复插入
  *   - 不同 S-P-O → 正常插入
  */
-export async function saveFacts(facts, sourceMemoryId = null, characterId = 'airi', project) {
+export async function saveFacts(facts, sourceMemoryId = null, characterId = 'airi', project, // v1.5: 项目隔离
+/**
+ * v1.27 来源出处：跨 memType 的证据不再把 provenance 丢成 NULL。
+ * source_memory_id 仍只在同库（general）时挂 —— 跨库外键本来就是错的；
+ * 但 source / mem_type / evidence_ids 一定落库，事实永远能追回出处。
+ */
+sourceRef) {
     if (!facts || facts.length === 0)
         return { inserted: 0, updated: 0 };
     const db = DatabaseManager.getInstance(project);
@@ -599,13 +650,45 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = 'air
     const proj = normalizeProject(project);
     let inserted = 0;
     let updated = 0;
+    // 来源校验：必须存在、active、同项目，且不能是派生叙述（模型自己写的解释不能再当出处）
+    let resolvedSourceId = null;
+    let resolvedSource = sourceRef?.source ?? null;
+    let resolvedMemType = sourceRef?.memType ?? null;
+    let resolvedEvidenceIds = serializeEvidenceIds(sourceRef?.evidenceIds);
+    if (sourceMemoryId) {
+        const found = findDbByMemoryId(sourceMemoryId, project);
+        if (found) {
+            const row = found.db.prepare('SELECT source, derived, is_active, project FROM memory WHERE id = ?').get(sourceMemoryId);
+            if (row && row.is_active && normalizeProject(row.project) === proj && !row.derived) {
+                resolvedSource = row.source ?? resolvedSource;
+                resolvedMemType = found.memType;
+                // 跨 memType 不挂本地外键（facts 表在 general 库），provenance 用 source+mem_type 表达
+                resolvedSourceId = found.memType === 'general' ? sourceMemoryId : null;
+            }
+            else {
+                // 派生叙述 / 失活 / 跨项目来源：一律不挂，连出处信息也不留。
+                // 留下"这条事实出自某段模型自述"本身就是把派生记录当成了证据。
+                if (row?.derived) {
+                    debugLog(`[facts] 拒绝派生叙述作为出处: ${sourceMemoryId} (source=${row.source})`);
+                }
+                resolvedSourceId = null;
+                resolvedSource = null;
+                resolvedMemType = null;
+            }
+        }
+        else {
+            resolvedSourceId = null;
+            resolvedSource = null;
+            resolvedMemType = null;
+        }
+    }
     // v1.23.1-fix: 不再依赖 ON CONFLICT 目标（旧实现每次启动 DROP 唯一索引再重建，
     // 一旦重建失败，ON CONFLICT 在 prepare 阶段就抛错 → facts 永久断流）。
     // 这里显式 find→update/insert，并把整批写入 + 互斥失效放进同一个事务。
     const findStmt = db.prepare('SELECT id FROM facts WHERE subject=? AND predicate=? AND object=? AND project=?');
     const insertStmt = db.prepare(`
-    INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id, character_id, is_active, created_at, updated_at, evidence, valid_from, valid_to)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+    INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id, character_id, is_active, created_at, updated_at, evidence, valid_from, valid_to, source_memory_source, source_memory_mem_type, evidence_ids)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
     const updateStmt = db.prepare(`
     UPDATE facts SET
@@ -615,7 +698,10 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = 'air
       evidence = COALESCE(NULLIF(?, ''), evidence),
       valid_from = COALESCE(?, valid_from),
       valid_to = ?,
-      source_memory_id = COALESCE(?, source_memory_id)
+      source_memory_id = COALESCE(?, source_memory_id),
+      source_memory_source = COALESCE(?, source_memory_source),
+      source_memory_mem_type = COALESCE(?, source_memory_mem_type),
+      evidence_ids = COALESCE(?, evidence_ids)
     WHERE id = ?
   `);
     // v1.23 冲突失效（Graphiti 式）：功能性关系（一个主体只能有一个值）出现新值时，
@@ -640,11 +726,11 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = 'air
         for (const f of facts) {
             const before = findStmt.get(f.subject, f.predicate, f.object, proj);
             if (before) {
-                updateStmt.run(f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null, sourceMemoryId, before.id);
+                updateStmt.run(f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null, resolvedSourceId, resolvedSource, resolvedMemType, resolvedEvidenceIds, before.id);
                 updated++;
             }
             else {
-                insertStmt.run(generateId(), f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now, f.evidence ?? null, f.validFrom ?? null, f.validTo ?? null);
+                insertStmt.run(generateId(), f.subject, f.predicate, f.object, proj, f.confidence, resolvedSourceId, characterId, now, now, f.evidence ?? null, f.validFrom ?? null, f.validTo ?? null, resolvedSource, resolvedMemType, resolvedEvidenceIds);
                 inserted++;
             }
         }
@@ -663,7 +749,9 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = 'air
         }
     });
     try {
-        applyTx();
+        // v1.27: 读-判-写必须 BEGIN IMMEDIATE —— 多桥进程并发写 facts 时，
+        // deferred 事务会让两个进程读到同一个 before，然后各自 INSERT。
+        applyTx.immediate();
     }
     catch (e) {
         console.error('[facts] 批量写入失败（整批回滚）:', e.message);

@@ -81,3 +81,52 @@ limit = 30, project) {
     }
     return all.filter(row => !processed.has(row.id)).slice(0, limit).map(row => ({ id: row.id, text: row.text, createdAt: row.created_at }));
 }
+export function listMemoriesForReflection(opts) {
+    const proj = normalizeProject(opts.project);
+    const limit = Math.max(1, opts.limit ?? 200);
+    const after = opts.after ?? null;
+    const out = [];
+    for (const mt of listMemTypeDirs(proj)) {
+        let db;
+        try {
+            db = DatabaseManager.getInstance(proj, mt);
+        }
+        catch {
+            continue;
+        }
+        const conds = [
+            'is_active = 1',
+            'project = ?',
+            "COALESCE(status, '') NOT IN ('cold', 'superseded')",
+            'derived = 0',
+        ];
+        const params = [proj];
+        if (after) {
+            // (created_at, memType, rowid) 严格大于游标
+            conds.push('(created_at > ? OR (created_at = ? AND (? > ? OR (? = ? AND rowid > ?))))');
+            params.push(after.createdAt, after.createdAt, mt, after.tag ?? '', mt, after.tag ?? '', after.rowid);
+        }
+        try {
+            const rows = db.prepare(`
+        SELECT rowid, id, text, type, mem_type, category, tags, importance, source, tier,
+               locked, created_at
+        FROM memory
+        WHERE ${conds.join(' AND ')}
+        ORDER BY created_at ASC, rowid ASC
+        LIMIT ?
+      `).all(...params, limit);
+            for (const r of rows) {
+                out.push({
+                    id: String(r.id), text: String(r.text ?? ''), createdAt: String(r.created_at),
+                    rowid: Number(r.rowid), memType: mt, type: String(r.type || 'episodic'),
+                    category: String(r.category || 'general'), tags: String(r.tags || '[]'),
+                    importance: Number(r.importance ?? 0.5), source: r.source ?? null,
+                    tier: String(r.tier || 'standard'), locked: Number(r.locked || 0),
+                });
+            }
+        }
+        catch { /* 单分类库失败不影响其它库 */ }
+    }
+    out.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.memType.localeCompare(b.memType) || a.rowid - b.rowid);
+    return out.slice(0, limit);
+}

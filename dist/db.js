@@ -18,6 +18,7 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { normalizeMemType } from './memType.js';
+import { backfillDerivedFlag } from './provenance.js';
 import { debugCatch } from './log.js';
 /** memdir 分类文件夹名(memType → 目录名,general 为默认/元数据) */
 export function memTypeDir(memType) {
@@ -821,6 +822,78 @@ export function initProjectSchema(db) {
     catch (_e) {
         debugCatch('db:ddl', _e);
     }
+    // v1.27 来源分界（取自已审计链路的不变量，只保留记忆体部分）：
+    //   derived      1 = 派生叙述（reflect_summary / reflect_insight），默认不进检索/注入/反思/整合
+    //   generated_by 谁生成的行（reflect_extract / reflect_merge / self_cycle …），内容型派生也记
+    //   evidence_ids 这条记录引用的证据 id（JSON 数组）
+    //   evidence_key 幂等键：同一证据集合 + 同一派生种类只落一行
+    // facts 侧同理补 source_memory_source / source_memory_mem_type ——
+    // 旧实现因为"跨库会触发 FOREIGN KEY"直接把来源丢成 NULL，等于事实没有出处。
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN derived INTEGER DEFAULT 0`);
+    }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN generated_by TEXT`);
+    }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN evidence_ids TEXT`);
+    }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
+    try {
+        db.exec(`ALTER TABLE memory ADD COLUMN evidence_key TEXT`);
+    }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
+    try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_derived ON memory(derived, is_active)`);
+    }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
+    try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_evidence_key ON memory(project, evidence_key)`);
+    }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
+    // v1.27: 幂等键必须是库级唯一约束 —— 只靠 SELECT-then-INSERT 在多进程下有窗口
+    // （claim 只挡得住反思路径，挡不住 memory_save 直接传 source=reflect_summary）。
+    // 部分索引：只约束非空键，普通记忆不受影响。老库里若已有重复行会建不起来，只告警。
+    try {
+        db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_memory_evidence_key ON memory(project, evidence_key) WHERE evidence_key IS NOT NULL`);
+    }
+    catch (e) {
+        console.error(`[db] evidence_key 唯一索引未建立（库内已有重复派生行，需先人工去重）: ${e.message}`);
+    }
+    try {
+        db.exec(`ALTER TABLE facts ADD COLUMN source_memory_source TEXT`);
+    }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
+    try {
+        db.exec(`ALTER TABLE facts ADD COLUMN source_memory_mem_type TEXT`);
+    }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
+    try {
+        db.exec(`ALTER TABLE facts ADD COLUMN evidence_ids TEXT`);
+    }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
+    // 历史行回填：老库里已存在的 reflect_summary / reflect_insight 补 derived=1（一次性，带打点）
+    backfillDerivedFlag(db);
     try {
         db.exec(`CREATE TRIGGER IF NOT EXISTS trg_memory_base_importance AFTER INSERT ON memory
              WHEN NEW.base_importance IS NULL

@@ -233,11 +233,36 @@ memory/                              ← MEMORY_DB_DIR
 - prompt 可用 `REFLECT_PROMPT_FILE` / `CONSOLIDATE_PROMPT_FILE` 覆盖，不必改源码
 - LLM 调用带重试（默认 3 次）与超时（默认 180s），失败按 `REFLECT_FAIL_BACKOFF_HOURS` 退避
 
+### 证据与派生记录的分界（v1.27）
+
+反思写回的内容分三类。**「不能当证据」和「不能被人搜到」是两件事**，这里只把前者做成硬边界：
+
+| 类别 | 来源 | 证据链（反思/facts/整合/合并） | 检索与注入 |
+|---|---|---|---|
+| 证据 | 用户写入、`conversation_log` | 允许 | 正常 |
+| 内容型派生 | `reflect_extract` / `reflect_merge` / `reflect_split` | 允许（它们就是记忆体主体） | 正常 |
+| 叙述型派生 | `reflect_summary` / `reflect_insight` | **拒绝**（不得回灌成证据） | `memory_search` 参与但**降权**；`memory_recent` 注入排除 |
+
+为什么叙述型不做硬隔离：摘要的 `metadata.role = 'navigation'`，它是从对话压出来的**导航层**。全库普查（95 个库文件 / 9198 行）里 802 行是叙述型（8.7%），集中度却很高 —— `lobehub/lobehub/general` 95%、`dsh/dsh/general` 90%、Hermes 自己用的 `hermes/hermes/general` 76%。硬排除等于把这三个库的召回砍掉大半，而报告原本要防的是「模型自述被当成用户事实」，不是「有人搜到过自己写的大纲」。
+
+叙事型派生行落库时带四个字段：`derived=1`、`generated_by`、`evidence_ids`、`evidence_key`。规则：
+
+- 证据链硬排除：不进反思输入（`listAllMemories`、`listMemoriesForReflection`）、不参与整合候选、不被 `merge`/`split` 当源、不能当 `facts` 出处；
+- 自动注入排除：`memory_recent`（没被点名要的，不塞进 prompt）；
+- 检索按 `derivedPolicy` 处理：`demoted`（默认，分数 ×`DERIVED_RANK_PENALTY`=0.75 并带 `derived` 标记）/ `excluded` / `only`；
+- 同一批证据重跑（哪怕模型换了措辞）复用同一行 —— `evidence_key` 由证据集合决定，库里还有 `ux_memory_evidence_key` 唯一索引兜跨进程竞态。
+
+`facts` 的来源也不再因为「跨 memType 外键」而丢成 NULL：`source_memory_id` 只在同库（`general`）挂，跨库时用 `source_memory_source` + `source_memory_mem_type` + `evidence_ids` 表达，派生记录一律拒绝做出处。
+
+**崩溃恢复与并发**：反思的输入游标是 `(created_at, memType, rowid)` 持久游标（不再是 id 字符串比较），每批处理前先取租约式 claim（`process_claim` 表，15 分钟 TTL），进程被杀后下一轮回收过期租约；游标只在写库成功后才推进。本机多个桥各起一个引擎进程时，同一批证据同一时刻只有一个执行者。观测用 `stats_get` 的 `derivedCount` 与 `process_claims` 的 `claimStats()`。
+
+后台定时器（consolidate / digest / 过期清理）统一受 `CASTALIA_BACKGROUND_TASKS=0` 关闭；周期反思本来就默认关（`REFLECT_INTERVAL_HOURS=0`）。
+
 ---
 
 ## 环境变量（Environment variables）
 
-引擎读 **77** 个环境变量，Web 控制台另有 **7** 个（`WEB_PORT` / `NODE_BIN` / `CASTALIA_MCP` / `ANIMA_DIR` / `AGGREGATE_DIRS` / `FEDERATION_DIRS` / `GRAPH_SCOPE`），合计 84 个。下表只列需要动的那部分。
+引擎读 **78** 个环境变量，Web 控制台另有 **7** 个（`WEB_PORT` / `NODE_BIN` / `CASTALIA_MCP` / `ANIMA_DIR` / `AGGREGATE_DIRS` / `FEDERATION_DIRS` / `GRAPH_SCOPE`），合计 84 个。下表只列需要动的那部分。
 
 **存储与实例**
 
@@ -285,6 +310,7 @@ memory/                              ← MEMORY_DB_DIR
 | `SEARCH_MIN_SCORE` | `0.15` | `balanced` profile 的最低分 |
 | `HALF_LIFE_HOURS` | `720` | 通用时间衰减半衰期（30 天） |
 | `EPHEMERAL_HALF_LIFE_HOURS` | `240` | 对话 / 会话类短半衰期 |
+| `DERIVED_RANK_PENALTY` | `0.75` | 叙述型派生（摘要/洞察）在检索里的排序折扣；`1` = 不降权 |
 | `MEMORY_CONTEXT_BUDGET` | `24000` | `memory_context` 的总字符预算 |
 
 **反思与整合**

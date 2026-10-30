@@ -1,6 +1,6 @@
 {
   "name": "castalia",
-  "version": "1.23.2",
+  "version": "1.27.0",
   "license": "MIT",
   "description": "Standalone MCP memory server for agent harnesses — SQLite + sqlite-vec local vector memory, zero API cost",
   "type": "module",
