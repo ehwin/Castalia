@@ -9,7 +9,7 @@
 - Node.js **≥ 20**（原生模块的 ABI 与安装时的 Node 绑定）
 - 不配 LLM 也能当读写记忆库用；不配嵌入服务则退化为标签 + 词法检索
 
-技术设计细节见 [docs/TECHNICAL.md](docs/TECHNICAL.md)，安装与踩坑见 [INSTALL.md](INSTALL.md)。
+技术设计细节见 [docs/TECHNICAL.md](docs/TECHNICAL.md)，安装与踩坑见 [INSTALL.md](INSTALL.md)；**已知限制单列在文末**（[Known limitations](#已知限制known-limitations)），不藏在文档深处。
 
 ---
 
@@ -21,9 +21,9 @@
 |---|---|---|
 | **Castalia**（本仓） | 引擎核心：分库存储、混合检索、记忆分层、反思与整合、指令、Web 控制台 | 唯一版本锚，`VERSION` 从这里发 |
 | **Castalia-Full** | 核心 + 跨库总线（联邦 `fedServer`、总反思 `reflect_all`、`memory_search_all`、聚合星图） | 核心文件由 `sync_core.py` 从本仓同步，只额外维护总线模块 |
-| **Castalia-Anima** | 核心 + 情感层（agent 状态、偏置、情绪加权检索） | 情感变体，自带一条引擎线与版本号 |
+| **Castalia-Anima** | 核心 + 情感层（VAD 写入与衰减、情绪加权检索、显著度排序、人物层） | 情感变体，自带一条引擎线与版本号 |
 
-判据很简单：**引擎能力只在本仓实现**，Full / Anima 里出现的引擎改动都是从本仓回同步的产物。
+判据很简单：**引擎能力只在本仓实现**，Full / Anima 里出现的引擎改动都是从本仓回同步的产物。反向也成立：情感相关的取舍不往本仓塞 —— 本仓保持中立，情绪与人物属于 Anima。
 
 ---
 
@@ -35,9 +35,12 @@
 - **热度与冷存**：临时记忆被反复访问就自动升级，长期不动且低重要性的记忆转冷存（不删，只降权）
 - **反思**：入站分拣（LLM1）+ 会话增量反思（每 5 轮或 4000 token 触发）+ 启动每日反思（LLM2）+ 深度反思（全量重排画像 / 去重 / 关系图）
 - **整合**：sigmoid 时间衰减 + 引用计数升华 + 向量预筛候选交 LLM 裁决合并与矛盾消解
+- **晋升链路闭环**（v1.26）：晋升即入库 → **立刻后台补向量**（不必等重启或手动 `reflect_batch_embed`）→ **按内容认领地摘掉被晋升的会话行**（不再整段清空滚动状态）
+- **多库维护**（v1.26）：consolidate / digest / 过期清理 / 启动反思 / 启动整合一律遍历「默认库 + 磁盘上现有全部库」，一个库失败不影响其它库
 - **指令三层**：global → user → project（约束递增）+ 可复用规则组，支持 `@include` 递归与 glob 路径过滤
 - **工具事件**：把「跑了什么命令、退出码、错误首行」记成可检索事件，不进反思输入、不存完整输出
 - **模型与维度可配**：换嵌入模型只改配置；维度或嵌入空间变化时自动重建索引，正文不丢
+- **可观察的降级**（v1.26）：附属操作失败仍然不阻塞主路径，但不再静默 —— `CASTALIA_DEBUG=1` 时每个被吞掉的错误打一行带位置的 `[debug]`
 - **Web 控制台**：3D 星系主视图 + 记忆总成 + 库管理，静态资源本地打包，离线可用
 
 ---
@@ -138,13 +141,13 @@ python scripts/setup.py json       # 直接打印标准 mcpServers JSON
               │     文本 → user / feedback / project / reference
               │
               ├─▶ 会话缓冲（5 轮 或 4000 token，任一命中即触发）
-              │     后台增量反思 → 长效干货晋升项目级
+              │     后台增量反思 → 长效干货晋升项目级（同步落库，向量后台补）
               │                  → 会话状态滚动覆盖
-              │                  → 晋升即删 + TTL 兜底
+              │                  → 按内容认领地摘掉被晋升的行 + TTL 兜底
               │
               └─▶ 嵌入（OLLAMA_URL / EMBEDDING_MODEL / EMBEDDING_DIM）
 
-启动 / 周期（CASTALIA_BACKGROUND_TASKS ≠ 0）
+启动 / 周期（CASTALIA_BACKGROUND_TASKS ≠ 0，逐库遍历 listAllProjects()）
   ├─ 每日反思（距上次 ≥24h 且未分析 >5 条）        LLM2
   ├─ 深度反思 reflect_deep（全量画像 / 去重 / 关系图）
   ├─ 整合 consolidate_deep（衰减 + 引用升华 + LLM 裁决）
@@ -152,7 +155,7 @@ python scripts/setup.py json       # 直接打印标准 mcpServers JSON
   └─ 可选 HTTP 健康检查（HEALTH_PORT）
 ```
 
-后台任务全部异步、失败只记日志：嵌入服务挂了不影响记忆读写，LLM 挂了只跳过反思。
+后台任务全部异步、失败只记日志：嵌入服务挂了不影响记忆读写，LLM 挂了只跳过反思。每个库单独 try/catch —— 一个库的异常不会把其它库的维护一起打断。
 
 ---
 
@@ -169,6 +172,7 @@ memory/                              ← MEMORY_DB_DIR
 ```
 
 - 库根默认 `./memory`，`MEMORY_DB_DIR` 可指向任意位置；备份时整目录复制即可
+- **「有哪些库」的判据**：`listAllProjects()` = 默认库（`CASTALIA_PROJECT`）+ 磁盘上存在的全部库目录（`memory/<project>/`，要求目录里已有 `.sqlite`）。空目录不算一个库 —— 维护任务不会为它建库。
 - `MEMORY_DB_PATH` 是旧单库兼容模式，显式设置会告警并退化为单库
 - WAL 模式，每 30 分钟 checkpoint；库文件在进程停止后完全可移植
 - `*.sqlite` / `keys.*` / `receipts/` 均不入 git
@@ -197,7 +201,7 @@ memory/                              ← MEMORY_DB_DIR
 | 向量 KNN | 前两路不足 topK | sqlite-vec 近邻，按 `SEARCH_MIN_SCORE` 过滤 |
 | 文本兜底 | KNN 报错 / 零命中 / 缺向量 | `LIKE` 兜底，保证「有字就能查到」 |
 
-排序分 = `0.65 × 相似度 + 0.35 × 时间衰减`，通用半衰期 30 天；对话 / 会话类记录用 10 天短半衰期自然沉底。三档检索 profile：`quick`（3 条 / 0.6）、`balanced`（5 条 / 0.15，默认）、`deep`（10 条 / 0.1）。
+排序分 = `0.65 × 相似度 + 0.35 × 时间衰减`，通用半衰期 30 天；对话 / 会话类记录用 10 天短半衰期自然沉底。**时间衰减目前锚在 `created_at`**（`last_accessed_at` 只写不读），这是[已知限制](#已知限制known-limitations)第 1 条，改法要先定「系统注入算不算一次回忆」。三档检索 profile：`quick`（3 条 / 0.6）、`balanced`（5 条 / 0.15，默认）、`deep`（10 条 / 0.1）。
 
 **注入侧**：`memory_index` 先给 150 字摘要索引（省 token），需要细节再 `memory_get(id)` 展全文；`memory_context` 按段配额装箱，只在条边界裁、不切半句，超过 1 天的记忆自动附「历史快照」警告。
 
@@ -211,12 +215,20 @@ memory/                              ← MEMORY_DB_DIR
 |---|---|---|
 | 入站分拣 | 每次 `auto_process` | mem_type 归类 + 投递会话缓冲 |
 | 增量反思 | 缓冲达 5 轮或 4000 token | 项目级晋升 / 会话状态覆盖，异步不阻塞主流程 |
-| 每日反思 | 距上次 ≥24h 且未分析 >5 条，启动时 | 画像更新、事实抽取（每轮 ≤15 条 SPO） |
+| 每日反思 | 距上次 ≥24h 且未分析 >5 条，启动时（逐库判） | 画像更新、事实抽取（每轮 ≤15 条 SPO） |
 | 深度反思 | `reflect_deep` / `reflect_auto` | 全量重排：合并重复、修正画像、重建关系 |
-| 整合 | 记忆数 >15 且距上次 ≥6h，启动 / 24h 周期 | 衰减降权、引用升华、LLM 裁决合并与矛盾消解（原子事务） |
+| 整合 | 记忆数 >15 且距上次 ≥6h，启动 / 24h 周期（逐库判） | 衰减降权、引用升华、LLM 裁决合并与矛盾消解（原子事务） |
 | 周期反思 | `REFLECT_INTERVAL_HOURS > 0` | 按小时自动跑 `reflect_auto`（默认关闭） |
 
-- 没有 `REFLECT_LLM_API_KEY` 时整条链路跳过并记一行日志，不影响存储
+晋升这一段（v1.26 起）值得单独说，因为它原来会**静默丢东西**：
+
+1. **落库**：通过三道闸的条目同步写进项目级库（`session_id = NULL`）—— 后台反思不依赖嵌入服务，所以这一步不等网络。
+2. **补向量**：落库后立刻在后台逐条嵌（`store.embedPromotedInBackground`），失败只记调试日志；嵌入服务没开就整体跳过，行为退回旧版。不用再等重启补账或手动 `reflect_batch_embed`。
+3. **摘行**：会话快照是「单会话单行」的滚动文本。旧实现晋升成功后整行删掉 —— 这轮 LLM 没返回新快照，整段滚动状态就没了。现在按行与晋升文本比对（归一化互相包含 / bigram Jaccard ≥ 0.6）只摘被吸收的行，其余原样写回；短句（<5 字或覆盖不到行内容三分之一）不认领长行，整行都被认领才硬删（连带向量与边）。
+
+其余：
+
+- 没有 `REFLECT_LLM_API_KEY` 时整条链路跳过并记一行日志（带库名），不影响存储
 - 每次反思写回执到 `receipts/`，可回溯「这次改了什么」
 - prompt 可用 `REFLECT_PROMPT_FILE` / `CONSOLIDATE_PROMPT_FILE` 覆盖，不必改源码
 - LLM 调用带重试（默认 3 次）与超时（默认 180s），失败按 `REFLECT_FAIL_BACKOFF_HOURS` 退避
@@ -225,7 +237,7 @@ memory/                              ← MEMORY_DB_DIR
 
 ## 环境变量（Environment variables）
 
-引擎读 **75** 个环境变量，Web 控制台另有 **7** 个（`WEB_PORT` / `NODE_BIN` / `CASTALIA_MCP` / `ANIMA_DIR` / `AGGREGATE_DIRS` / `FEDERATION_DIRS` / `GRAPH_SCOPE`），合计 82 个。下表只列需要动的那部分。
+引擎读 **77** 个环境变量，Web 控制台另有 **7** 个（`WEB_PORT` / `NODE_BIN` / `CASTALIA_MCP` / `ANIMA_DIR` / `AGGREGATE_DIRS` / `FEDERATION_DIRS` / `GRAPH_SCOPE`），合计 84 个。下表只列需要动的那部分。
 
 **存储与实例**
 
@@ -234,7 +246,7 @@ memory/                              ← MEMORY_DB_DIR
 | `MEMORY_DB_DIR` | `./memory` | 库根目录，一切的物理载体 |
 | `MEMORY_CONFIG` | `<MEMORY_DB_DIR>/config.json` | 配置文件路径（优先级最高） |
 | `CHAR_ID` | `default` | 实例 / 角色分区，多实例共享一个库也不串味 |
-| `CASTALIA_PROJECT` | `default` | 默认项目命名空间 |
+| `CASTALIA_PROJECT` | `default` | 默认项目命名空间；维护任务的库清单从它 + 磁盘上的库算出 |
 | `MEMORY_DB_PATH` | — | 旧单库路径，显式设置会告警 |
 
 **嵌入**
@@ -279,11 +291,11 @@ memory/                              ← MEMORY_DB_DIR
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `REFLECT_MIN_GAP_HOURS` / `_MIN_UNANALYZED` | `24` / `5` | 启动反思的两个门槛 |
+| `REFLECT_MIN_GAP_HOURS` / `_MIN_UNANALYZED` | `24` / `5` | 启动反思的两个门槛（逐库判） |
 | `REFLECT_FACT_EXTRACTION` / `REFLECT_MAX_FACTS` | `auto` / `15` | 事实抽取开关与条数上限 |
 | `REFLECT_INTERVAL_HOURS` | `0` | 周期反思间隔，0 = 关 |
 | `REFLECT_BATCH_LIMIT` | `30` | 单轮反思处理的对话条数 |
-| `CONSOLIDATE_MIN_MEMORIES` / `_SIMILARITY` | `15` / `0.88` | 整合触发条数与候选阈值 |
+| `CONSOLIDATE_MIN_MEMORIES` / `_SIMILARITY` | `15` / `0.88` | 整合触发条数与候选阈值（逐库判） |
 | `CONSOLIDATE_MIN_INTERVAL_HOURS` / `_MAX_PAIRS` | `6` / `50` | 整合最小间隔与候选对数上限 |
 | `CONSOLIDATE_DECAY_STEEPNESS` / `_MIDPOINT_DAYS` | `0.04` / `90` | sigmoid 衰减形状 |
 | `CONSOLIDATE_PROMOTE_REF_COUNT` | `2` | 被引用几次后升华 |
@@ -337,6 +349,7 @@ node server.mjs    # → http://127.0.0.1:3345   (WEB_PORT 可改)
 | `/manage.html`（库管理） | 分库清单、记忆增删改、搬移分类、重要度切换、单库统计 |
 | `/aggregate.html`（记忆总成） | 跨目录汇总：总条数与事实数、跨库搜索、软件 → 库的二部关系图 |
 
+- **数据口径是「当前实例的全部库」**：星图 / 记忆列表 / 统计读的是 `currentInstanceLibs()` / `libFiles()`，本来就是跨项目的聚合视图，不是只读默认库；`/api/status` 回报的默认库路径只是状态展示
 - 前端 3D 依赖（three + 3d-force-graph）打成单文件放 `web/public/vendor/`，**离线可用**，不依赖 CDN
 - 控制台里改的嵌入 / triage / reflect 三通道配置写回 `config.json`，MCP 服务重启后生效
 - 概览 / 星图 / 总成对库只读打开（`readonly`），不与 MCP 进程抢写锁；只有管理页的写操作才建写连接
@@ -345,7 +358,7 @@ node server.mjs    # → http://127.0.0.1:3345   (WEB_PORT 可改)
 
 ## 联邦（Federation）
 
-本仓（Lite）**不包含**跨库联邦工具：没有 `memory_search_all`、`reflect_all`、`fedServer`，`src/federation/` 只是保留目录。这些是 [Castalia-Full](https://github.com/ehwin/Castalia-Full) 的职责。
+本仓（核心）**不包含**跨库联邦工具：没有 `memory_search_all`、`reflect_all`、`fedServer`，`src/federation/` 只是保留目录。这些是 [Castalia-Full](https://github.com/ehwin/Castalia-Full) 的职责。
 
 本仓唯一的多实例能力在 Web 侧：**记忆总成**页可以同时汇总多份库目录，配 `FEDERATION_DIRS`（或 `AGGREGATE_DIRS`）：
 
@@ -368,8 +381,11 @@ node server.mjs    # → http://127.0.0.1:3345   (WEB_PORT 可改)
 | `NODE_MODULE_VERSION` 不匹配 | 装完之后换了 Node | 用目标 Node 重跑 `npm install --foreground-scripts` |
 | 检索召回为 0 | 查询与写入不在同一项目，或 `CHAR_ID` 不一致 | 核对 `CASTALIA_PROJECT` / `CHAR_ID`，或降低 `SEARCH_MIN_SCORE` |
 | 换嵌入模型后检索一度全空 | 嵌入空间或维度变了，索引被重建 | 预期行为：重启后自动补向量，或手动 `reflect_batch_embed` |
-| 日志 `reflect-startup skipped: ... not configured` | 没有 LLM key | 预期行为，配 `REFLECT_LLM_API_KEY` 才启用 |
-| 日志 `consolidate-startup skipped: below threshold` | 记忆数没到阈值 | 预期行为，阈值见 `CONSOLIDATE_MIN_MEMORIES` |
+| 刚晋升的记忆语义搜不到 | 嵌入服务没开，或补向量失败 | 设 `CASTALIA_DEBUG=1` 看 `store:embedPromoted` 那行；开嵌入后重启会补账 |
+| 某个库的维护日志一直不出现 | 该库目录里还没有 `.sqlite`，`listAllProjects()` 不认 | 先写入一条记忆把库建出来；正常时每个库都会单独打一行日志（带库名） |
+| 日志 `reflect-startup <project> 跳过: ...` | 没有 LLM key，或该库条件未达成 | 预期行为，配 `REFLECT_LLM_API_KEY` |
+| 日志 `consolidate-startup <project> 跳过: ...` | 该库记忆数没到阈值 | 预期行为，阈值见 `CONSOLIDATE_MIN_MEMORIES` |
+| 想知道某次「静默降级」到底发生了什么 | 空 catch 默认不输出 | `CASTALIA_DEBUG=1` 后重跑，会打出 `[debug] <位置> — <原始错误>` |
 | 改了配置不生效 | 环境变量优先于 `config.json` | 检查同名 env 是否已设置 |
 | 目录里又冒出 `project-*.sqlite` | 有旧版进程还在写 | 停掉旧实例；新版写 `memory/<project>/<memType>/` |
 | Web 页面白屏 | 浏览器不支持 ESM 或被脚本拦截 | 换较新浏览器；页面有 3D 库自检提示 |
@@ -380,9 +396,10 @@ node server.mjs    # → http://127.0.0.1:3345   (WEB_PORT 可改)
 
 ## 回归脚本
 
-`scripts/` 下 12 个 `.mjs` 是可重复跑的回归，挑常用的：
+`scripts/` 下 13 个 `.mjs` 是可重复跑的回归，挑常用的：
 
 ```bash
+node scripts/test_known_limits.mjs        # v1.26：精确晋升即删 / 补向量调度 / 调试开关 / 库清单
 node scripts/regression_embed_dim.mjs     # 维度可配 / 自动重建 / 正文不丢
 node scripts/regression_cjk_recall.mjs    # 中文问句召回
 node scripts/test_lexical.mjs             # 词法通道
@@ -390,10 +407,30 @@ node scripts/test_context_pack.mjs        # 上下文装箱
 node scripts/test_embed_space_safety.mjs  # 换模型不误清索引
 node scripts/test_lineage.mjs             # 记忆血缘
 node scripts/test_events.mjs              # 工具事件
+node scripts/test_index_summary.mjs       # 记忆索引摘要
 node scripts/test_e2e_mcp.mjs             # 端到端 MCP
 ```
 
-另含 `smoke_test.py`、`verify_v115.mjs`、`gen_version.mjs`、`setup.py`、`keygen.js` 等工具脚本。
+另含 `smoke_test.py`、`verify_v115.mjs`、`gen_version.mjs`、`setup.py`、`keygen.js`、`_measure_index.mjs` 等工具脚本。跑回归一律**离线**（`EMBED_MODE=none` + 临时 `MEMORY_DB_DIR`），不碰线上库、不叫 LLM。
+
+---
+
+## 已知限制（Known limitations）
+
+写在这里，避免被当成已完成。设计取舍与实现细节见 [docs/TECHNICAL.md](docs/TECHNICAL.md) §12；其中 v1.26 修掉的几条，回归在 `scripts/test_known_limits.mjs`。
+
+| # | 限制 | 现状 |
+|---|---|---|
+| 1 | **时间衰减锚在 `created_at`**：`computeScore` 按创建时间算衰减，`last_accessed_at` 只写不读 —— 被反复想起的旧记忆，衰减时钟不会被回忆刷新 | **未改**。锚点换成 `last_accessed_at`（缺失回退 `created_at`）必须连同「系统注入算不算一次回忆」一起定，否则注入会自己把冷知识顶回前排。Anima 分支里时间项已按访问时间刷新；本仓保持中立口径 |
+| 2 | **晋升项不嵌向量**（旧版取舍：后台反思不能依赖嵌入服务） | **v1.26 已修**：晋升返回后后台逐条补向量，`EMBED_MODE=none` 时跳过；启动补账与 `reflect_batch_embed` 仍作兜底 |
+| 3 | **维护任务只作用默认库**：consolidate / digest / 过期清理 / 启动反思 / 启动整合过去一律用 `PROJECT_ID` | **v1.26 已修**：一律遍历 `listAllProjects()`，逐库 try/catch。代价见第 6 条 |
+| 4 | **晋升即删会整段清空会话滚动状态**：快照是单会话单行，晋升成功就整行删掉，这轮没返回新快照就全丢 | **v1.26 已修**：按内容认领，只摘被晋升吸走的行；短句不认领长行；整行被认领才硬删 |
+| 5 | **空 catch 无日志**：防御性降级不阻塞主路径，但出问题时毫无痕迹 | **v1.26 已修**：63 处接上 `debugCatch`；默认静默（避免刷满 stdio），`CASTALIA_DEBUG=1` 才输出 |
+| 6 | **多库维护是线性成本**：每库一轮 consolidate = 一轮 LLM 调用（条件不满足会跳过，但库多时启动后日志会变长） | **开放**。真到几十个库的规模，应改成「只跑有增量的库」，而不是继续扫全量 |
+| 7 | **会话草稿行（`session_memory`）不进语义检索**：它没有稳定向量，正文一变就摘掉旧向量 | **按设计**。要让它可检索，应在宿主侧显式调用检索，而不是把草稿混进候选 |
+| 8 | **情感 / 人物 / 关系层不在本仓**：VAD、情绪加权、显著度排序、锚点属于 Anima | **分工**。本仓只保证中立核心；把情感取舍塞进来会让两个仓的版本线互相污染 |
+
+需要情感记忆（该不该想起、想起来有多重）用 [Castalia-Anima](https://github.com/ehwin/Castalia-Anima)；需要跨库检索 / 总反思用 [Castalia-Full](https://github.com/ehwin/Castalia-Full)。
 
 ---
 
