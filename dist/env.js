@@ -37,4 +37,3 @@ export function isEmbedEnabled() {
 export const SERVER_NAME = process.env.MCP_SERVER_NAME || 'castalia';
 /** 服务器版本号(单一来源:仓库根 VERSION → src/version.ts) */
 export const SERVER_VERSION = process.env.MCP_SERVER_VERSION || VERSION;
-//# sourceMappingURL=env.js.map

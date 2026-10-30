@@ -3,6 +3,24 @@
 > 本文件记录每次功能/架构变更,供 AIRI 主系统(`主系统`)吸收改进时快速对账。
 > 格式:Keep a Changelog 简化版(Added / Changed / Fixed / Removed)。
 
+## [v1.26.0] — 2026-10-30 已知限制五条逐条落地（晋升即嵌/多库维护/精确晋升即删/空 catch 有出口）
+
+### Added
+- **`src/log.ts`**：`debugCatch` / `debugLog` —— 给被吞掉的降级错误一条出口。默认静默，`CASTALIA_DEBUG=1`（或 `DEBUG` 含 castalia）才输出；不做缓存、绝不抛错
+- **`db.listAllProjects()`**：维护类任务要跑的库清单（默认库 + 磁盘上现有全部库，去重排序），周期任务与启动任务共用同一口径
+- **`store.deletePromotedFragments()`**：晋升后按内容认领删除 —— 只摘被晋升吸走的快照行
+- **`store.embedPromotedInBackground()`**：晋升项后台补向量（不 await、`EMBED_MODE=none` 时跳过）
+- `scripts/test_known_limits.mjs`（19 项断言：精确删 / 短句保守 / 补向量调度 / 调试开关 / 库清单）
+
+### Changed
+- **周期任务与启动任务改为遍历全部库**：consolidate(24h)、digest(1min)、过期清理(30min)、启动反思、启动整合过去一律只作用于 `PROJECT_ID`，多库实例上非默认库永远等不到维护；现在每个库单独 try/catch，一个库失败不影响其它库
+- **晋升即删从「整段清空」改为「按行认领」**：`session_memory` 是单会话单行滚动快照，旧实现晋升成功后整行删掉 —— LLM 这轮没返回新快照就整段丢失。现在按归一化包含 / bigram Jaccard ≥ 0.6 比对，只摘走被晋升吸收的行；短句不认领长行，整行被认领才硬删（连带向量与边）
+- `docs/TECHNICAL.md` §12 重写：五条已知限制逐条标注现状，并删掉一条记错的（Web 控制台本来就是跨项目的聚合视图）
+
+### Fixed
+- **空 catch 全部接上日志出口**：63 处（含 `db.ts` 全部迁移 DDL、`ollama.ts` 嵌入缓存读写、`search.ts` 访问计数刷新、`store.ts` facts 嵌入）不再静默吞错
+- 晋升出来的记忆不再依赖重启补账或手动 `reflect_batch_embed` 才能语义检索
+
 ## [v1.25.0] — 2026-10-26 模型与维度可配(换嵌入模型不再改源码) + 配置 BOM 容错
 
 ### Added

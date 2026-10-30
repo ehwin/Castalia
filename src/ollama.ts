@@ -12,6 +12,7 @@
  */
 import { DatabaseManager, vecDim, embedSpaceHash } from './db.js';
 import { isEmbedEnabled } from './env.js';
+import { debugCatch } from './log.js';
 import crypto from 'node:crypto';
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';  // Ollama embed server (standard port)
@@ -75,7 +76,7 @@ export async function embed(text: string, project?: string): Promise<number[]> {
       setMemCache(memKey(text), vec);
       return vec;
     }
-  } catch {}
+  } catch (e: unknown) { debugCatch('ollama:embedCacheRead', e); }
 
   // 3. 调嵌入服务(API key 模式 → OpenAI 兼容 /embeddings;否则 Ollama /api/embed)
   let vector: number[];
@@ -128,7 +129,7 @@ export async function embed(text: string, project?: string): Promise<number[]> {
   try {
     const floatArr = new Float32Array(vector);
     db.prepare('INSERT OR IGNORE INTO embedding_cache (text_hash, embedding) VALUES (?, ?)').run(hash, floatArr);
-  } catch {}
+  } catch (e: unknown) { debugCatch('ollama:embedCacheWrite', e); }
 
   return vector;
 }

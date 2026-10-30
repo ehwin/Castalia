@@ -10,6 +10,7 @@ import { CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
 import { isMemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 import { reflectionPolicySafe } from './reflectionFidelity.js';
+import { debugCatch, debugLog } from './log.js';
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
 export async function saveMemory(params) {
@@ -162,9 +163,11 @@ export async function saveMemory(params) {
         saveCount = 0;
         try {
             const { consolidate } = await import('./consolidate.js');
-            consolidate(project).catch(() => { });
+            consolidate(project).catch((e) => debugCatch('store:consolidateInterval', e));
         }
-        catch { }
+        catch (e) {
+            debugCatch('store:consolidateImport', e);
+        }
     }
     return record;
 }
@@ -684,10 +687,14 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = 'air
                 db.prepare('DELETE FROM vec_facts WHERE rowid = ?').run(BigInt(row.rowid));
                 db.prepare('INSERT INTO vec_facts (rowid, embedding) VALUES (?, ?)').run(BigInt(row.rowid), vec);
             }
-            catch { }
+            catch (e) {
+                debugCatch('store:factEmbedRow', e);
+            }
         }
     }
-    catch { }
+    catch (e) {
+        debugCatch('store:factEmbedBatch', e);
+    }
     return { inserted, updated };
 }
 /**
@@ -890,9 +897,141 @@ export function deleteSessionFragments(project, sessionId) {
         });
         return tx();
     }
-    catch {
+    catch (e) {
+        debugCatch('store:deleteSessionFragments', e);
         return 0;
     }
+}
+/**
+ * v1.26：晋升后精确删 —— 只摘掉「已经被晋升吸走」的那几行，不再整段清空会话滚动状态
+ *
+ * 旧行为（deleteSessionFragments）在晋升成功后按 (project, session_id) 删掉**整条**
+ * session_memory 行。而 session_memory 是「单会话单行滚动快照」（见 upsertSessionMemory），
+ * 于是：只要这一轮 LLM 没有返回新的 sessionMemory，整段滚动状态当场消失；就算返回了，
+ * 没被晋升、也没被新快照覆盖的线索也一并没了。TECHNICAL.md §12 记的就是这一条。
+ *
+ * 这里的口径是「按内容认领」：把快照按行拆开，与晋升文本比对（归一化后互相包含，
+ * 或 bigram Jaccard ≥ 0.6），命中的行才算被吸收，其余原样写回。
+ * 行被删光才硬删整行（连带向量/边，与 deleteSessionFragments 的清法一致）。
+ */
+export function deletePromotedFragments(project, sessionId, promotedTexts) {
+    const db = DatabaseManager.getInstance(project);
+    const proj = normalizeProject(project);
+    const nothing = { removedLines: 0, keptLines: 0, deleted: false };
+    const norm = (s) => String(s || '').toLowerCase().replace(/[^\u4e00-\u9fa5a-z0-9]+/g, '');
+    const bigrams = (s) => {
+        const n = norm(s);
+        const out = new Set();
+        for (let q = 0; q + 2 <= n.length; q++)
+            out.add(n.slice(q, q + 2));
+        return out;
+    };
+    const targets = (promotedTexts || [])
+        .map(t => ({ n: norm(t), bg: bigrams(t) }))
+        .filter(t => t.n.length >= 4);
+    if (targets.length === 0)
+        return nothing;
+    const row = db.prepare(`
+    SELECT rowid, id, text FROM memory
+    WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1
+    ORDER BY updated_at DESC LIMIT 1
+  `).get(proj, sessionId);
+    if (!row)
+        return nothing;
+    const lines = String(row.text || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (lines.length === 0)
+        return nothing;
+    const kept = [];
+    let removed = 0;
+    for (const line of lines) {
+        const ln = norm(line);
+        if (ln.length < 4) {
+            kept.push(line);
+            continue;
+        }
+        const lb = bigrams(line);
+        const hit = targets.some(t => {
+            if (t.n.includes(ln))
+                return true; // 该行整句被晋升文本吸走
+            // 该行包住整条晋升文本：要求晋升文本够长、且这一行没有比它长太多，
+            // 否则一个短词（"用户喜欢猫"）就能认领整段快照。
+            if (ln.includes(t.n) && t.n.length >= 5 && ln.length <= t.n.length * 3)
+                return true;
+            if (lb.size < 6 || t.bg.size < 6)
+                return false;
+            let inter = 0;
+            for (const g of lb)
+                if (t.bg.has(g))
+                    inter++;
+            return inter / (lb.size + t.bg.size - inter) >= 0.6; // 换行/标点差异仍认得出是同一句
+        });
+        if (hit)
+            removed++;
+        else
+            kept.push(line);
+    }
+    if (removed === 0)
+        return { removedLines: 0, keptLines: lines.length, deleted: false };
+    if (kept.length === 0) {
+        try {
+            db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(row.rowid);
+        }
+        catch (e) {
+            debugCatch('store:promotedFragments:vec', e);
+        }
+        try {
+            db.prepare('DELETE FROM edges WHERE source_id = ? OR target_id = ?').run(row.id, row.id);
+        }
+        catch (e) {
+            debugCatch('store:promotedFragments:edges', e);
+        }
+        db.prepare('DELETE FROM memory WHERE id = ?').run(row.id);
+        return { removedLines: removed, keptLines: 0, deleted: true };
+    }
+    db.prepare('UPDATE memory SET text = ?, updated_at = ? WHERE id = ?')
+        .run(kept.join('\n'), new Date().toISOString(), row.id);
+    // 正文变了旧向量就失效；会话草稿行本不该走语义检索，摘掉让它按需重嵌
+    try {
+        db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(row.rowid);
+    }
+    catch (e) {
+        debugCatch('store:promotedFragments:vec', e);
+    }
+    return { removedLines: removed, keptLines: kept.length, deleted: false };
+}
+/**
+ * v1.26：晋升项立刻补向量（后台、不 await）
+ *
+ * promoteToProject 刻意不嵌（后台反思不能依赖嵌入服务），代价是晋升出来的记忆要等
+ * 重启补账或手动 `reflect_batch_embed` 才能语义检索 —— TECHNICAL.md §12 第一条。
+ * 这里在晋升返回后起火并忘：不阻塞这次反思的响应，失败只记调试日志；
+ * 嵌入服务不可用时干脆不做（行为与旧版一致）。
+ */
+export function embedPromotedInBackground(ids, project, cap = 50) {
+    if (!ids || ids.length === 0)
+        return;
+    if (!isEmbedEnabled()) {
+        debugLog('store:embedPromoted', 'skip — 嵌入未启用（EMBED_MODE=none）');
+        return;
+    }
+    const proj = normalizeProject(project);
+    const list = ids.slice(0, Math.max(0, cap));
+    setTimeout(() => {
+        void (async () => {
+            let ok = 0;
+            for (const id of list) {
+                try {
+                    if (await reEmbedMemory(id, proj))
+                        ok++;
+                }
+                catch (e) {
+                    debugCatch('store:embedPromoted', e);
+                }
+            }
+            if (ok < list.length)
+                debugLog('store:embedPromoted', `${ok}/${list.length} 条晋升项已补向量`);
+        })();
+    }, 0);
 }
 export async function applyIdentityActions(actions, project) {
     const rejected = [];
@@ -969,4 +1108,3 @@ export async function applyIdentityActions(actions, project) {
     }
     return { applied, rejected };
 }
-//# sourceMappingURL=store.js.map

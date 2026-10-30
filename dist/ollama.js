@@ -12,6 +12,7 @@
  */
 import { DatabaseManager, vecDim, embedSpaceHash } from './db.js';
 import { isEmbedEnabled } from './env.js';
+import { debugCatch } from './log.js';
 import crypto from 'node:crypto';
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434'; // Ollama embed server (standard port)
 const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY || ''; // set → OpenAI-compatible /embeddings mode
@@ -68,7 +69,9 @@ export async function embed(text, project) {
             return vec;
         }
     }
-    catch { }
+    catch (e) {
+        debugCatch('ollama:embedCacheRead', e);
+    }
     // 3. 调嵌入服务(API key 模式 → OpenAI 兼容 /embeddings;否则 Ollama /api/embed)
     let vector;
     const signal = AbortSignal.timeout(EMBED_TIMEOUT_MS);
@@ -122,7 +125,9 @@ export async function embed(text, project) {
         const floatArr = new Float32Array(vector);
         db.prepare('INSERT OR IGNORE INTO embedding_cache (text_hash, embedding) VALUES (?, ?)').run(hash, floatArr);
     }
-    catch { }
+    catch (e) {
+        debugCatch('ollama:embedCacheWrite', e);
+    }
     return vector;
 }
 /** 带缓存的 embed 别名 */
@@ -150,4 +155,3 @@ function setMemCache(text, vec) {
     }
     memCache.set(text, vec);
 }
-//# sourceMappingURL=ollama.js.map

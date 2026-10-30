@@ -321,8 +321,23 @@ findSimilarCandidates(cos > 0.88, 上限50对)  ← 向量预筛,省 token
 
 ## 12. 已知限制与后续方向
 
-- **promoted 不即时嵌入**:临时反思晋升的记忆 `skipEmbed`,需 `reflect_batch_embed` 统一向量化(避免后台依赖嵌入服务)
-- **维护性周期任务只作用于默认项目**:consolidate/digest 的多项目遍历未做(最小化)
-- **Web 控制台数据接口只读默认库**:多项目聚合展示待做
-- **promotedKeys 精确晋升即删**:当前简化"晋升成功后清空该会话碎片",未按 LLM 返回 key 精确删
-- **空 catch 块无日志**:防御性降级(附属操作失败不阻塞主操作)但静默,后续可加 debug 级日志
+v1.26 把此前记在这里的五条逐条核过并落地（回归脚本 `scripts/test_known_limits.mjs`，19 项断言）：
+
+- **promoted 即时嵌入**（已修）：晋升成功后 `embedPromotedInBackground` 在后台逐条补向量，不再等重启或手动
+  `reflect_batch_embed`；`EMBED_MODE=none` 时直接跳过（行为与旧版一致）。启动补账（v1.24 vec-backfill）保留作兜底。
+- **维护性周期任务覆盖全部库**（已修）：consolidate / digest / 过期清理 / 启动反思 / 启动整合 一律遍历
+  `listAllProjects()`（默认库 + 磁盘上现有的全部库），不再只作用于默认库。各个库单独 try/catch，一个库失败不影响其它库。
+- **Web 控制台本来就是聚合视图**（此前记错）：`web/routes/*` 读的是 `currentInstanceLibs()` / `libFiles()`，
+  早已跨项目；只有 `/api/status` 回报默认库路径，那是状态展示而不是数据口径，未改。
+- **`promotedKeys` 精确晋升即删 → 改为「按内容认领」**（已修）：`deletePromotedFragments` 把滚动快照按行拆开，
+  与晋升文本比对（归一化后互相包含，或 bigram Jaccard ≥ 0.6）只摘走被吸收的行，其余写回；短句（<5 字，
+  或覆盖不到行内容的三分之一）不认领长行，避免一个短词吃掉整段快照；整行都被认领才硬删（连带向量/边）。
+- **空 catch 有出口**（已修）：新增 `src/log.ts` 的 `debugCatch` / `debugLog`，63 处空 catch（含 `db.ts` 里
+  全部迁移 DDL）都接上；默认静默（这些 catch 每秒可能撞很多次），`CASTALIA_DEBUG=1` 或 `DEBUG` 含 castalia 才输出。
+
+仍然开放：
+
+- **会话草稿行的向量缺口是设计，不是缺陷**：`session_memory` 行不进语义检索，正文一变就摘掉旧向量。若宿主想让
+  「会话滚动状态」也可检索，需要在宿主侧显式调用检索接口，而不是让引擎把它混进候选。
+- **多库维护的成本是线性的**：每个库存一轮 consolidate 就是一轮 LLM 调用（条件不满足会跳过，但库很多时
+  启动后那段日志会变长）。真到几十个库的规模，应该改成「只跑有增量的库」而不是继续扫全量。

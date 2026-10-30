@@ -16,7 +16,7 @@
 import { callLlm, makeLlmChannel, LlmChannel } from './reflectionLlm.js';
 import { reflectionFidelityPrompt, reflectionPolicy, reflectionPolicySafe } from './reflectionFidelity.js';
 import { isMemType, isClosedMemType, normalizeMarkdown, MemType } from './memType.js';
-import { getSessionMemory, upsertSessionMemory, promoteToProject, deleteSessionFragments, applyIdentityActions, saveMemory } from './store.js';
+import { getSessionMemory, upsertSessionMemory, promoteToProject, deleteSessionFragments, deletePromotedFragments, embedPromotedInBackground, applyIdentityActions, saveMemory } from './store.js';
 import { normalizeProject } from './env.js';
 import { embed, cosineSimilarity, embedCacheKey } from './ollama.js';
 import { DatabaseManager } from './db.js';
@@ -361,11 +361,19 @@ ${lines}
       try {
         const ids = promoteToProject(proj, promoted, characterId);
         promotedCount = ids.length;
+        // v1.26：晋升项立刻补向量（后台起火并忘，不阻塞这次反思的响应）
+        try { embedPromotedInBackground(ids, proj); }
+        catch (e: any) { console.error('[reflect-incremental] 晋升项补向量调度失败:', e.message); }
         // 2026-10-27 修复(P2-3,复核提出):门控改 Safe 版 —— 严格版在 config.json 坏掉时
         // 会在此抛错,被下面的 catch 记成"晋升失败"(而晋升其实已经成功),并跳过"晋升即删"清理。
+        // v1.26：改按内容精确删（只摘被晋升吸走的那几行），不再整段清掉会话滚动状态。
         if (ids.length === promoted.length && reflectionPolicySafe(proj) === 'standard') {
-          try { deleteSessionFragments(proj, sessionId); }
-          catch (e: any) { console.error('[reflect-incremental] 晋升即删失败:', e.message); }
+          try {
+            const del = deletePromotedFragments(proj, sessionId, promoted.map(p => p.text));
+            if (del.removedLines > 0) {
+              console.error(`[reflect-incremental] 晋升即删: 摘掉 ${del.removedLines} 行, 保留 ${del.keptLines} 行${del.deleted ? '（整行清空）' : ''}`);
+            }
+          } catch (e: any) { console.error('[reflect-incremental] 晋升即删失败:', e.message); }
         }
       } catch (e: any) {
         console.error('[reflect-incremental] 晋升失败:', e.message);

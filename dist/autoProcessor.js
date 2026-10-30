@@ -48,4 +48,3 @@ export async function autoProcess(args) {
     }
     return results;
 }
-//# sourceMappingURL=autoProcessor.js.map

@@ -2,10 +2,10 @@
 
 **给 agent harness 用的独立记忆服务器**：标准 MCP stdio 服务，记忆落在本地 SQLite，按「项目 × 分类」分库物理隔离；向量检索走 `sqlite-vec`，嵌入服务自己选（本地 Ollama 兼容端点或任意 OpenAI 兼容 API），存储侧零 API 成本。
 
-当前版本 **1.25.4**。版本号只有一个来源：仓库根 `VERSION`，构建时由 `scripts/gen_version.mjs` 生成 `src/version.ts`，不要在别处手改。
+当前版本 **1.26.0**。版本号只有一个来源：仓库根 `VERSION`，构建时由 `scripts/gen_version.mjs` 生成 `src/version.ts`，不要在别处手改。
 
 - **32** 个 MCP tool，按 profile 分档暴露（默认只开 7 个只读工具）
-- **25** 个 TypeScript 源文件；运行时依赖 5 个：MCP SDK / better-sqlite3 / sqlite-vec / picomatch / zod
+- **26** 个 TypeScript 源文件；运行时依赖 5 个：MCP SDK / better-sqlite3 / sqlite-vec / picomatch / zod
 - Node.js **≥ 20**（原生模块的 ABI 与安装时的 Node 绑定）
 - 不配 LLM 也能当读写记忆库用；不配嵌入服务则退化为标签 + 词法检索
 
@@ -297,6 +297,7 @@ memory/                              ← MEMORY_DB_DIR
 | `MCP_SERVER_NAME` | `castalia` | 握手时报的服务名 |
 | `HEALTH_PORT` | `0` | >0 时在 `127.0.0.1:<port>/health` 提供探活 |
 | `CASTALIA_BACKGROUND_TASKS` | 开 | 设 `0` 关闭全部后台任务（测试 / 单次脚本） |
+| `CASTALIA_DEBUG` | 关 | 设 `1`（或 `DEBUG` 含 castalia）让被吞掉的降级错误打一行 `[debug]`（迁移 DDL、缓存写失败、向量表缺席等）|
 
 ---
 

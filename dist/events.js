@@ -191,4 +191,3 @@ export function eventStats(project, days = 7) {
     const errs = db.prepare("SELECT COUNT(*) c FROM tool_events WHERE project = ? AND at >= ? AND status = 'error'").get(proj, since).c;
     return { total, byTool, errorRate: total > 0 ? Math.round((errs / total) * 1000) / 1000 : 0 };
 }
-//# sourceMappingURL=events.js.map

@@ -18,6 +18,7 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { normalizeMemType } from './memType.js';
+import { debugCatch } from './log.js';
 /** memdir 分类文件夹名(memType → 目录名,general 为默认/元数据) */
 export function memTypeDir(memType) {
     return normalizeMemType(memType);
@@ -130,15 +131,21 @@ export function ensureEmbedSpace(db) {
         try {
             db.exec('DELETE FROM vec_memory');
         }
-        catch (_e) { }
+        catch (_e) {
+            debugCatch('db:ddl', _e);
+        }
         try {
             db.exec('DELETE FROM vec_facts');
         }
-        catch (_e) { }
+        catch (_e) {
+            debugCatch('db:ddl', _e);
+        }
         try {
             db.exec('DELETE FROM embedding_cache');
         }
-        catch (_e) { }
+        catch (_e) {
+            debugCatch('db:ddl', _e);
+        }
         db.prepare('UPDATE _embed_space SET model = ?, dim = ?, space_hash = ?, updated_at = ? WHERE id = 1')
             .run(embedModelName(), vecDim(), to, new Date().toISOString());
         return { changed: true, to };
@@ -156,6 +163,7 @@ function vecTableDim(db, name) {
         return m ? Number.parseInt(m[1], 10) : null;
     }
     catch (_e) {
+        debugCatch('db:vecTableDim', _e);
         return null;
     }
 }
@@ -196,15 +204,21 @@ function reconcileVecDim(db) {
     try {
         db.exec(`DROP TABLE IF EXISTS vec_memory`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     try {
         db.exec(`DROP TABLE IF EXISTS vec_facts`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     try {
         db.exec(`DELETE FROM embedding_cache`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
 }
 export function generateId() {
     return crypto.randomUUID();
@@ -215,6 +229,7 @@ function tableExists(db, name) {
         return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
     }
     catch (_e) {
+        debugCatch('db:tableExists', _e);
         return false;
     }
 }
@@ -333,6 +348,18 @@ export function listProjectNames() {
     }
     return [...names];
 }
+/**
+ * v1.26：维护类任务要跑的库清单 —— 默认库 + 磁盘上现有的全部库（去重、排序）
+ *
+ * 起因：consolidate / digest / 启动反思过去一律用 PROJECT_ID，多库实例上
+ * 非默认库永远等不到维护 —— TECHNICAL.md §12 第二条。
+ * 这里把「要跑哪些库」收敛成一个函数，周期任务与启动任务共用，避免两边口径漂移。
+ */
+export function listAllProjects(defaultProject) {
+    const base = defaultProject || process.env.CASTALIA_PROJECT || 'default';
+    const set = new Set([base, ...listProjectNames()]);
+    return [...set].filter(Boolean).sort();
+}
 /** 项目下的分类文件夹(memdir:user/feedback/project/reference/general),不存在则返回默认四类+general */
 export function listMemTypeDirs(project) {
     const dir = path.join(memDir(), safeFilePart(project));
@@ -376,7 +403,9 @@ function initInstructionsSchema(db) {
       CREATE INDEX IF NOT EXISTS idx_instructions_scope ON instructions(scope, project);
     `);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     // v5.5 迁移:老表补 paths 列 + scope='rule'(规则组)。
     // SQLite 无法 ALTER 修改 CHECK 约束,必须重建表;用事务保证原子性,不破坏已有数据。
     // 幂等:每次启动检查 table_info + sqlite_master.sql,缺任一特性才重建。
@@ -414,10 +443,14 @@ function initInstructionsSchema(db) {
             try {
                 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_instructions_rule_unique ON instructions(project) WHERE scope = 'rule'`);
             }
-            catch (_e) { }
+            catch (_e) {
+                debugCatch('db:ddl', _e);
+            }
         }
     }
-    catch (_e) { /* instructions 表尚未创建时跳过 */ }
+    catch (_e) {
+        debugCatch('db:ddl:instructions', _e); /* instructions 表尚未创建时跳过 */
+    }
 }
 /** 全局库 schema:指令表 + 项目注册表(不含 memory/vec 业务表) */
 function initGlobalSchema(db) {
@@ -430,7 +463,9 @@ function initGlobalSchema(db) {
       );
     `);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
 }
 /** 项目库 schema:全部业务表(与旧单库一致)+ 指令表(保持原 schema) */
 export function initProjectSchema(db) {
@@ -511,144 +546,210 @@ export function initProjectSchema(db) {
         try {
             db.exec(sql);
         }
-        catch (_e) { /* already exists */ }
+        catch (_e) {
+            debugCatch('db:ddl', _e); /* already exists */
+        }
     }
     // v5.3: locked column for permanent memory protection
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN locked INTEGER DEFAULT 0`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_tier ON memory(tier, is_active)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     // v1.5: project column for per-project memory isolation
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN project TEXT DEFAULT 'default'`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE facts ADD COLUMN project TEXT DEFAULT 'default'`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_project ON memory(project, is_active)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_project ON facts(project, is_active)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     // v6.0: session_id column for session-level memory (reserved, no logic added yet)
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN session_id TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     // v1.8: mem_type column — 用途维度(Claude Code 4 种封闭类型),默认 general
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN mem_type TEXT DEFAULT 'general'`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_mem_type ON memory(mem_type, is_active)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     // v1.15: LobeHub 精细化吸收 — 四维评分/元数据/身份 CRUD 维护
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN metadata TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN title TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN status TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN score_confidence REAL`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN score_impact REAL`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN score_priority REAL`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN score_urgency REAL`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN identity_locked INTEGER DEFAULT 0`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type, is_active)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     // v1.15: LobeHub 精细化吸收 — 四维评分/元数据/身份 CRUD 维护
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN metadata TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN title TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN status TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN score_confidence REAL`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN score_impact REAL`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN score_priority REAL`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN score_urgency REAL`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN identity_locked INTEGER DEFAULT 0`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type, is_active)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     // v1.23 Parent-Child 检索：leaf 记忆指回父对话（llama_index ParentDocumentRetriever 思路）
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN parent_id TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_parent ON memory(parent_id)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     // v1.23 事实边：Graphiti 式时间有效性 + 证据引用（不删除，只失效）
     try {
         db.exec(`ALTER TABLE facts ADD COLUMN valid_from DATETIME`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE facts ADD COLUMN valid_to DATETIME`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE facts ADD COLUMN evidence TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     // v1.24 记忆血缘（Graphiti EntityEdge 语义）：合并必须可追溯，旧行不得消失
     //   valid_at       事实/记忆何时开始成立
     //   expired_at     何时被系统取代（soft supersede，与"事实不再成立"区分）
@@ -659,53 +760,75 @@ export function initProjectSchema(db) {
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN valid_at DATETIME`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN expired_at DATETIME`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN reference_time DATETIME`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN merged_from TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN merged_quotes TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN merged_into TEXT`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_merged_into ON memory(merged_into)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     // v1.23.1: 衰减基线。importance 会被 consolidate 按年龄衰减；如果每次都在“已衰减值”上再乘一次，
     // 衰减速度就取决于 consolidate 跑了几次而不是记忆多老（实测 61 天 0.9 分 7 次运行后跌破阈值被删）。
     // base_importance 保存原始值，衰减永远从基线算；触发器覆盖所有 INSERT 路径。
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN base_importance REAL`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     // v1.23.2: 向量化失败计数，避免连续失败的头部记录永久占满 batchEmbedPending 的 200 条窗口
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN embed_fail_count INTEGER DEFAULT 0`);
     }
-    catch (_e) { /* already exists */ }
+    catch (_e) {
+        debugCatch('db:ddl', _e); /* already exists */
+    }
     try {
         db.exec(`UPDATE memory SET base_importance = importance WHERE base_importance IS NULL`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     try {
         db.exec(`CREATE TRIGGER IF NOT EXISTS trg_memory_base_importance AFTER INSERT ON memory
              WHEN NEW.base_importance IS NULL
              BEGIN UPDATE memory SET base_importance = NEW.importance WHERE id = NEW.id; END`);
     }
-    catch (_e) { /* trigger 已存在或旧库不支持 */ }
+    catch (_e) {
+        debugCatch('db:ddl:trigger', _e); /* trigger 已存在或旧库不支持 */
+    }
     // v1.24: 词法通道（FTS5 trigram + 外部内容表 + 触发器）。
     // 现有三路（tags LIKE / 向量 KNN / text LIKE）对"精确短语"无能为力：
     // 古籍原句、卦名、错误码、路径、端口都查不到 —— 这是用户笔记里记过的老问题。
@@ -750,7 +873,9 @@ export function initProjectSchema(db) {
     try {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject, is_active)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     // 指令表(保持原 schema:项目库也建;三层指令路由在 instructions.ts 决定)
     initInstructionsSchema(db);
     // ═══ v5.0 迁移：4096-dim → 1024-dim (Yuan-EB) ═══
@@ -758,22 +883,30 @@ export function initProjectSchema(db) {
     try {
         db.exec(`CREATE TABLE IF NOT EXISTS _schema_version (version INTEGER)`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     const currentVersion = db.prepare('SELECT MAX(version) as v FROM _schema_version').get()?.v || 0;
     if (currentVersion < SCHEMA_VERSION) {
         console.log(`[db] migrating schema v${currentVersion} → v${SCHEMA_VERSION}`);
         try {
             db.exec(`DROP TABLE IF EXISTS vec_memory`);
         }
-        catch (_e) { }
+        catch (_e) {
+            debugCatch('db:ddl', _e);
+        }
         try {
             db.exec(`DROP TABLE IF EXISTS vec_facts`);
         }
-        catch (_e) { }
+        catch (_e) {
+            debugCatch('db:ddl', _e);
+        }
         try {
             db.exec(`DELETE FROM embedding_cache`);
         }
-        catch (_e) { }
+        catch (_e) {
+            debugCatch('db:ddl', _e);
+        }
         db.prepare('INSERT OR REPLACE INTO _schema_version (version) VALUES (?)').run(SCHEMA_VERSION);
         console.log(`[db] migration complete: vec tables will be created with ${vecDim()}-dim`);
     }
@@ -782,11 +915,15 @@ export function initProjectSchema(db) {
     try {
         db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(embedding float[${vecDim()}])`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     try {
         db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(embedding float[${vecDim()}])`);
     }
-    catch (_e) { }
+    catch (_e) {
+        debugCatch('db:ddl', _e);
+    }
     // v1.26: 嵌入空间(模型+维度)对齐 —— 换模型但维度不变时,旧向量属于另一语义空间,必须失效重嵌。
     // 放在建表之后、批量嵌入之前;EMBED_MODE=none 时只告警不动数据。
     ensureEmbedSpace(db);
@@ -973,4 +1110,3 @@ export function sweepExpiredSessionMemories(project) {
     }
     return total;
 }
-//# sourceMappingURL=db.js.map

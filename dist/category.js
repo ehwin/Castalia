@@ -81,4 +81,3 @@ export function deleteCategory(name, reassignTo, reassignChildrenTo) {
     tx();
     return { reassigned: memCount.cnt };
 }
-//# sourceMappingURL=category.js.map

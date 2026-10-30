@@ -1010,4 +1010,3 @@ export async function reflect(action, params = {}) {
             return { error: `unknown reflect action: "${action}". Valid: list, unanalyzed, apply, merge, split, relate, reclassify, delete, boost, decay, batch, auto` };
     }
 }
-//# sourceMappingURL=reflect.js.map

@@ -12,6 +12,7 @@ import { embed } from './ollama.js';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { MemType, normalizeMemType } from './memType.js';
 import { parseTagsSafe } from './tags.js';
+import { debugCatch } from './log.js';
 import type Database from 'better-sqlite3';
 
 // 中性评分权重(可配)
@@ -552,7 +553,7 @@ function updateAccessed(db: any, results: SearchResult[]) {
     const now = new Date().toISOString();
     const tx = db.transaction((ids: string[]) => { for (const id of ids) stmt.run(now, id); });
     tx(results.map(r => r.id));
-  } catch {}
+  } catch (e: unknown) { debugCatch('search:updateAccessed', e); }
 }
 
 /**
@@ -714,7 +715,7 @@ export async function searchFacts(
       const update = db.prepare('UPDATE facts SET accessed_count = accessed_count + 1, updated_at = ? WHERE id = ?');
       const tx = db.transaction((ids: string[]) => { for (const id of ids) update.run(now, id); });
       tx(results.map(r => r.id));
-    } catch {}
+    } catch (e: unknown) { debugCatch('search:factAccessed', e); }
   }
 
   // v1.23.2-fix: 按 topK 截断（此前会把 knnLimit 内的 60 条全返回并全部记访问）

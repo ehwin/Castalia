@@ -12,6 +12,7 @@ import { embed } from './ollama.js';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { normalizeMemType } from './memType.js';
 import { parseTagsSafe } from './tags.js';
+import { debugCatch } from './log.js';
 // 中性评分权重(可配)
 const WEIGHT_CONSISTENCY = parseFloat(process.env.WEIGHT_CONSISTENCY || '0.65'); // 语义/标签匹配
 const WEIGHT_TIME = parseFloat(process.env.WEIGHT_TIME || '0.35'); // 时间衰减
@@ -543,7 +544,9 @@ function updateAccessed(db, results) {
             stmt.run(now, id); });
         tx(results.map(r => r.id));
     }
-    catch { }
+    catch (e) {
+        debugCatch('search:updateAccessed', e);
+    }
 }
 /**
  * 快速获取近期重要记忆(用于请求前注入，<5ms)
@@ -679,9 +682,10 @@ export async function searchFacts(query, options = {}) {
                 update.run(now, id); });
             tx(results.map(r => r.id));
         }
-        catch { }
+        catch (e) {
+            debugCatch('search:factAccessed', e);
+        }
     }
     // v1.23.2-fix: 按 topK 截断（此前会把 knnLimit 内的 60 条全返回并全部记访问）
     return results.slice(0, topK);
 }
-//# sourceMappingURL=search.js.map

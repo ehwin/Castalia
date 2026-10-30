@@ -15,7 +15,7 @@ import { z } from 'zod';
 import { searchMemory, searchFacts, getRecentMemories, searchMemoryAcross } from './search.js';
 import { saveMemory, forgetMemory, updateMemory, saveConversationTurn, cleanupExpiredMemories, batchEmbedPending, markColdMemories } from './store.js';
 import { consolidate } from './consolidate.js';
-import { DatabaseManager, listProjectNames, safeFilePart, sweepExpiredSessionMemories } from './db.js';
+import { DatabaseManager, listProjectNames, listAllProjects, safeFilePart, sweepExpiredSessionMemories } from './db.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
 import { flushAllBuffers } from './buffer.js';
 import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnanalyzedConversations } from './reflect.js';
@@ -23,6 +23,7 @@ import { autoProcess } from './autoProcessor.js';
 import { runAutoReflect, runDeepReflect, shouldAutoReflect, runConsolidate, shouldAutoConsolidate, AUTO_REFLECT_LIMIT } from './reflectDriver.js';
 import { ensureSeedInstructions, saveInstruction, getInstruction, listInstructions, deleteInstruction } from './instructions.js';
 import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject, isEmbedEnabled } from './env.js';
+import { debugCatch } from './log.js';
 import { MEM_TYPES, summarizeForIndex } from './memType.js';
 import { parseTagsSafe } from './tags.js';
 import { packContext, deriveCaps } from './contextPack.js';
@@ -1123,7 +1124,9 @@ register('project_list', 'admin', 'List all project namespaces and their memory/
                     try {
                         facts += db.prepare('SELECT COUNT(*) as c FROM facts WHERE is_active=1').get().c;
                     }
-                    catch { }
+                    catch (e) {
+                        debugCatch(`index:stats:facts:${name}:${mt}`, e);
+                    }
                 }
                 projects.push({
                     project: name,
@@ -1275,15 +1278,21 @@ async function main() {
         }, 8000);
     }
     // Agent state: nothing to flush (in-memory only)
-    // Consolidate every 24 hours
-    setInterval(() => { consolidate(PROJECT_ID).catch(() => { }); }, 24 * 60 * 60 * 1000);
-    // Event-driven digest check every 1 minute
+    // Consolidate every 24 hours（v1.26：遍历全部库，不再只维护默认库）
     setInterval(() => {
-        try {
-            maybeDigest(CHAR_ID)?.catch((e) => console.error('digest error:', e));
+        for (const proj of listAllProjects(PROJECT_ID)) {
+            consolidate(proj).catch((e) => debugCatch(`consolidate:${proj}`, e));
         }
-        catch (e) {
-            console.error('digest error:', e);
+    }, 24 * 60 * 60 * 1000);
+    // Event-driven digest check every 1 minute（v1.26：逐个库检查，热闸本就是 per-project）
+    setInterval(() => {
+        for (const proj of listAllProjects(PROJECT_ID)) {
+            try {
+                maybeDigest(CHAR_ID, proj)?.catch((e) => console.error(`digest error (${proj}):`, e));
+            }
+            catch (e) {
+                console.error(`digest error (${proj}):`, e);
+            }
         }
     }, 60 * 1000);
     // WAL checkpoint every 30 minutes
@@ -1293,17 +1302,21 @@ async function main() {
             if (r.pages > 0)
                 console.error('[db] WAL checkpoint:', r.pages, 'pages');
         }
-        catch { }
-    }, 30 * 60 * 1000);
-    // Cleanup expired every 30 minutes
-    setInterval(() => {
-        try {
-            const cleaned = cleanupExpiredMemories();
-            if (cleaned > 0)
-                console.error(`[castalia] cleaned ${cleaned} expired temporary memories`);
-        }
         catch (e) {
-            console.error('[castalia] cleanup error:', e.message);
+            debugCatch('index:walCheckpoint', e);
+        }
+    }, 30 * 60 * 1000);
+    // Cleanup expired every 30 minutes（v1.26：全部库）
+    setInterval(() => {
+        for (const proj of listAllProjects(PROJECT_ID)) {
+            try {
+                const cleaned = cleanupExpiredMemories(proj);
+                if (cleaned > 0)
+                    console.error(`[castalia] cleaned ${cleaned} expired temporary memories (${proj})`);
+            }
+            catch (e) {
+                console.error(`[castalia] cleanup error (${proj}):`, e.message);
+            }
         }
     }, 30 * 60 * 1000);
     // Auto-reflect every N hours (REFLECT_INTERVAL_HOURS > 0 enables)
@@ -1349,16 +1362,24 @@ async function main() {
             try {
                 if (process.env.CASTALIA_BACKGROUND_TASKS === '0')
                     return;
-                const cond = shouldAutoReflect(CHAR_ID, PROJECT_ID);
-                if (!cond.should) {
-                    console.error(`[reflect-startup] 跳过: ${cond.reason}`);
-                    return;
+                // v1.26：逐个库判条件（多库实例上，非默认库过去永远等不到启动反思）
+                for (const proj of listAllProjects(PROJECT_ID)) {
+                    try {
+                        const cond = shouldAutoReflect(CHAR_ID, proj);
+                        if (!cond.should) {
+                            console.error(`[reflect-startup] ${proj} 跳过: ${cond.reason}`);
+                            continue;
+                        }
+                        console.error(`[reflect-startup] ${proj} 条件达成(${cond.reason}),启动自动反思...`);
+                        const r = await runAutoReflect(CHAR_ID, AUTO_REFLECT_LIMIT, proj);
+                        console.error(`[reflect-startup] ${proj} 完成: ok=${r.ok}, actions=${r.actions}, applied=${r.applied}, factsInserted=${r.factsInserted ?? 0}, factsUpdated=${r.factsUpdated ?? 0}, errors=${r.errors.length}${r.skipped ? ', skipped' : ''}`);
+                        if (r.errors.length > 0)
+                            console.error(`[reflect-startup] ${proj} errors: ${r.errors.join('; ')}`);
+                    }
+                    catch (e) {
+                        console.error(`[reflect-startup] ${proj} error:`, e.message);
+                    }
                 }
-                console.error(`[reflect-startup] 条件达成(${cond.reason}),启动自动反思...`);
-                const r = await runAutoReflect(CHAR_ID, AUTO_REFLECT_LIMIT, PROJECT_ID);
-                console.error(`[reflect-startup] 完成: ok=${r.ok}, actions=${r.actions}, applied=${r.applied}, factsInserted=${r.factsInserted ?? 0}, factsUpdated=${r.factsUpdated ?? 0}, errors=${r.errors.length}${r.skipped ? ', skipped' : ''}`);
-                if (r.errors.length > 0)
-                    console.error(`[reflect-startup] errors: ${r.errors.join('; ')}`);
             }
             catch (e) {
                 console.error('[reflect-startup] error:', e.message);
@@ -1377,23 +1398,31 @@ async function main() {
                     console.error('[consolidate-startup] 跳过: CONSOLIDATE_AUTO_ON_START=0');
                     return;
                 }
-                const cond = shouldAutoConsolidate(PROJECT_ID);
-                if (!cond.should) {
-                    console.error(`[consolidate-startup] 跳过: 记忆 ${cond.count} 条未超阈值 ${cond.min}`);
-                    return;
+                // v1.26：逐个库判条件与整合（多库实例上，非默认库过去永远等不到启动整合）
+                for (const proj of listAllProjects(PROJECT_ID)) {
+                    try {
+                        const cond = shouldAutoConsolidate(proj);
+                        if (!cond.should) {
+                            console.error(`[consolidate-startup] ${proj} 跳过: 记忆 ${cond.count} 条未超阈值 ${cond.min}`);
+                            continue;
+                        }
+                        // v1.23: 先把长期不用的低价值记忆转冷存（退出新沉淀，但保留可检索）
+                        try {
+                            markColdMemories(proj);
+                        }
+                        catch (e) {
+                            console.error(`[cold] ${proj} error:`, e.message);
+                        }
+                        console.error(`[consolidate-startup] ${proj} 记忆 ${cond.count} 条超阈值 ${cond.min},自动整合...`);
+                        const r = await runConsolidate(CHAR_ID, proj);
+                        console.error(`[consolidate-startup] ${proj} 完成: ok=${r.ok}, scanned=${r.scanned}, candidates=${r.candidates}, actions=${r.actions}, applied=${r.applied}, merged=${r.merged}, deleted=${r.deleted}, kept=${r.kept}, invalidated=${r.invalidated ?? 0}, errors=${r.errors.length}${r.skipped ? ', skipped' : ''}`);
+                        if (r.errors.length > 0)
+                            console.error(`[consolidate-startup] ${proj} errors: ${r.errors.join('; ')}`);
+                    }
+                    catch (e) {
+                        console.error(`[consolidate-startup] ${proj} error:`, e.message);
+                    }
                 }
-                // v1.23: 先把长期不用的低价值记忆转冷存（退出新沉淀，但保留可检索）
-                try {
-                    markColdMemories(PROJECT_ID);
-                }
-                catch (e) {
-                    console.error('[cold] error:', e.message);
-                }
-                console.error(`[consolidate-startup] 记忆 ${cond.count} 条超阈值 ${cond.min},自动整合...`);
-                const r = await runConsolidate(CHAR_ID, PROJECT_ID);
-                console.error(`[consolidate-startup] 完成: ok=${r.ok}, scanned=${r.scanned}, candidates=${r.candidates}, actions=${r.actions}, applied=${r.applied}, merged=${r.merged}, deleted=${r.deleted}, kept=${r.kept}, invalidated=${r.invalidated ?? 0}, errors=${r.errors.length}${r.skipped ? ', skipped' : ''}`);
-                if (r.errors.length > 0)
-                    console.error(`[consolidate-startup] errors: ${r.errors.join('; ')}`);
             }
             catch (e) {
                 console.error('[consolidate-startup] error:', e.message);
@@ -1404,4 +1433,3 @@ async function main() {
     process.on('SIGTERM', () => { DatabaseManager.close(); process.exit(0); });
 }
 main();
-//# sourceMappingURL=index.js.map
