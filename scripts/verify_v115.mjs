@@ -76,5 +76,7 @@ check('preference metadata 落库', prow && prow.metadata.includes('originContex
 check('score_priority=0.85', prow && prow.score_priority === 0.85);
 
 console.log(`\n===== 结果: ${pass} 通过, ${fail} 失败 =====`);
-fs.rmSync(TEST_DIR, { recursive: true, force: true });
+// Windows 上句柄可能还没释放，rmSync 会抛 EPERM；清理失败不该把一次全绿的验证判成崩溃。
+try { fs.rmSync(TEST_DIR, { recursive: true, force: true }); }
+catch (e) { console.log(`（临时库未删除：${TEST_DIR} — ${e.code || e.message}）`); }
 process.exit(fail > 0 ? 1 : 0);
