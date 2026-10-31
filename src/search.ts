@@ -67,6 +67,11 @@ const SEARCH_PROFILES: Record<string, { topK: number; minScore: number }> = {
   deep: { topK: 10, minScore: 0.1 },
 };
 
+/** 当前生效的 minScore（面板/回归读取用；balanced 档读 env SEARCH_MIN_SCORE）。 */
+export function profileMinScore(profile: 'quick' | 'balanced' | 'deep' = 'balanced'): number {
+  return SEARCH_PROFILES[profile].minScore;
+}
+
 export interface SearchResult {
   id: string;
   text: string;
@@ -121,7 +126,8 @@ function decayFor(row: any, hoursSinceCreated: number): number {
 }
 
 /** 统一评分:一致性 + 情绪(弱) + 时间（+ 派生叙述折扣） */
-function computeScore(similarity: number, row: any, derivedPenalty: number = 1): number {
+/** 导出给回归/面板契约测试用：直接验「权重改了分数就变」这类性质，不被端到端相似度差异干扰。 */
+export function computeScore(similarity: number, row: any, derivedPenalty: number = 1): number {
   const consistency = Math.min(Math.max(similarity, 0), 0.85);
   const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
   const decay = decayFor(row, hoursSinceCreated);

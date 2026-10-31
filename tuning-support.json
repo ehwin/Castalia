@@ -1,0 +1,49 @@
+{
+  "spec_version": 1,
+  "engine": "castalia",
+  "variant": "panel",
+  "engine_version": "1.27.0",
+  "generated_by": "Castalia 标准版 · 面板变体",
+  "notes": [
+    "宿主（如 AIRI 的「心智参数」面板）按本文件生成表单：只画这里列出的键，默认值取这里的 default。",
+    "标准版没有情感状态机，也没有情感/偏离权重与注入门槛：清单里只有相关性与时间两项权重 + 检索下限。",
+    "restart=true 的键是模块级常量，改完必须重启后端进程才生效。"
+  ],
+  "groups": {
+    "search": [
+      {
+        "key": "WEIGHT_CONSISTENCY",
+        "kind": "number",
+        "default": 0.65,
+        "min": 0,
+        "max": 3,
+        "step": 0.01,
+        "restart": true,
+        "label": { "zh": "权重 · 相关性", "en": "Weight · relevance" }
+      },
+      {
+        "key": "WEIGHT_TIME",
+        "kind": "number",
+        "default": 0.35,
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "restart": true,
+        "label": { "zh": "权重 · 时间衰减", "en": "Weight · recency" },
+        "hint": { "zh": "标准版偏重时间连续性；与情感版的 0.03 不是同一个量", "en": "The standard engine leans on recency; not the same quantity as the emotional body's 0.03" }
+      },
+      {
+        "key": "SEARCH_MIN_SCORE",
+        "kind": "number",
+        "default": 0.15,
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "restart": true,
+        "label": { "zh": "检索下限（balanced 档）", "en": "Search floor (balanced)" },
+        "hint": { "zh": "低于它的候选不返回；调高会让召回变窄", "en": "Candidates below this are dropped; raising it narrows recall" }
+      }
+    ]
+  },
+  "presets": {}
+}

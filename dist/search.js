@@ -39,6 +39,10 @@ const SEARCH_PROFILES = {
     balanced: { topK: 5, minScore: parseFloat(process.env.SEARCH_MIN_SCORE || '0.15') },
     deep: { topK: 10, minScore: 0.1 },
 };
+/** 当前生效的 minScore（面板/回归读取用；balanced 档读 env SEARCH_MIN_SCORE）。 */
+export function profileMinScore(profile = 'balanced') {
+    return SEARCH_PROFILES[profile].minScore;
+}
 /** 指数时间衰减:30 天半衰期 */
 function timeDecay(hoursSinceCreated) {
     if (hoursSinceCreated <= 0)
@@ -67,7 +71,8 @@ function decayFor(row, hoursSinceCreated) {
     return timeDecay(hoursSinceCreated);
 }
 /** 统一评分:一致性 + 情绪(弱) + 时间（+ 派生叙述折扣） */
-function computeScore(similarity, row, derivedPenalty = 1) {
+/** 导出给回归/面板契约测试用：直接验「权重改了分数就变」这类性质，不被端到端相似度差异干扰。 */
+export function computeScore(similarity, row, derivedPenalty = 1) {
     const consistency = Math.min(Math.max(similarity, 0), 0.85);
     const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
     const decay = decayFor(row, hoursSinceCreated);

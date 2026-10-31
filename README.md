@@ -420,6 +420,33 @@ node server.mjs    # → http://127.0.0.1:3345   (WEB_PORT 可改)
 
 ---
 
+## 面板对接（tuning-support.json）
+
+标准版带「面板」变体时，宿主（如 AIRI 设置 → 记忆 → 心智参数）不需要认识引擎内部，只要读
+仓库根的 `tuning-support.json`：
+
+```json
+{
+  "spec_version": 1, "engine": "castalia", "variant": "panel",
+  "groups": { "search": [
+    { "key": "WEIGHT_CONSISTENCY", "default": 0.65, "min": 0, "max": 3, "step": 0.01, "restart": true, "label": {…} },
+    { "key": "WEIGHT_TIME",        "default": 0.35, … },
+    { "key": "SEARCH_MIN_SCORE",   "default": 0.15, … }
+  ]},
+  "presets": {}
+}
+```
+
+约定：
+
+1. **只画清单里的键**。标准版没有情感状态机，也没有情感/偏离权重与注入门槛，所以清单里没有
+   `PSYCHE_*` / `WEIGHT_EMOTION` / `WEIGHT_DEVIATION` / `MEMORY_INJECT_*` —— 面板应整组隐藏。
+2. **默认值取清单里的 `default`**：标准版的 0.65 / 0.35 / 0.15 与情感版的 1.00 / 0.12 / 0.03 / 0.10
+   不是同一个量，不能共用一份默认值。
+3. `restart: true` 的键是模块级常量，改完必须重启后端进程才生效。
+
+契约测试：`node scripts/test_tuning_surface.mjs`（11 断言：权重生效、下限生效、情感侧键不在清单里）。
+
 ## 回归脚本
 
 `scripts/` 下 13 个 `.mjs` 是可重复跑的回归，挑常用的：
