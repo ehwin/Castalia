@@ -28,6 +28,7 @@ import { MEM_TYPES, summarizeForIndex } from './memType.js';
 import { parseTagsSafe } from './tags.js';
 import { packContext, deriveCaps } from './contextPack.js';
 import { ingestEvents, searchEvents, eventStats } from './events.js';
+import { adjudicateInjection, gateModeFromEnv } from './injectGate.js';
 /** memory_context 的总字符预算（v1.24：从"盲切"改成按段配额装箱；超预算按优先级整条裁） */
 const PROMPT_BUDGET = Number(process.env.MEMORY_CONTEXT_BUDGET || 24000);
 console.log = console.error;
@@ -139,17 +140,42 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
     projects: z.array(z.string()).optional().describe('Cross-library search: search several libraries in one call (e.g. ["default","shared"]). "*" or ["all"] = every library of this instance. Omit for single-library search. Each result carries its source library in "project".'),
     derivedPolicy: z.enum(['demoted', 'only', 'excluded']).optional().describe('How to treat derived narratives (reflect summaries/insights): demoted = included but ranked down (default), only = only those, excluded = hide them completely. They are never usable as evidence regardless.'),
+    gate: z.enum(['off', 'shadow', 'on']).optional().describe('Pair-level injection adjudication (v1.28). off = never call the LLM (default); shadow = call and report decisions without dropping anything; on = only keep candidates judged A (needed now). Measured on 880 labelled pairs: retrieval alone F1 32.9 → adjudicated F1 94.1.'),
+    simFloor: z.number().optional().describe('Similarity floor applied to the similarity (not the composite score). Omit to use the profile default (balanced = 0 unless SEARCH_SIM_FLOOR is set).'),
 }, async (args) => {
     try {
-        const base = { query: args.query, topK: args.topK ?? 5, category: args.category, memType: args.memType, characterId: CHAR_ID, derivedPolicy: args.derivedPolicy };
+        const base = { query: args.query, topK: args.topK ?? 5, category: args.category, memType: args.memType, characterId: CHAR_ID, derivedPolicy: args.derivedPolicy, simFloor: args.simFloor };
         const r = args.projects && args.projects.length > 0
             ? await searchMemoryAcross({ ...base, projects: args.projects })
             : await searchMemory({ ...base, profile: 'balanced', project: args.project });
+        // v1.28: 对级裁决（默认 off）。shadow 只回决策、不改结果；on 只留 label=A。
+        let rows = r;
+        let gateInfo = undefined;
+        const gateMode = args.gate ?? gateModeFromEnv();
+        if (gateMode !== 'off' && r.length > 0) {
+            const g = await adjudicateInjection({
+                query: args.query,
+                candidates: r.map(m => ({ id: m.id, text: m.text, similarity: m.similarity })),
+                project: args.project,
+                mode: gateMode,
+            });
+            gateInfo = {
+                mode: g.mode,
+                keep: g.kept.length,
+                drop: g.dropped.length,
+                verdicts: g.verdicts.map(v => ({ id: v.id, decision: v.decision, label: v.label, why: v.why })),
+                errors: g.errors.slice(0, 3),
+            };
+            if (gateMode === 'on') {
+                const keep = new Set(g.kept.map(c => c.id));
+                rows = r.filter(m => keep.has(m.id));
+            }
+        }
         return ok({
             op: 'search',
             query: args.query,
-            count: r.length,
-            results: r.map(m => ({
+            count: rows.length,
+            results: rows.map(m => ({
                 project: m.project,
                 id: m.id,
                 text: m.text.length > 200 ? m.text.substring(0, 200) + '…' : m.text,
@@ -163,6 +189,7 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
                 derived: m.derived === true,
                 createdAt: m.createdAt,
             })),
+            ...(gateInfo ? { gate: gateInfo } : {}),
             hint: '用 memory_get(id) 取完整内容',
         });
     }
