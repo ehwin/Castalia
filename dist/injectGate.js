@@ -43,11 +43,11 @@ function renderContext(context) {
         return '（无）';
     return context.slice(-6).map(m => `${m.role === 'assistant' ? '助手' : '对方'}: ${String(m.text).slice(0, 400)}`).join('\n');
 }
-function buildUser(input) {
-    const cands = input.candidates
+function buildUser(input, cands) {
+    const body = cands
         .map((c, i) => `[${i + 1}] id=${c.id}\n${String(c.text).slice(0, 800)}`)
         .join('\n\n');
-    return `【最近对话】\n${renderContext(input.context)}\n\n【用户这一轮】\n${input.query}\n\n【候选记忆】\n${cands}`;
+    return `【最近对话】\n${renderContext(input.context)}\n\n【用户这一轮】\n${input.query}\n\n【候选记忆】\n${body}`;
 }
 /** 从模型输出里抠出 JSON（容忍围栏、前后废话、被截断的尾巴） */
 function parseVerdicts(raw) {
@@ -104,12 +104,31 @@ export async function adjudicateInjection(input) {
     }
     const errors = [];
     let parsed = [];
-    const resp = await callGateLlm(GATE_SYSTEM, buildUser(input), channel).catch((e) => {
+    // 第一轮：整批判
+    const first = await callGateLlm(GATE_SYSTEM, buildUser(input, all), channel).catch((e) => {
         errors.push(`gate llm: ${String(e?.message ?? e).slice(0, 160)}`);
         return null;
     });
-    if (resp)
-        parsed = parseVerdicts(resp);
+    if (first)
+        parsed = parseVerdicts(first);
+    // 第二轮：只补"模型没给判定"的候选。
+    // 这一轮不是调参，是补确定性：漏判会被 fail-open 当成 INJECT 放过去，
+    // 实测同一批候选两次跑，漏判 13 vs 28 条，F1 就从 81.3 掉到 79.8 —— 抖动全在漏判上。
+    for (let round = 0; round < 2; round++) {
+        const missing = all.filter(c => !parsed.some(v => v.id === c.id));
+        if (missing.length === 0)
+            break;
+        const retry = await callGateLlm(`${GATE_SYSTEM}\n\n【本轮只判这些】上一条回复漏掉了下面 ${missing.length} 条候选，逐条补齐，格式不变。`, buildUser(input, missing), channel).catch((e) => {
+            errors.push(`gate retry: ${String(e?.message ?? e).slice(0, 120)}`);
+            return null;
+        });
+        if (!retry)
+            break;
+        const more = parseVerdicts(retry).filter(v => missing.some(c => c.id === v.id));
+        if (more.length === 0)
+            break;
+        parsed = [...parsed, ...more];
+    }
     // 模型漏判的候选按"保留"处理（fail-open）：判不了不等于该丢。
     const byId = new Map(parsed.map(v => [v.id, v]));
     const verdicts = all.map(c => {
