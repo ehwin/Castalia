@@ -34,6 +34,15 @@ export interface SearchOptions {
   subject?: string;
   topK?: number;
   minScore?: number;
+  /**
+   * v1.28: 进入门槛，作用在 **similarity** 上（不是复合分）。
+   *
+   * 旧的 minScore 比的是 computeScore 的结果，而 computeScore 里有 `0.35 × 时间衰减` ——
+   * 相似度 0 的新行也有 0.35 分，balanced 门槛 0.15 对 30 天内写入的任何行都不成立。
+   * 于是"这里没有够格的候选"无法表达：只要库里有行，就一定有结果。
+   * simFloor 把"进不进来"和"排多前"拆开：相似度不够的候选整条丢弃，时间/重要性只影响排序。
+   */
+  simFloor?: number;
   profile?: 'quick' | 'balanced' | 'deep';
   // v1.15: LobeHub 精细化吸收 — 评分排序
   sort?: 'default' | 'priority' | 'urgency';  // priority=score_priority 优先,urgency=score_urgency 优先
@@ -61,11 +70,27 @@ const DERIVED_RANK_PENALTY = (() => {
 })();
 
 // minScore 阈值可配;harness 可用 SEARCH_MIN_SCORE 覆盖
-const SEARCH_PROFILES: Record<string, { topK: number; minScore: number }> = {
-  quick: { topK: 3, minScore: 0.6 },
-  balanced: { topK: 5, minScore: parseFloat(process.env.SEARCH_MIN_SCORE || '0.15') },
-  deep: { topK: 10, minScore: 0.1 },
+// v1.28: simFloor = 相似度进入门槛（见 SearchOptions.simFloor）。
+//
+// 默认 0 = 不改变既有行为（只按复合分判，时间项仍可单独过关）——这是**策略选择**，
+// 不该由引擎单方面替部署方决定。同一批 880 对上实测（scripts/eval/std_gate_eval.mjs）：
+//   floor 0    → 注入 559 / 精确率 11.6% / 召回 75.6% / F1 20.2
+//   floor 0.15 → 注入 173 / 精确率 19.7% / 召回 39.5% / F1 26.3
+//   floor 0.45 → 注入   4 / 精确率 100%  / 召回  4.7% / F1  8.9
+// 即：0.15 让 F1 涨三成，代价是召回腰斩（论文 §8 的零和，不是修复）。
+// 要收紧就设 SEARCH_SIM_FLOOR=0.15（或按调用传 simFloor）；quick 档本来就自称高精度，
+// 它的 0.6 复合分等价于相似度 0.38，因此单独给 0.45。
+const SEARCH_PROFILES: Record<string, { topK: number; minScore: number; simFloor: number }> = {
+  quick: { topK: 3, minScore: 0.6, simFloor: 0.45 },
+  balanced: { topK: 5, minScore: parseFloat(process.env.SEARCH_MIN_SCORE || '0.15'),
+    simFloor: parseFloat(process.env.SEARCH_SIM_FLOOR || '0') },
+  deep: { topK: 10, minScore: 0.1, simFloor: 0 },
 };
+
+/** 当前生效的 simFloor（面板/回归读取用；balanced 档读 env SEARCH_SIM_FLOOR）。 */
+export function profileSimFloor(profile: 'quick' | 'balanced' | 'deep' = 'balanced'): number {
+  return SEARCH_PROFILES[profile].simFloor;
+}
 
 /** 当前生效的 minScore（面板/回归读取用；balanced 档读 env SEARCH_MIN_SCORE）。 */
 export function profileMinScore(profile: 'quick' | 'balanced' | 'deep' = 'balanced'): number {
@@ -187,6 +212,8 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
   const profile = options.profile ? SEARCH_PROFILES[options.profile] : null;
   const topK = options.topK ?? profile?.topK ?? 10;
   const minScore = options.minScore ?? profile?.minScore ?? 0;
+  // v1.28: 进入门槛（相似度）。未指定 profile/options 时为 0，保持旧行为。
+  const simFloor = options.simFloor ?? profile?.simFloor ?? 0;
 
   // ═══ Phase 1: 标签搜索 + 词法(FTS5/BM25)(0 次向量调用) ═══
   // v1.24: 词法通道与标签并列进 Phase 1 —— 精确短语命中不该排在向量后面，
@@ -196,8 +223,10 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
   const tagResults2 = [...tagResults, ...lexical].sort((a, b) => b.score - a.score);
 
   // 标签/词法结果足够好 → 直接返回（访问记账统一在 searchMemory 里做）
-  if (tagResults2.length >= topK && tagResults2[0].score >= 0.5) {
-    return tagResults2.slice(0, topK);
+  // v1.28: 早退也必须过 simFloor —— 否则 quick 档的 0.6 复合分会被总量命中绕开
+  //        （旧实现里标签路 similarity 是"命中占比"，一个关键词就能到 1.0）。
+  if (tagResults2.length >= topK && tagResults2[0].score >= 0.5 && tagResults2[0].similarity >= simFloor) {
+    return tagResults2.filter(r => r.similarity >= simFloor).slice(0, topK);
   }
 
   // ═══ Phase 2: 不足 → 向量 KNN 补充(EMBED_MODE=none 时跳过,纯文本回退) ═══
@@ -236,6 +265,9 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
   const seen = new Set<string>();
   const unique: SearchResult[] = [];
   for (const r of merged) {
+    // v1.28: 相似度不够的候选不占名额 —— 旧实现先取满 topK 再返回，
+    // 弱命中会把真命中挤出结果（也让"返回空"永远不可能发生）。
+    if (r.similarity < simFloor) continue;
     if (!seen.has(r.id)) { seen.add(r.id); unique.push(r); }
     if (unique.length >= topK) break;
   }
@@ -306,6 +338,44 @@ export function queryTerms(query: string, max = 16): string[] {
 /** 从中文/英文 query 中提取关键词 */
 function extractKeywords(query: string): string[] {
   return queryTerms(query).filter(t => !QUERY_STOP_WORDS.has(t.toLowerCase()));
+}
+
+/**
+ * v1.28: 查询词的 IDF 权重 —— 词法两路（FTS / 文本回退）共用同一口径。
+ * 「母亲」「黑潮」这类罕见词比「自己」「记得」这种高频 bigram 有信息量；
+ * 不按语料频率加权的话，命中个数一视同仁，实体问句的要点行会被高频词挤掉。
+ */
+function idfWeights(db: any, terms: string[], options: SearchOptions): number[] {
+  const project = normalizeProject(options.project);
+  const dfSql = `SELECT COUNT(*) c FROM memory m WHERE m.is_active = 1 AND m.project = ?`
+    + ` AND COALESCE(m.status, '') <> 'superseded'`
+    + (options.memType ? ' AND m.mem_type = ?' : '')
+    + (options.characterId ? ' AND m.character_id = ?' : '');
+  const dfBase: any[] = [project, ...(options.memType ? [String(options.memType)] : []), ...(options.characterId ? [options.characterId] : [])];
+  let corpusN = 1;
+  try { corpusN = Number((db.prepare(dfSql).get(...dfBase) as any)?.c) || 1; } catch { corpusN = 1; }
+  return terms.map((t) => {
+    let df = 0;
+    try { df = Number((db.prepare(`${dfSql} AND m.text LIKE ?`).get(...dfBase, `%${t}%`) as any)?.c) || 0; } catch { df = 0; }
+    return Math.log(1 + corpusN / (1 + df));
+  });
+}
+
+/**
+ * IDF 加权覆盖率 = 命中词权重 / 全部词权重。
+ *
+ * 这是**占比**，不是证据量：单 term 查询命中即 1.0，2 字中文查询只有一个 bigram，
+ * 所以"在吗/继续"这类无实指短句命中任何含该 bigram 的行都会拿到满分。
+ * 知道这一点是设计前提 —— 门槛挡不住它，只能靠裁决层（见 injectGate）。
+ */
+function coverageOf(text: string, terms: string[], idf: number[]): number {
+  const lower = String(text || '').toLowerCase();
+  let matched = 0, total = 0;
+  for (let i = 0; i < terms.length; i++) {
+    total += idf[i];
+    if (lower.includes(terms[i].toLowerCase())) matched += idf[i];
+  }
+  return total > 0 ? Math.min(1, matched / total) : 0;
 }
 
 /** SQL 标签搜索：匹配 memory.tags JSON 数组 */
@@ -410,11 +480,15 @@ function lexicalSearch(
   } catch {
     return [];   // 库没建 FTS 或语法不支持 → 静默退回其它通道
   }
+  // v1.28: similarity 必须是"覆盖率"，不是"名次"。
+  // 旧实现按名次发分（首位 0.88，下限 0.45），于是 FTS 命中的第 1 名在数值上
+  // 永远比真实的弱向量命中更像"高相似"，门槛对它完全失去意义；改口径后
+  // bm25 只决定返回谁和顺序，进入门槛由 coverage 与 simFloor 共同决定。
+  const idf = idfWeights(db, terms, options);
   return rows
     .filter(row => !excludeIds.has(row.id))
-    .map((row, i) => {
-      // 排名折算：首位 0.88，按名次递减，下限 0.45（仍高于纯 LIKE 的 0.3）
-      const similarity = Math.max(0.45, 0.88 - i * 0.06);
+    .map((row) => {
+      const similarity = coverageOf(row.text, terms, idf);
       return {
         id: row.id, text: row.text, project: row.project || 'default', type: row.type,
         memType: row.mem_type || 'general', category: row.category,
@@ -535,20 +609,8 @@ function textFallbackSearch(
   if (options.subject) { conds.push('m.subject = ?'); params.push(options.subject); }
 
   // 2026-10-28:IDF 加权 —— 「母亲」「黑潮」这类罕见词比「自己」「记得」这种高频 bigram 有信息量,
-  // 按命中个数一视同仁会让实体问句的要点行排在后面。
-  const dfSql = `SELECT COUNT(*) c FROM memory m WHERE m.is_active = 1 AND m.project = ?`
-    + ` AND COALESCE(m.status, '') <> 'superseded'`
-    + (options.memType ? ' AND m.mem_type = ?' : '')
-    + (options.characterId ? ' AND m.character_id = ?' : '');
-  const dfBase: any[] = [project, ...(options.memType ? [String(options.memType)] : []), ...(options.characterId ? [options.characterId] : [])];
-  let corpusN = 1;
-  try { corpusN = Number((db.prepare(dfSql).get(...dfBase) as any)?.c) || 1; } catch { corpusN = 1; }
-  const idf = terms.map((t) => {
-    let df = 0;
-    try { df = Number((db.prepare(`${dfSql} AND m.text LIKE ?`).get(...dfBase, `%${t}%`) as any)?.c) || 0; } catch { df = 0; }
-    return Math.log(1 + corpusN / (1 + df));
-  });
-  const totalWeight = idf.reduce((a: number, b: number) => a + b, 0) || 1;
+  // 按命中个数一视同仁会让实体问句的要点行排在后面。v1.28 抽成 idfWeights，与 FTS 路共用。
+  const idf = idfWeights(db, terms, options);
 
   const rows = db.prepare(`
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
@@ -559,16 +621,17 @@ function textFallbackSearch(
     WHERE ${conds.join(' AND ')}
     ORDER BY (${terms.map(() => `CASE WHEN m.text LIKE ? THEN 1 ELSE 0 END`).join(' + ')}) DESC, m.created_at DESC
     LIMIT ?
-  `).all(...params, ...likeParams, topK * 2) as any[];
+  `).all(...params, ...likeParams, topK * 3) as any[];
 
   return rows
     .filter(row => !excludeIds.has(row.id))
-    .map(row => {
+    .map((row): SearchResult | null => {
       // 真实词法覆盖率(IDF 加权),不再硬写 0.3 —— 硬写会让所有词法命中在相关性上完全并列,
       // 排序只能靠元数据决定(2026-10-28)。
-      const lower = String(row.text || '').toLowerCase();
-      const matchedWeight = terms.reduce((n: number, t: string, i: number) => n + (lower.includes(t.toLowerCase()) ? idf[i] : 0), 0);
-      const lexSim = Math.min(1, matchedWeight / totalWeight);
+      const lexSim = coverageOf(row.text, terms, idf);
+      const score = computeScore(lexSim, row, dpTxt.penalty);
+      // v1.28: 这个形参以前是死的（签名收下、函数体从未使用），调用方以为词法回退有门槛。
+      if (score < minScore) return null;
       return {
         id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
         subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
@@ -576,11 +639,12 @@ function textFallbackSearch(
         characterId: row.character_id, source: row.source,
         subject: row.subject || 'user', tier: row.tier || 'standard',
         parentId: row.parent_id || null, derived: !!row.derived,
-        score: computeScore(lexSim, row, dpTxt.penalty), similarity: Math.round(lexSim * 1000) / 1000,
+        score, similarity: Math.round(lexSim * 1000) / 1000,
         createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
         accessedCount: row.accessed_count,
       };
-    });
+    })
+    .filter((r): r is SearchResult => r !== null);
 }
 
 /** 更新记忆访问计数 */
