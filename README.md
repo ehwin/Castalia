@@ -420,6 +420,33 @@ node server.mjs    # → http://127.0.0.1:3345   (WEB_PORT 可改)
 
 ---
 
+## 面板对接（tuning-support.json）
+
+标准版带「面板」变体时，宿主（如 AIRI 设置 → 记忆 → 心智参数）不需要认识引擎内部，只要读
+仓库根的 `tuning-support.json`：
+
+```json
+{
+  "spec_version": 1, "engine": "castalia", "variant": "panel",
+  "groups": { "search": [
+    { "key": "WEIGHT_CONSISTENCY", "default": 0.65, "min": 0, "max": 3, "step": 0.01, "restart": true, "label": {…} },
+    { "key": "WEIGHT_TIME",        "default": 0.35, … },
+    { "key": "SEARCH_MIN_SCORE",   "default": 0.15, … }
+  ]},
+  "presets": {}
+}
+```
+
+约定：
+
+1. **只画清单里的键**。标准版没有情感状态机，也没有情感/偏离权重与注入门槛，所以清单里没有
+   `PSYCHE_*` / `WEIGHT_EMOTION` / `WEIGHT_DEVIATION` / `MEMORY_INJECT_*` —— 面板应整组隐藏。
+2. **默认值取清单里的 `default`**：标准版的 0.65 / 0.35 / 0.15 与情感版的 1.00 / 0.12 / 0.03 / 0.10
+   不是同一个量，不能共用一份默认值。
+3. `restart: true` 的键是模块级常量，改完必须重启后端进程才生效。
+
+契约测试：`node scripts/test_tuning_surface.mjs`（11 断言：权重生效、下限生效、情感侧键不在清单里）。
+
 ## 回归脚本
 
 `scripts/` 下 13 个 `.mjs` 是可重复跑的回归，挑常用的：
@@ -455,6 +482,8 @@ node scripts/test_e2e_mcp.mjs             # 端到端 MCP
 | 6 | **多库维护是线性成本**：每库一轮 consolidate = 一轮 LLM 调用（条件不满足会跳过，但库多时启动后日志会变长） | **开放**。真到几十个库的规模，应改成「只跑有增量的库」，而不是继续扫全量 |
 | 7 | **会话草稿行（`session_memory`）不进语义检索**：它没有稳定向量，正文一变就摘掉旧向量 | **按设计**。要让它可检索，应在宿主侧显式调用检索，而不是把草稿混进候选 |
 | 8 | **情感 / 人物 / 关系层不在本仓**：VAD、情绪加权、显著度排序、锚点属于 Anima | **分工**。本仓只保证中立核心；把情感取舍塞进来会让两个仓的版本线互相污染 |
+| 9 | **相似度是"命中占比 / 名次"，不是证据量**：2 字中文查询只有一个 bigram，命中任何含该 bigram 的行就是覆盖率 1.0（"为什么"会召回"什么也没说"）。单靠门槛挡不住 | **按设计暴露，不假装修好**。v1.28 把 FTS 通道从"名次发分（首位 0.88）"改成 IDF 加权覆盖率，让三条通道可比较，但占比饱和是结构性的。真正的判据是对级裁决：`memory_search` 的 `gate` 参数（`off` / `shadow` / `on`），默认 `off` |
+| 10 | **`simFloor` 默认 0**：进入门槛虽然已经作用在 `similarity` 上（时间项不再能单独让一条记忆过关），但默认不启用 | **策略留给部署方**。880 对实测：`0` → F1 20.2 / 召回 75.6；`0.15` → F1 26.3 / 召回 39.5；`0.45` → 精确 100 / 召回 4.7。收紧是零和，不该由引擎替调用方决定；需要就设 `SEARCH_SIM_FLOOR=0.15`。复跑见 `scripts/eval/std_gate_eval.mjs` |
 
 需要情感记忆（该不该想起、想起来有多重）用 [Castalia-Anima](https://github.com/ehwin/Castalia-Anima)；需要跨库检索 / 总反思用 [Castalia-Full](https://github.com/ehwin/Castalia-Full)。
 
