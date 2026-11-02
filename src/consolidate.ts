@@ -47,6 +47,18 @@ export const CONSOLIDATE_MAX_PAIRS = (() => {
   return Number.isFinite(v) && v > 0 ? v : 50;
 })();
 
+/** v1.28: 整合窗口分片大小 —— 重要度分片 + 轮转分片。
+ *  两者之和就是单轮进 LLM 的上限(默认 500，与旧行为同量级)，但轮转分片带游标，
+ *  所以全库会被逐轮扫到，而不是像旧实现那样永远只扫最老的 200 条。 */
+export const CONSOLIDATE_WINDOW_TOP = (() => {
+  const v = parseInt(process.env.CONSOLIDATE_WINDOW_TOP || '300', 10);
+  return Number.isFinite(v) && v >= 0 ? v : 300;
+})();
+export const CONSOLIDATE_WINDOW_ROTATE = (() => {
+  const v = parseInt(process.env.CONSOLIDATE_WINDOW_ROTATE || '200', 10);
+  return Number.isFinite(v) && v >= 0 ? v : 200;
+})();
+
 export interface SimilarCandidate {
   idA: string;
   idB: string;
@@ -59,8 +71,13 @@ export interface SimilarCandidate {
  * - vec0 虚拟表禁止 JOIN:先对每条记忆做 KNN 取候选 rowid,再二段过滤 project/locked
  * - 每对去重(不重复 idA/idB、不反向),数量上限 limit 防爆炸
  */
-/** v1.11.2 单个 memType 库的语义预筛(向量 KNN);候选并入共享 seen/pairs。 */
-function scanVectorPairs(db: any, proj: string, threshold: number, limit: number, seen: Set<string>, pairs: SimilarCandidate[]): void {
+/** v1.11.2 单个 memType 库的语义预筛(向量 KNN);候选并入共享 seen/pairs。
+ *  v1.28: windowIds 给定时候选生成被限制在窗口内 —— 锚点与邻居都必须是窗口内的行。
+ *  旧实现先全库取“最新 500”当锚点、再让下游按窗口过滤，实测 48 对里 42 对被丢掉；
+ *  而窗口里的老行(created_at 很早)根本轮不到当锚点，老重复永远进不了裁决。
+ */
+function scanVectorPairs(db: any, proj: string, threshold: number, limit: number, seen: Set<string>, pairs: SimilarCandidate[], windowIds?: Set<string>): void {
+  const winClause = windowIds && windowIds.size ? `AND m.id IN (${[...windowIds].map(() => '?').join(',')})` : '';
   const mems = db.prepare(`
     SELECT m.rowid, m.id FROM memory m
     WHERE m.is_active = 1 AND m.project = ? AND (m.locked IS NULL OR m.locked = 0)
@@ -68,9 +85,10 @@ function scanVectorPairs(db: any, proj: string, threshold: number, limit: number
       AND COALESCE(m.status, '') NOT IN ('cold', 'superseded')
       -- v1.27: 派生叙述不参与整合（摘要之间互合并只会让模型的自述越滚越大）
       AND m.derived = 0
+      ${winClause}
     ORDER BY m.created_at DESC
     LIMIT 500
-  `).all(proj) as any[];
+  `).all(proj, ...(windowIds && windowIds.size ? [...windowIds] : [])) as any[];
   if (mems.length < 2) return;
 
   const rowidList = mems.map(m => Number(m.rowid));
@@ -126,11 +144,15 @@ function scanVectorPairs(db: any, proj: string, threshold: number, limit: number
   }
 }
 
-/** v1.11.2 单个 memType 库的结构兜底(同 `# 表头` 分桶);由 findSimilarCandidates 跨库调度。 */
-function scanStructPairs(db: any, proj: string, limit: number, seen: Set<string>, pairs: SimilarCandidate[]): void {
+/** v1.11.2 单个 memType 库的结构兜底(同 `# 表头` 分桶);由 findSimilarCandidates 跨库调度。
+ *  v1.28: windowIds 给定时候选只用窗口内的行 —— 旧实现固定取“最新 500”，
+ *  窗口里的老行(表头重复往往就是这批)永远拿不到，结构兜底等于对它们失效。
+ */
+function scanStructPairs(db: any, proj: string, limit: number, seen: Set<string>, pairs: SimilarCandidate[], windowIds?: Set<string>): void {
   // ═══ v1.11 结构兜底:同 `# 表头` + 同 memType 分桶补候选(相似度记 0,表示"结构配对"而非语义相似)═══
   if (CONSOLIDATE_BUCKET_PAIRS > 0 && pairs.length < limit) {
     let rows2: any[] = [];
+    const winClause = windowIds && windowIds.size ? `AND id IN (${[...windowIds].map(() => '?').join(',')})` : '';
     try {
       rows2 = db.prepare(`
         SELECT id, text, mem_type FROM memory
@@ -138,8 +160,9 @@ function scanStructPairs(db: any, proj: string, limit: number, seen: Set<string>
           AND COALESCE(tier, 'standard') <> 'critical'
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
           AND derived = 0
+          ${winClause}
         ORDER BY created_at DESC LIMIT 500
-      `).all(proj) as any[];
+      `).all(proj, ...(windowIds && windowIds.size ? [...windowIds] : [])) as any[];
     } catch { rows2 = []; }
     const buckets = new Map<string, any[]>();
     for (const r of rows2) {
@@ -171,15 +194,24 @@ function scanStructPairs(db: any, proj: string, limit: number, seen: Set<string>
   return;
 }
 
+export interface CandidateOptions {
+  /** v1.28: 本次整合窗口的 id 集合。给了就只在窗口内生成候选（两端都必须是窗口内的行）。
+   *  这是修 "候选对裁剪：48 → 6（窗口外 42 对）" 的正解：先定窗口再找候选，
+   *  而不是先全库找候选再让下游筛掉 —— 后者既浪费 KNN/嵌入，又会让窗口里的老行永远当不上锚点。 */
+  windowIds?: Set<string>;
+}
+
 export async function findSimilarCandidates(
   project?: string,
   threshold: number = CONSOLIDATE_SIMILARITY,
   limit: number = CONSOLIDATE_MAX_PAIRS,
+  opts: CandidateOptions = {},
 ): Promise<SimilarCandidate[]> {
   if (!isEmbedEnabled()) return [];
   const proj = normalizeProject(project);
   const seen = new Set<string>();
   const pairs: SimilarCandidate[] = [];
+  const windowIds = opts.windowIds && opts.windowIds.size ? opts.windowIds : undefined;
 
   // v1.11.2 memdir:每个 memType 是**独立 sqlite** —— 旧版只扫 general,user/feedback/project 里的
   // "报告式"重复(带 # 表头的成组记录)完全够不到,LLM 也就无从裁决。
@@ -190,12 +222,12 @@ export async function findSimilarCandidates(
   const vecLimit = Math.max(1, limit - structReserve);
   for (const mt of dirs) {
     if (pairs.length >= vecLimit) break;
-    scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, vecLimit, seen, pairs);
+    scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, vecLimit, seen, pairs, windowIds);
   }
   if (CONSOLIDATE_BUCKET_PAIRS > 0) {
     for (const mt of dirs) {
       if (pairs.length >= limit) break;
-      scanStructPairs(DatabaseManager.getInstance(project, mt), proj, limit, seen, pairs);
+      scanStructPairs(DatabaseManager.getInstance(project, mt), proj, limit, seen, pairs, windowIds);
     }
   }
   return pairs.slice(0, limit);
