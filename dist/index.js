@@ -140,7 +140,7 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
     projects: z.array(z.string()).optional().describe('Cross-library search: search several libraries in one call (e.g. ["default","shared"]). "*" or ["all"] = every library of this instance. Omit for single-library search. Each result carries its source library in "project".'),
     derivedPolicy: z.enum(['demoted', 'only', 'excluded']).optional().describe('How to treat derived narratives (reflect summaries/insights): demoted = included but ranked down (default), only = only those, excluded = hide them completely. They are never usable as evidence regardless.'),
-    gate: z.enum(['off', 'shadow', 'on']).optional().describe('Pair-level injection adjudication (v1.28). off = never call the LLM (default); shadow = call and report decisions without dropping anything; on = only keep candidates judged A (needed now). Measured on 880 labelled pairs: retrieval alone F1 32.9 → adjudicated F1 94.1.'),
+    gate: z.enum(['off', 'shadow', 'on']).optional().describe('Pair-level injection adjudication (v1.28). off = never call the LLM (default); shadow = call and report decisions without dropping anything; on = only keep candidates judged A (needed now). Scope: 173 retrieval-visible pairs covering 34 of 86 NEED. Retrieval-only F1 32.9 → adjudicated 94.1. On the full 880-pair set the three adjudicator runs scored F1 78.2–82.2 (see 审查报告).'),
     simFloor: z.number().optional().describe('Similarity floor applied to the similarity (not the composite score). Omit to use the profile default (balanced = 0 unless SEARCH_SIM_FLOOR is set).'),
 }, async (args) => {
     try {

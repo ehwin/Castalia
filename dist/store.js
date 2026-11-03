@@ -135,7 +135,58 @@ export async function saveMemory(params) {
             // KNN 不可用，跳过去重检查
         }
     }
-    // ═══ 存入新记忆（不管是否近重复，都存） ═══
+    // ═══ v1.28 派生行近重复合并 ═══
+    // 在此之前 isNearDup / dupId 只算不用：检测到了照样 INSERT（旧注释就写着"都存"），
+    // 于是同一个晚上被模型重写成 7 条近似记忆，索引里全是同一件事的不同说法。
+    // 派生行（模型自己写的摘要/日记/洞察）命中近重复时合并到旧行；用户陈述的事实仍照常
+    // 插入——把"两件相似但确实不同的事"合并掉，比多一条更糟。
+    const refreshVector = (rowid) => {
+        if (skipEmbed || !vector)
+            return;
+        try {
+            db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(BigInt(rowid));
+            db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(rowid), new Float32Array(vector));
+        }
+        catch { /* 无 vec 表时忽略 */ }
+    };
+    const mergeInto = (row) => {
+        const keepLonger = String(text || '').trim().length > String(row.text || '').trim().length;
+        if (keepLonger)
+            db.prepare('UPDATE memory SET text = ?, updated_at = ?, reference_count = reference_count + 1 WHERE id = ?').run(text, now, row.id);
+        else
+            db.prepare('UPDATE memory SET updated_at = ?, reference_count = reference_count + 1 WHERE id = ?').run(now, row.id);
+        if (keepLonger)
+            refreshVector(row.rowid);
+        return recordOf(db.prepare('SELECT * FROM memory WHERE id = ?').get(row.id));
+    };
+    if (derived && dupId) {
+        const merged = db.prepare('SELECT id, text, rowid FROM memory WHERE id = ?').get(dupId);
+        if (merged)
+            return mergeInto(merged);
+    }
+    // ═══ v1.28 同证据派生行合并 ═══
+    // 同一段对话被反复摘要时措辞会变，向量距离常常超过 0.05，近重复检测拦不住；
+    // 证据 id 重叠才是"同一件事"的硬信号。同一天内、派生行、共享 ≥1 个证据且
+    // 重叠 ≥50%（按较小集合算）时，合并到先写的那条。
+    if (derived && evidenceIds.length) {
+        try {
+            const since = new Date(Date.parse(now) - 24 * 60 * 60 * 1000).toISOString();
+            const rows = db.prepare('SELECT id, text, evidence_ids, rowid FROM memory WHERE is_active = 1 AND project = ? AND derived = 1 AND evidence_ids IS NOT NULL AND created_at >= ? LIMIT 200').all(project, since);
+            const mine = new Set(evidenceIds);
+            for (const row of rows) {
+                const theirs = new Set(parseEvidenceIds(row.evidence_ids));
+                let shared = 0;
+                for (const id of theirs)
+                    if (mine.has(id))
+                        shared++;
+                if (!shared || shared / Math.min(mine.size, theirs.size) < 0.5)
+                    continue;
+                return mergeInto(row);
+            }
+        }
+        catch { /* 旧库缺 evidence_ids 列时按旧行为 */ }
+    }
+    // ═══ 存入新记忆（用户陈述的事实、或没命中任何去重信号的派生行） ═══
     const id = generateId();
     // tier + expires_at 计算:显式 expiresAt 优先;否则 temporary 默认 3 天 TTL,standard/critical 永不过期
     const tier = params.tier || 'standard';

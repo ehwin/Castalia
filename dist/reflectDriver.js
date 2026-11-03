@@ -20,7 +20,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { isMemType } from './memType.js';
-import { findSimilarCandidates, CONSOLIDATE_SIMILARITY, CONSOLIDATE_MAX_PAIRS } from './consolidate.js';
+import { findSimilarCandidates, CONSOLIDATE_SIMILARITY, CONSOLIDATE_MAX_PAIRS, CONSOLIDATE_WINDOW_TOP, CONSOLIDATE_WINDOW_ROTATE } from './consolidate.js';
 import { getRecentConversations } from './digest.js';
 import { loadPromptOverride } from './promptFile.js';
 import { makeLlmChannel, callLlm, parseJsonRobust, REFLECT_DEEP_MAX_TOKENS } from './reflectionLlm.js';
@@ -40,6 +40,38 @@ const CONSOLIDATE_MIN_MEMORIES = (() => { const v = parseInt(process.env.CONSOLI
 // 2026-10-23 审计:整合一次 ≈ 2.7 万 prompt + 1.2 万输出、多数 merged=0,而"记忆条数超过 15"这个
 // 门槛永远成立,导致每次桥启动(含重启风暴里每 25 秒一次)都重跑一遍。最小间隔 = 硬闸。
 const CONSOLIDATE_MIN_INTERVAL_HOURS = (() => { const v = parseFloat(process.env.CONSOLIDATE_MIN_INTERVAL_HOURS || '6'); return Number.isFinite(v) && v >= 0 ? v : 6; })();
+/** v1.28: 间隔闸改成自适应（默认开）。旧行为「距上次 N 小时就跳过」会把**已找到候选**的轮次一并挡掉：
+ *  活库实测一轮 50 对候选在 6h 内被跳过，等于白算 KNN 也让积压排不出去。
+ *  新规则：候选非空且输入与上次不同 → 该跑就跑；只有「输入没变」或「上次失败」才按时间节流。
+ *  设 0 可退回旧的纯时间闸。 */
+const CONSOLIDATE_ADAPTIVE_INTERVAL = (() => { const v = process.env.CONSOLIDATE_ADAPTIVE_INTERVAL; return v === undefined ? true : !/^(0|false|no)$/i.test(String(v)); })();
+/**
+ * v1.28: 整合是否该跑 —— 纯函数，便于加速测试（不用等 6h、不用调 LLM）。
+ * 判定顺序：输入未变 → 上次失败冷却 → （非自适应时）纯时间闸 → 跑。
+ */
+export function decideConsolidateRun(prevState, fingerprint, candidateCount, now = Date.now(), floorMs = CONSOLIDATE_MIN_INTERVAL_HOURS * 3600 * 1000, adaptive = CONSOLIDATE_ADAPTIVE_INTERVAL) {
+    if (!prevState)
+        return { run: true, reason: '首次运行' };
+    const age = now - Date.parse(prevState.at);
+    if (!Number.isFinite(age) || age < 0)
+        return { run: true, reason: '状态时间戳无效' };
+    const sameInput = prevState.fingerprint === fingerprint;
+    const h = (age / 3600000).toFixed(1);
+    if (prevState.ok && sameInput && age < 7 * 24 * 3600 * 1000) {
+        return { run: false, reason: `输入未变（上次 ${h}h 前, merged=${prevState.merged ?? 0}）` };
+    }
+    if (!prevState.ok && age < floorMs) {
+        // 失败冷却与输入是否相同无关：换一片窗口重试同样是重试，坏端点会被连续捶。
+        return { run: false, reason: `上次失败,冷却中（${h}h < ${(floorMs / 3600000).toFixed(0)}h）` };
+    }
+    if (!adaptive && age < floorMs) {
+        return { run: false, reason: `距上次整合 ${h}h,未到最小间隔 ${CONSOLIDATE_MIN_INTERVAL_HOURS}h（非自适应）` };
+    }
+    if (candidateCount === 0 && age < floorMs) {
+        return { run: false, reason: `无候选且未到最小间隔（${h}h）` };
+    }
+    return { run: true, reason: candidateCount > 0 ? `有 ${candidateCount} 对候选,自适应放行` : undefined };
+}
 /**
  * v1.23.1: 反思失败退避。反思失败不会写 reflect_summary，于是 24h 闸门永远"已到时间"，
  * 每次桥重启都会立刻重试同一批（content_filter/超时/超大 prompt 时尤其明显）。
@@ -738,6 +770,81 @@ function normalizeConsolidationActions(raw) {
     }
     return { actions, kept, invalidate, errors };
 }
+export async function buildConsolidateWindow(project, opts = {}) {
+    const proj = normalizeProject(project);
+    const topN = Number.isFinite(Number(opts.topN)) ? Math.max(0, Number(opts.topN)) : CONSOLIDATE_WINDOW_TOP;
+    const rotateN = Number.isFinite(Number(opts.rotateN)) ? Math.max(0, Number(opts.rotateN)) : CONSOLIDATE_WINDOW_ROTATE;
+    const windowWhere = `is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
+        AND COALESCE(tier, 'standard') <> 'critical'
+        AND COALESCE(status, '') <> 'cold'`;
+    const dirs = listMemTypeDirs(proj);
+    // ① 重要度前 N（跨库合并后截断）
+    const top = [];
+    const seenTop = new Set();
+    if (topN > 0) {
+        for (const mt of dirs) {
+            try {
+                const db = DatabaseManager.getInstance(project, mt);
+                const rows = db.prepare(`
+          SELECT id, mem_type, text, created_at, importance, COALESCE(updated_at, created_at) AS k
+          FROM memory WHERE ${windowWhere}
+          ORDER BY importance DESC, created_at DESC LIMIT ?
+        `).all(proj, topN);
+                for (const r of rows) {
+                    if (!seenTop.has(r.id)) {
+                        seenTop.add(r.id);
+                        top.push(r);
+                    }
+                }
+            }
+            catch { /* 单库读不到不影响其它库 */ }
+        }
+        top.sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0));
+        top.length = Math.min(top.length, topN);
+    }
+    // ② 游标之后的 N 条（keyset 分页：k 相同按 id 排）
+    const exclude = new Set(top.map((m) => m.id));
+    const collect = (after, need) => {
+        if (need <= 0)
+            return [];
+        const cond = after ? `AND (COALESCE(updated_at, created_at) > ? OR (COALESCE(updated_at, created_at) = ? AND id > ?))` : '';
+        const out = [];
+        for (const mt of dirs) {
+            try {
+                const db = DatabaseManager.getInstance(project, mt);
+                const rows = db.prepare(`
+          SELECT id, mem_type, text, created_at, importance, COALESCE(updated_at, created_at) AS k
+          FROM memory WHERE ${windowWhere} ${cond}
+          ORDER BY k ASC, id ASC LIMIT ?
+        `).all(proj, ...(after ? [after.k, after.k, after.id] : []), need);
+                out.push(...rows);
+            }
+            catch { /* 同上 */ }
+        }
+        out.sort((a, b) => (String(a.k).localeCompare(String(b.k))) || String(a.id).localeCompare(String(b.id)));
+        const picked = [];
+        for (const r of out) {
+            if (exclude.has(r.id))
+                continue;
+            exclude.add(r.id);
+            picked.push(r);
+            if (picked.length >= need)
+                break;
+        }
+        return picked;
+    };
+    const cursor = opts.cursor ?? null;
+    const rotate = collect(cursor, rotateN);
+    // 到表尾：本轮只给剩下的那一段，nextCursor 置空 → 下一轮从表头重新开始。
+    // 刻意不做"回卷补齐"：补齐会把本轮回卷段的行重复塞进同一轮，去重逻辑和 LLM 输入都会变脏。
+    const wrapped = !!cursor && rotate.length < rotateN;
+    const last = rotate.length ? rotate[rotate.length - 1] : null;
+    return {
+        mems: [...top, ...rotate],
+        nextCursor: wrapped || !last ? null : { k: String(last.k), id: String(last.id) },
+        wrapped,
+    };
+}
 /**
  * v1.10: 记忆整合主流程 — 向量预筛 → LLM 整合 → applyReflectActions 原子执行。
  * - EMBED_MODE=none:预筛返回空 → LLM 全量扫兜底
@@ -758,50 +865,30 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
     // v1.23-fix：两片必须各自保底。原实现把「前 300 + 最久 200」合成一个数组后按 importance
     // 截到 500，结果低分老记忆被整片裁掉 —— 轮转等于没发生。现在先锁 top300，再用"最久 200"
     // 补到 500，保证每轮都有老记忆被轮到。
-    const topSlice = [];
-    const oldestSlice = [];
-    const seenTop = new Set();
-    const seenOldest = new Set();
-    const pushRows = (rows, target, seen) => {
-        for (const r of rows) {
-            if (seen.has(r.id))
-                continue;
-            seen.add(r.id);
-            target.push(r);
-        }
-    };
-    const windowWhere = `is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
-        AND COALESCE(tier, 'standard') <> 'critical'
-        AND COALESCE(status, '') <> 'cold'`;
-    for (const mt of listMemTypeDirs(proj)) {
+    // v1.28: 窗口由 buildConsolidateWindow 统一构造（重要度前 N + 游标轮转 N）。
+    // 旧实现在这里内联「重要度 300 + 最久 200」，而候选生成另有一套 `最新 500` 口径 ——
+    // 两套排序不一致，活库实测 48 个候选对里 42 个两端不在同一窗口，白白烧掉 KNN 还被下游拒掉。
+    const statePath0 = path.join(currentMemDir(), `consolidate-state-${safeFilePart(proj)}.json`);
+    let prevCursor = null;
+    try {
+        prevCursor = JSON.parse(fs.readFileSync(statePath0, 'utf8')).windowCursor ?? null;
+    }
+    catch {
+        prevCursor = null;
+    }
+    const win = await buildConsolidateWindow(proj, { cursor: prevCursor });
+    const mems = win.mems;
+    /** v1.28: 统一的状态持久化入口（游标必须和指纹一起落盘，避免"没看过就跳过"）。 */
+    const persistState = (fp, ok, merged, candN, next, scannedN) => {
         try {
-            const db = DatabaseManager.getInstance(project, mt);
-            pushRows(db.prepare(`
-        SELECT id, mem_type, text, created_at, importance FROM memory
-        WHERE ${windowWhere}
-        ORDER BY importance DESC, created_at DESC
-        LIMIT 300
-      `).all(proj), topSlice, seenTop);
-            pushRows(db.prepare(`
-        SELECT id, mem_type, text, created_at, importance FROM memory
-        WHERE ${windowWhere}
-        ORDER BY COALESCE(updated_at, created_at) ASC
-        LIMIT 200
-      `).all(proj), oldestSlice, seenOldest);
+            fs.mkdirSync(path.dirname(statePath0), { recursive: true });
+            fs.writeFileSync(statePath0, JSON.stringify({
+                fingerprint: fp, at: new Date().toISOString(), ok, merged, scanned: scannedN, candidates: candN,
+                windowCursor: next,
+            }), 'utf8');
         }
-        catch { /* 单个库读不到不影响其它库 */ }
-    }
-    topSlice.sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0));
-    const mems = topSlice.slice(0, 300);
-    const windowSeen = new Set(mems.map((m) => m.id));
-    for (const r of oldestSlice) {
-        if (mems.length >= 500)
-            break;
-        if (windowSeen.has(r.id))
-            continue;
-        windowSeen.add(r.id);
-        mems.push(r);
-    }
+        catch { /* 状态写失败不影响主流程 */ }
+    };
     const scanned = mems.length;
     if (scanned < 2) {
         return { ...base, ok: true, scanned, skipped: true, errors: ['active 记忆不足 2 条,无需整合'] };
@@ -810,7 +897,9 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
     // 1. 向量预筛(EMBED_MODE=none 返回空 → 全量扫兜底)
     let candidates = [];
     if (isEmbedEnabled()) {
-        candidates = await findSimilarCandidates(proj, threshold ?? CONSOLIDATE_SIMILARITY, limit ?? CONSOLIDATE_MAX_PAIRS);
+        // 先定窗口再找候选：候选生成的锚点与邻居都限制在本轮窗口内，
+        // 下面的窗口过滤从此只作为不变式断言（正常应为 0 裁剪）。
+        candidates = await findSimilarCandidates(proj, threshold ?? CONSOLIDATE_SIMILARITY, limit ?? CONSOLIDATE_MAX_PAIRS, { windowIds });
         // v1.23: 候选对必须两端都在本次窗口内 —— 否则模型会拿到窗口外的 id，动作必被
         // `allowedSourceIds` 拒绝（现网 "target is outside the current reflection input" 的根因）。
         const before = candidates.length;
@@ -820,6 +909,8 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
         }
         if (candidates.length === 0) {
             // 有向量但窗口内确实无相似对 → 不再调 LLM,省 token
+            // v1.28: 仍要推进游标，否则这一片窗口会被每轮重复选中、后面的行永远轮不到
+            persistState(`empty:${scanned}:${win.nextCursor?.k ?? '-'}`, true, 0, 0, win.nextCursor, scanned);
             return { ...base, ok: true, scanned, skipped: true, errors: ['无相似候选,无需整合'] };
         }
     }
@@ -870,40 +961,22 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
         : `all:${scanned}`) + '#' + inputMems.map(m => `${m.id}:${m.text || ''}`).join('\u0001')
         + '#' + factRows.map(f => `${f.id}:${f.object}`).join('|'))
         .digest('hex');
-    const statePath = path.join(currentMemDir(), `consolidate-state-${safeFilePart(proj)}.json`);
+    const statePath = statePath0;
     const readState = () => { try {
         return JSON.parse(fs.readFileSync(statePath, 'utf8'));
     }
     catch {
         return null;
     } };
-    const writeState = (ok, merged) => {
-        try {
-            fs.mkdirSync(path.dirname(statePath), { recursive: true });
-            fs.writeFileSync(statePath, JSON.stringify({ fingerprint, at: new Date().toISOString(), ok, merged, scanned, candidates: candidates.length }), 'utf8');
-        }
-        catch { /* 状态写失败不影响主流程 */ }
-    };
+    const writeState = (ok, merged) => persistState(fingerprint, ok, merged, candidates.length, win.nextCursor, scanned);
     const prevState = readState();
-    if (!force && prevState) {
-        const age = Date.now() - Date.parse(prevState.at);
-        if (Number.isFinite(age) && age >= 0) {
-            const sameInput = prevState.fingerprint === fingerprint;
-            const unchangedTtl = prevState.ok && sameInput ? 7 * 24 * 3600 * 1000 : 0;
-            const floorMs = CONSOLIDATE_MIN_INTERVAL_HOURS * 3600 * 1000;
-            let reason = '';
-            if (unchangedTtl && age < unchangedTtl) {
-                reason = `输入未变（上次 ${(age / 3600000).toFixed(1)}h 前, merged=${prevState.merged ?? 0}）`;
-            }
-            else if (age < floorMs) {
-                reason = `距上次整合 ${(age / 3600000).toFixed(1)}h,未到最小间隔 ${CONSOLIDATE_MIN_INTERVAL_HOURS}h`;
-            }
-            if (reason) {
-                console.error(`[consolidate] 跳过：${reason}`);
-                return { ...base, ok: true, scanned, candidates: candidates.length, skipped: true, errors: [] };
-            }
-        }
+    const decision = force ? { run: true, reason: 'force' } : decideConsolidateRun(prevState, fingerprint, candidates.length);
+    if (!decision.run) {
+        console.error(`[consolidate] 跳过：${decision.reason}`);
+        return { ...base, ok: true, scanned, candidates: candidates.length, skipped: true, errors: [] };
     }
+    if (decision.reason && !force)
+        console.error(`[consolidate] ${decision.reason}`);
     const userPrompt = `今天是 ${today}(相对日期转绝对日期时以此为准)。
 请整合以下候选记忆,输出整合 JSON 数组。
 
@@ -923,7 +996,9 @@ ${transcript || '无近期对话转录'}`;
     // 每跑一次净增 N 条记忆、merged 永远 0（实测 hermes 一轮写 18 条、lobehub 12 条）。
     // 正确做法：任务永远是"整合"，保真策略只作为约束追加在后面。
     const systemPrompt = buildConsolidationPrompt() + '\n' + reflectionFidelityPrompt(proj);
-    const llm = await callLlm(systemPrompt, userPrompt, undefined, REFLECT_DEEP_MAX_TOKENS);
+    const llm = opts.llm
+        ? await opts.llm(systemPrompt, userPrompt)
+        : await callLlm(systemPrompt, userPrompt, undefined, REFLECT_DEEP_MAX_TOKENS);
     if (!llm) {
         writeState(false, 0);
         return { ...base, scanned, candidates: candidates.length, errors: ['LLM 调用失败'] };

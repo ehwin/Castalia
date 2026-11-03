@@ -41,14 +41,30 @@ export const CONSOLIDATE_MAX_PAIRS = (() => {
     const v = parseInt(process.env.CONSOLIDATE_MAX_PAIRS || '50', 10);
     return Number.isFinite(v) && v > 0 ? v : 50;
 })();
+/** v1.28: 整合窗口分片大小 —— 重要度分片 + 轮转分片。
+ *  两者之和就是单轮进 LLM 的上限(默认 500，与旧行为同量级)，但轮转分片带游标，
+ *  所以全库会被逐轮扫到，而不是像旧实现那样永远只扫最老的 200 条。 */
+export const CONSOLIDATE_WINDOW_TOP = (() => {
+    const v = parseInt(process.env.CONSOLIDATE_WINDOW_TOP || '300', 10);
+    return Number.isFinite(v) && v >= 0 ? v : 300;
+})();
+export const CONSOLIDATE_WINDOW_ROTATE = (() => {
+    const v = parseInt(process.env.CONSOLIDATE_WINDOW_ROTATE || '200', 10);
+    return Number.isFinite(v) && v >= 0 ? v : 200;
+})();
 /**
  * v1.10: 向量预筛相似记忆对(cos 相似度 > threshold)。
  * - EMBED_MODE=none → 直接返回 [] (LLM 全量扫兜底)
  * - vec0 虚拟表禁止 JOIN:先对每条记忆做 KNN 取候选 rowid,再二段过滤 project/locked
  * - 每对去重(不重复 idA/idB、不反向),数量上限 limit 防爆炸
  */
-/** v1.11.2 单个 memType 库的语义预筛(向量 KNN);候选并入共享 seen/pairs。 */
-function scanVectorPairs(db, proj, threshold, limit, seen, pairs) {
+/** v1.11.2 单个 memType 库的语义预筛(向量 KNN);候选并入共享 seen/pairs。
+ *  v1.28: windowIds 给定时候选生成被限制在窗口内 —— 锚点与邻居都必须是窗口内的行。
+ *  旧实现先全库取“最新 500”当锚点、再让下游按窗口过滤，实测 48 对里 42 对被丢掉；
+ *  而窗口里的老行(created_at 很早)根本轮不到当锚点，老重复永远进不了裁决。
+ */
+function scanVectorPairs(db, proj, threshold, limit, seen, pairs, windowIds) {
+    const winClause = windowIds && windowIds.size ? `AND m.id IN (${[...windowIds].map(() => '?').join(',')})` : '';
     const mems = db.prepare(`
     SELECT m.rowid, m.id FROM memory m
     WHERE m.is_active = 1 AND m.project = ? AND (m.locked IS NULL OR m.locked = 0)
@@ -56,9 +72,10 @@ function scanVectorPairs(db, proj, threshold, limit, seen, pairs) {
       AND COALESCE(m.status, '') NOT IN ('cold', 'superseded')
       -- v1.27: 派生叙述不参与整合（摘要之间互合并只会让模型的自述越滚越大）
       AND m.derived = 0
+      ${winClause}
     ORDER BY m.created_at DESC
     LIMIT 500
-  `).all(proj);
+  `).all(proj, ...(windowIds && windowIds.size ? [...windowIds] : []));
     if (mems.length < 2)
         return;
     const rowidList = mems.map(m => Number(m.rowid));
@@ -125,11 +142,15 @@ function scanVectorPairs(db, proj, threshold, limit, seen, pairs) {
         }
     }
 }
-/** v1.11.2 单个 memType 库的结构兜底(同 `# 表头` 分桶);由 findSimilarCandidates 跨库调度。 */
-function scanStructPairs(db, proj, limit, seen, pairs) {
+/** v1.11.2 单个 memType 库的结构兜底(同 `# 表头` 分桶);由 findSimilarCandidates 跨库调度。
+ *  v1.28: windowIds 给定时候选只用窗口内的行 —— 旧实现固定取“最新 500”，
+ *  窗口里的老行(表头重复往往就是这批)永远拿不到，结构兜底等于对它们失效。
+ */
+function scanStructPairs(db, proj, limit, seen, pairs, windowIds) {
     // ═══ v1.11 结构兜底:同 `# 表头` + 同 memType 分桶补候选(相似度记 0,表示"结构配对"而非语义相似)═══
     if (CONSOLIDATE_BUCKET_PAIRS > 0 && pairs.length < limit) {
         let rows2 = [];
+        const winClause = windowIds && windowIds.size ? `AND id IN (${[...windowIds].map(() => '?').join(',')})` : '';
         try {
             rows2 = db.prepare(`
         SELECT id, text, mem_type FROM memory
@@ -137,8 +158,9 @@ function scanStructPairs(db, proj, limit, seen, pairs) {
           AND COALESCE(tier, 'standard') <> 'critical'
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
           AND derived = 0
+          ${winClause}
         ORDER BY created_at DESC LIMIT 500
-      `).all(proj);
+      `).all(proj, ...(windowIds && windowIds.size ? [...windowIds] : []));
         }
         catch {
             rows2 = [];
@@ -179,12 +201,13 @@ function scanStructPairs(db, proj, limit, seen, pairs) {
     }
     return;
 }
-export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIMILARITY, limit = CONSOLIDATE_MAX_PAIRS) {
+export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIMILARITY, limit = CONSOLIDATE_MAX_PAIRS, opts = {}) {
     if (!isEmbedEnabled())
         return [];
     const proj = normalizeProject(project);
     const seen = new Set();
     const pairs = [];
+    const windowIds = opts.windowIds && opts.windowIds.size ? opts.windowIds : undefined;
     // v1.11.2 memdir:每个 memType 是**独立 sqlite** —— 旧版只扫 general,user/feedback/project 里的
     // "报告式"重复(带 # 表头的成组记录)完全够不到,LLM 也就无从裁决。
     // 逐库扫描并把候选并起来;两阶段(先全库语义 → 再全库结构)是为了让表头对不挤占语义候选的名额。
@@ -195,13 +218,13 @@ export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIM
     for (const mt of dirs) {
         if (pairs.length >= vecLimit)
             break;
-        scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, vecLimit, seen, pairs);
+        scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, vecLimit, seen, pairs, windowIds);
     }
     if (CONSOLIDATE_BUCKET_PAIRS > 0) {
         for (const mt of dirs) {
             if (pairs.length >= limit)
                 break;
-            scanStructPairs(DatabaseManager.getInstance(project, mt), proj, limit, seen, pairs);
+            scanStructPairs(DatabaseManager.getInstance(project, mt), proj, limit, seen, pairs, windowIds);
         }
     }
     return pairs.slice(0, limit);
