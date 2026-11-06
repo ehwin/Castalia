@@ -289,7 +289,7 @@ export function healVecOrphans(db) {
     return healed;
 }
 /** memory 目录:env MEMORY_DB_DIR 或 <cwd>/memory/ */
-function memDir() {
+export function memDir() {
     const dir = process.env.MEMORY_DB_DIR;
     return dir && dir.trim().length > 0 ? dir.trim() : path.join(process.cwd(), 'memory');
 }

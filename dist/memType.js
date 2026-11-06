@@ -9,6 +9,20 @@
  *   reference — 外部指针(URL/ID/文档链接,不存内容副本)
  *   general   — 默认,现有记忆不受影响
  */
+/**
+ * 日记分区(2026-11-06):「记住这一天」每天一条。
+ *
+ * 故意**不放进 MEM_TYPES**。所有自动路径(目录枚举、跨库召回、反刍、衰减、星图实体)都只认
+ * MEM_TYPES,于是日记在任何自动检索里都看不到;只有显式带 memType='diary' 的查询才读得到。
+ * 返回值仍标 MemType 是镜像层的折中:引擎的类型联合不扩,免得每个 Record<MemType, …> 都要补一项。
+ */
+export const DIARY_MEM_TYPE = 'diary';
+/**
+ * 念头分区(2026-11-06):脑内每一行念头落一条,和日记同一个 bank、另一个文件。
+ *
+ * 同样**不进 MEM_TYPES**:这不是要被召回的东西,而是「需要的时候翻出来看」的存档。
+ */
+export const THOUGHTS_MEM_TYPE = 'thoughts';
 /** 4 种封闭类型 + general 默认值 */
 export const MEM_TYPES = ['user', 'feedback', 'project', 'reference', 'general'];
 /** 仅 4 种封闭类型(写记忆时强制 Markdown 结构) */
@@ -27,6 +41,9 @@ export function isClosedMemType(v) {
     return typeof v === 'string' && CLOSED_MEM_TYPES.includes(v);
 }
 export function normalizeMemType(v) {
+    // 日记/念头分区走同一个 schema,但不在 MEM_TYPES 里,按普通类型名归一化。
+    if (v === DIARY_MEM_TYPE || v === THOUGHTS_MEM_TYPE)
+        return v;
     return isMemType(v) ? v : 'general';
 }
 /**

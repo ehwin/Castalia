@@ -4,10 +4,12 @@
  * v5.0: skipEmbed 参数 — digest 暂不向量化，reflect 后统一 embed
  * v4.0: 去重不再丢弃，SQLite 持久化 embedding 缓存
  */
-import { DatabaseManager, generateId, listMemTypeDirs } from './db.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { DatabaseManager, generateId, listMemTypeDirs, memDir, safeFilePart } from './db.js';
 import { embed, getEmbeddingCached } from './ollama.js';
 import { CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
-import { isMemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
+import { DIARY_MEM_TYPE, isMemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 import { reflectionPolicySafe } from './reflectionFidelity.js';
 import { isDerivedSource, normalizeEvidenceIds, serializeEvidenceIds, evidenceKeyOf, parseEvidenceIds } from './provenance.js';
@@ -570,7 +572,12 @@ export async function batchEmbedPending(characterId = 'airi', project, opts = {}
     let embeddedFacts = 0;
     const errors = [];
     // memdir:遍历项目全部分类库补嵌入
-    for (const mt of DatabaseManager.existingMemTypes(proj)) {
+    const embedTypes = DatabaseManager.existingMemTypes(proj);
+    // 日记分区不在 MEM_TYPES，目录枚举拿不到它 —— 不单独加进来，换嵌入模型后日记就永远没有向量。
+    const diaryFile = path.join(memDir(), safeFilePart(proj), DIARY_MEM_TYPE, 'memory.sqlite');
+    if (fs.existsSync(diaryFile) && !embedTypes.includes(DIARY_MEM_TYPE))
+        embedTypes.push(DIARY_MEM_TYPE);
+    for (const mt of embedTypes) {
         const db = DatabaseManager.getInstance(proj, mt);
         // v1.24: 嵌入空间切换后，旧空间留下的失败计数没有意义（失败原因已不存在），
         // 否则这些行会被 COALESCE(embed_fail_count,0) < 3 永久挡在窗口外 —— 实测本机 190 条
